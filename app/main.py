@@ -16,12 +16,17 @@ from app.core.preview_export import (
     save_report,
     save_smoothed_density_preview,
     save_mask_preview,
+    save_contour_preview,
 )
 from app.core.mask_processing import (
     build_mask_from_density,
     fill_small_holes,
     keep_largest_component,
     remove_small_components,
+)
+from app.core.contour_extractor import (
+    build_external_contour,
+    save_contour_csv,
 )
 
 from app.core.xyz_reader import compute_stats
@@ -101,6 +106,19 @@ def main() -> None:
         help="Fill internal holes smaller than this area in cells. Default: 0",
     )
 
+    parser.add_argument(
+        "--contour",
+        action="store_true",
+        help="Extract external contour from final mask",
+    )
+
+    parser.add_argument(
+        "--simplify-mm",
+        type=float,
+        default=0.0,
+        help="Simplify contour tolerance in source units, probably millimeters. Default: 0.0",
+    )
+
     args = parser.parse_args()
 
     input_path = Path(args.input_file)
@@ -171,6 +189,13 @@ def main() -> None:
     mask_path = output_dir / f"{base_name}_mask_cell_{cell_text}_threshold_{args.threshold}.png"
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
 
+    contour_preview_path = (
+        output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.png"
+    )
+    contour_csv_path = (
+        output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.csv"
+    )
+
     save_density_preview(grid, preview_path, max_size=args.preview_size)
 
     if args.smooth_mm > 0:
@@ -208,6 +233,27 @@ def main() -> None:
     save_mask_preview(mask, mask_path, max_size=args.preview_size)
     save_report(stats, grid, report_path)
 
+    contour_result = None
+
+    if args.contour:
+        contour_result = build_external_contour(
+            mask=mask,
+            grid=grid,
+            simplify_mm=args.simplify_mm,
+        )
+
+        save_contour_preview(
+            mask=mask,
+            contour_pixels=contour_result.contour_pixels,
+            output_path=contour_preview_path,
+            max_size=args.preview_size,
+        )
+
+        save_contour_csv(
+            contour_world=contour_result.contour_world,
+            output_path=contour_csv_path,
+        )
+
     t3 = time.perf_counter()
 
     print(f"Preview:        {preview_path}")
@@ -217,6 +263,10 @@ def main() -> None:
     print(f"Report:         {report_path}")
     print(f"Mask threshold: {mask_result.threshold:.3f}")
     print(f"Mask cells:     {int(mask.sum()):,}")
+    if contour_result is not None:
+        print(f"Contour preview:{contour_preview_path}")
+        print(f"Contour CSV:    {contour_csv_path}")
+        print(f"Contour points: {contour_result.point_count:,}")
     print(f"Время сохранения: {t3 - t2:.2f} сек")
 
     print(f"\nГотово. Общее время: {t3 - t0:.2f} сек")

@@ -156,3 +156,49 @@ def save_mask_preview(
         image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
     cv2.imwrite(str(output_path), image)
+
+def save_contour_preview(
+    mask: np.ndarray,
+    contour_pixels: np.ndarray,
+    output_path: str | Path,
+    max_size: int = 3000,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Фон: маска детали
+    image = (mask.astype(np.uint8) * 180)
+    image = np.flipud(image)
+
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    h, w = mask.shape
+
+    # Контур надо тоже перевернуть по Y для отображения,
+    # потому что preview flipud.
+    contour_display = contour_pixels.copy()
+    contour_display[:, 1] = (h - 1) - contour_display[:, 1]
+
+    contour_int = contour_display.reshape((-1, 1, 2)).astype(np.int32)
+
+    cv2.drawContours(
+        image_bgr,
+        [contour_int],
+        contourIdx=-1,
+        color=(0, 0, 255),
+        thickness=2,
+    )
+
+    ih, iw = image_bgr.shape[:2]
+    scale = min(max_size / max(iw, ih), 1.0)
+
+    if scale < 1.0:
+        new_w = int(iw * scale)
+        new_h = int(ih * scale)
+        image_bgr = cv2.resize(
+            image_bgr,
+            (new_w, new_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    cv2.imwrite(str(output_path), image_bgr)
