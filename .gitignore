@@ -1,0 +1,20 @@
+# Python
+.venv/
+venv/
+__pycache__/
+
+# Cache / temp
+cache/
+.cache/
+
+
+# Конфиденциальное
+data/
+
+# Отчёты и документы
+*.docx
+*.doc
+*.pdf
+
+# VS Code
+.vscode/
