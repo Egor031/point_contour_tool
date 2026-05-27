@@ -31,6 +31,7 @@ from app.core.contour_extractor import (
 
 from app.core.xyz_reader import compute_stats
 
+from app.exporters.dxf_exporter import save_contour_dxf
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -110,6 +111,12 @@ def main() -> None:
         "--contour",
         action="store_true",
         help="Extract external contour from final mask",
+    )
+
+    parser.add_argument(
+        "--dxf",
+        action="store_true",
+        help="Export extracted contour to DXF. Requires --contour.",
     )
 
     parser.add_argument(
@@ -196,6 +203,10 @@ def main() -> None:
         output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.csv"
     )
 
+    contour_dxf_path = (
+        output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.dxf"
+    )
+
     save_density_preview(grid, preview_path, max_size=args.preview_size)
 
     if args.smooth_mm > 0:
@@ -254,6 +265,13 @@ def main() -> None:
             output_path=contour_csv_path,
         )
 
+        if args.dxf:
+            save_contour_dxf(
+                contour_world=contour_result.contour_world,
+                output_path=contour_dxf_path,
+                close=True,
+            )
+
     t3 = time.perf_counter()
 
     print(f"Preview:        {preview_path}")
@@ -264,9 +282,13 @@ def main() -> None:
     print(f"Mask threshold: {mask_result.threshold:.3f}")
     print(f"Mask cells:     {int(mask.sum()):,}")
     if contour_result is not None:
-        print(f"Contour preview:{contour_preview_path}")
-        print(f"Contour CSV:    {contour_csv_path}")
-        print(f"Contour points: {contour_result.point_count:,}")
+        print(f"Contour preview: {contour_preview_path}")
+        print(f"Contour CSV:     {contour_csv_path}")
+
+        if args.dxf:
+            print(f"Contour DXF:     {contour_dxf_path}")
+
+        print(f"Contour points:  {contour_result.point_count:,}")
     print(f"Время сохранения: {t3 - t2:.2f} сек")
 
     print(f"\nГотово. Общее время: {t3 - t0:.2f} сек")
