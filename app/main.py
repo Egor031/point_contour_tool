@@ -20,6 +20,7 @@ from app.core.preview_export import (
     save_holes_preview,
 )
 from app.core.mask_processing import (
+    apply_polygon_roi_to_mask,
     apply_roi_to_mask,
     build_mask_from_density,
     fill_small_holes,
@@ -38,7 +39,39 @@ from app.core.hole_detector import (
 
 from app.core.xyz_reader import compute_stats
 
+from app.exporters.clean_xyz_exporter import export_clean_points
 from app.exporters.dxf_exporter import save_contour_dxf
+
+
+def parse_roi_poly(value: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+
+    for raw_point in value.split(";"):
+        raw_point = raw_point.strip()
+        if not raw_point:
+            continue
+
+        parts = [part.strip() for part in raw_point.split(",")]
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError(
+                "ROI polygon points must use format x1,y1;x2,y2;x3,y3;..."
+            )
+
+        try:
+            x = float(parts[0])
+            y = float(parts[1])
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "ROI polygon coordinates must be numbers"
+            ) from exc
+
+        points.append((x, y))
+
+    if len(points) < 3:
+        raise argparse.ArgumentTypeError("ROI polygon must contain at least 3 points")
+
+    return points
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -115,6 +148,11 @@ def main() -> None:
         help="Limit mask processing to ROI in world coordinates: min_x min_y max_x max_y",
     )
     parser.add_argument(
+        "--roi-poly",
+        type=parse_roi_poly,
+        help="Limit mask processing to polygon ROI: x1,y1;x2,y2;x3,y3;...",
+    )
+    parser.add_argument(
         "--fill-holes-area",
         type=int,
         default=0,
@@ -131,6 +169,12 @@ def main() -> None:
         "--dxf",
         action="store_true",
         help="Export extracted contour to DXF. Requires --contour.",
+    )
+
+    parser.add_argument(
+        "--export-clean",
+        action="store_true",
+        help="Export cleaned point cloud using final mask",
     )
 
     parser.add_argument(
@@ -245,6 +289,9 @@ def main() -> None:
     )
     mask_path = output_dir / f"{base_name}_mask_cell_{cell_text}_threshold_{args.threshold}.png"
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
+    clean_path = (
+        output_dir / f"{base_name}_clean_cell_{cell_text}_threshold_{args.threshold}.asc"
+    )
 
     holes_csv_path = (
         output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.csv"
@@ -304,6 +351,13 @@ def main() -> None:
             f"min_x={roi[0]:.3f}, min_y={roi[1]:.3f}, "
             f"max_x={roi[2]:.3f}, max_y={roi[3]:.3f}"
         )
+
+    if args.roi_poly is not None:
+        mask = apply_polygon_roi_to_mask(mask, grid, args.roi_poly)
+        print(
+            "Applied polygon ROI: "
+            f"points={len(args.roi_poly)}, mask_cells={int(mask.sum()):,}"
+        )
     
 
     # Эту маску используем для поиска отверстий.
@@ -349,6 +403,16 @@ def main() -> None:
     save_mask_preview(mask, mask_path, max_size=args.preview_size)
     save_report(stats, grid, report_path)
 
+    clean_point_count = None
+
+    if args.export_clean:
+        clean_point_count = export_clean_points(
+            input_path=input_path,
+            output_path=clean_path,
+            grid=grid,
+            mask=mask,
+        )
+
     contour_result = None
 
     if args.contour:
@@ -386,6 +450,9 @@ def main() -> None:
     print(f"Report:         {report_path}")
     print(f"Mask threshold: {mask_result.threshold:.3f}")
     print(f"Mask cells:     {int(mask.sum()):,}")
+    if clean_point_count is not None:
+        print(f"Clean points:   {clean_path}")
+        print(f"Clean count:    {clean_point_count:,}")
     if contour_result is not None:
         print(f"Contour preview: {contour_preview_path}")
         print(f"Contour CSV:     {contour_csv_path}")

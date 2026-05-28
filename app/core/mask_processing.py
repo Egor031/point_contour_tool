@@ -160,6 +160,32 @@ def apply_roi_to_mask(
 
     return filtered
 
+
+def apply_polygon_roi_to_mask(
+    mask: np.ndarray,
+    grid: DensityGrid,
+    polygon_points: list[tuple[float, float]],
+) -> np.ndarray:
+    height, width = mask.shape
+
+    if len(polygon_points) < 3:
+        raise ValueError("polygon ROI must contain at least 3 points")
+
+    points_pixels = []
+    for x, y in polygon_points:
+        ix = (x - grid.min_x) / grid.cell_size
+        iy = (y - grid.min_y) / grid.cell_size
+        points_pixels.append([int(round(ix)), int(round(iy))])
+
+    polygon_mask = np.zeros((height, width), dtype=np.uint8)
+    polygon = np.array(points_pixels, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(polygon_mask, [polygon], 1)
+
+    filtered = mask.astype(np.uint8).copy()
+    filtered[polygon_mask == 0] = 0
+
+    return filtered
+
 def fill_small_holes(
     mask: np.ndarray,
     max_hole_area_cells: int,
