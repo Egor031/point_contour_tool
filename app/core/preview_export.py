@@ -202,3 +202,70 @@ def save_contour_preview(
         )
 
     cv2.imwrite(str(output_path), image_bgr)
+
+def save_holes_preview(
+    mask: np.ndarray,
+    holes,
+    output_path: str | Path,
+    max_size: int = 3000,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    image = (mask.astype(np.uint8) * 180)
+    image = np.flipud(image)
+
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    h, w = mask.shape
+
+    for hole in holes:
+        # Переводим мировые координаты обратно в пиксельные нельзя сделать здесь,
+        # потому что у функции нет grid. Поэтому ниже мы будем передавать
+        # дополнительные pixel-поля в HoleCandidate.
+        if not hasattr(hole, "center_px"):
+            continue
+
+        cx = int(round(hole.center_px))
+        cy = int(round((h - 1) - hole.center_py))
+        r = int(round(hole.radius_px))
+
+        if hole.accepted:
+            color = (0, 255, 0)      # зелёный
+            thickness = 2
+        else:
+            color = (0, 0, 255)      # красный
+            thickness = 1
+
+        cv2.circle(
+            image_bgr,
+            center=(cx, cy),
+            radius=max(r, 2),
+            color=color,
+            thickness=thickness,
+        )
+
+        cv2.putText(
+            image_bgr,
+            text=str(hole.id),
+            org=(cx + 5, cy - 5),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.5,
+            color=color,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+
+    ih, iw = image_bgr.shape[:2]
+    scale = min(max_size / max(iw, ih), 1.0)
+
+    if scale < 1.0:
+        new_w = int(iw * scale)
+        new_h = int(ih * scale)
+        image_bgr = cv2.resize(
+            image_bgr,
+            (new_w, new_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    cv2.imwrite(str(output_path), image_bgr)

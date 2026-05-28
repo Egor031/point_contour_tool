@@ -17,6 +17,7 @@ from app.core.preview_export import (
     save_smoothed_density_preview,
     save_mask_preview,
     save_contour_preview,
+    save_holes_preview,
 )
 from app.core.mask_processing import (
     build_mask_from_density,
@@ -27,6 +28,11 @@ from app.core.mask_processing import (
 from app.core.contour_extractor import (
     build_external_contour,
     save_contour_csv,
+)
+
+from app.core.hole_detector import (
+    detect_circular_holes,
+    save_holes_csv,
 )
 
 from app.core.xyz_reader import compute_stats
@@ -126,12 +132,46 @@ def main() -> None:
         help="Simplify contour tolerance in source units, probably millimeters. Default: 0.0",
     )
 
+    parser.add_argument(
+        "--holes",
+        action="store_true",
+        help="Detect circular holes inside final mask",
+    )
+
+    parser.add_argument(
+        "--min-hole-diameter-mm",
+        type=float,
+        default=8.0,
+        help="Minimum hole diameter to keep, in source units. Default: 8.0",
+    )
+
+    parser.add_argument(
+        "--max-hole-diameter-mm",
+        type=float,
+        default=0.0,
+        help="Maximum hole diameter to keep. 0 means no limit. Default: 0",
+    )
+
+    parser.add_argument(
+        "--min-circularity",
+        type=float,
+        default=0.55,
+        help="Minimum circularity for hole candidate. Default: 0.55",
+    )
+
+    parser.add_argument(
+        "--max-circle-error-ratio",
+        type=float,
+        default=0.18,
+        help="Maximum mean fitting error divided by radius. Default: 0.18",
+    )
+
     args = parser.parse_args()
 
     input_path = Path(args.input_file)
     output_dir = Path(args.out)
     cache_dir = Path(args.cache)
-
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -139,6 +179,8 @@ def main() -> None:
         raise FileNotFoundError(f"Файл не найден: {input_path}")
 
     base_name = input_path.stem
+
+    
 
     print(f"Файл: {input_path}")
     print(f"Размер ячейки: {args.cell}")
@@ -196,6 +238,10 @@ def main() -> None:
     mask_path = output_dir / f"{base_name}_mask_cell_{cell_text}_threshold_{args.threshold}.png"
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
 
+    holes_csv_path = (
+        output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.csv"
+    )
+
     contour_preview_path = (
         output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.png"
     )
@@ -206,6 +252,10 @@ def main() -> None:
     contour_dxf_path = (
         output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.dxf"
     )
+
+    holes_preview_path = (
+        output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.png"
+        )
 
     save_density_preview(grid, preview_path, max_size=args.preview_size)
 
@@ -238,8 +288,46 @@ def main() -> None:
     if args.keep_largest:
         mask = keep_largest_component(mask)
     
+
+    # Эту маску используем для поиска отверстий.
+    # Она уже очищена от внешнего мусора, но дырки ещё не залиты.
+    mask_for_holes = mask.copy()
+
+    # А эту маску используем для внешнего контура.
     if args.fill_holes_area > 0:
         mask = fill_small_holes(mask, args.fill_holes_area)
+
+    if args.fill_holes_area > 0:
+        mask = fill_small_holes(mask, args.fill_holes_area)
+
+    holes = []
+
+    if args.holes:
+        max_hole_diameter = (
+            None if args.max_hole_diameter_mm <= 0 else args.max_hole_diameter_mm
+        )
+
+        holes = detect_circular_holes(
+            mask=mask_for_holes,
+            grid=grid,
+            min_diameter_mm=args.min_hole_diameter_mm,
+            max_diameter_mm=max_hole_diameter,
+            min_circularity=args.min_circularity,
+            max_error_ratio=args.max_circle_error_ratio,
+        )
+
+        save_holes_csv(
+            holes=holes,
+            output_path=holes_csv_path,
+            only_accepted=False,
+        )
+
+        save_holes_preview(
+            mask=mask_for_holes,
+            holes=holes,
+            output_path=holes_preview_path,
+            max_size=args.preview_size,
+        )
 
     save_mask_preview(mask, mask_path, max_size=args.preview_size)
     save_report(stats, grid, report_path)
@@ -289,6 +377,26 @@ def main() -> None:
             print(f"Contour DXF:     {contour_dxf_path}")
 
         print(f"Contour points:  {contour_result.point_count:,}")
+
+    if args.holes:
+        accepted_holes = [hole for hole in holes if hole.accepted]
+
+        print(f"Holes CSV:      {holes_csv_path}")
+        print(f"Hole candidates:{len(holes):,}")
+        print(f"Accepted holes: {len(accepted_holes):,}")
+
+        for hole in accepted_holes[:20]:
+            print(
+                f"  Hole {hole.id}: "
+                f"center=({hole.center_x:.3f}, {hole.center_y:.3f}), "
+                f"r={hole.radius:.3f}, "
+                f"d={hole.diameter:.3f}, "
+                f"err={hole.error_ratio:.3f}"
+            )
+
+        if len(accepted_holes) > 20:
+            print("  ...")
+    print(f"Holes preview:  {holes_preview_path}")
     print(f"Время сохранения: {t3 - t2:.2f} сек")
 
     print(f"\nГотово. Общее время: {t3 - t0:.2f} сек")
