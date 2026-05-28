@@ -27,11 +27,16 @@ PARAM_GRID_HEIGHT = "param_original_grid_height"
 MIN_ZOOM = 0.1
 MAX_ZOOM = 16.0
 ZOOM_STEP = 1.25
+CANVAS_WIDTH = 2400
+CANVAS_HEIGHT = 1600
 
 state = {
     "image_width": 0,
     "image_height": 0,
     "zoom": 1.0,
+    "pan_x": 0.0,
+    "pan_y": 0.0,
+    "last_pan_mouse": None,
     "roi_first_world": None,
     "mode": "rectangle",
     "polygon_points": [],
@@ -63,24 +68,28 @@ def _scaled_image_size() -> tuple[int, int]:
     return width, height
 
 
-def _set_zoom(zoom: float) -> None:
+def _set_zoom(
+    zoom: float,
+    anchor_canvas_pos: tuple[float, float] | None = None,
+) -> None:
     old_zoom = float(state["zoom"])
     new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
 
     if abs(new_zoom - old_zoom) < 0.0001:
         return
 
-    old_x_scroll = dpg.get_x_scroll("image_area") if dpg.does_item_exist("image_area") else 0
-    old_y_scroll = dpg.get_y_scroll("image_area") if dpg.does_item_exist("image_area") else 0
+    if anchor_canvas_pos is None:
+        anchor_canvas_pos = (CANVAS_WIDTH / 2.0, CANVAS_HEIGHT / 2.0)
+
+    anchor_x, anchor_y = anchor_canvas_pos
+    image_anchor_x = (anchor_x - float(state["pan_x"])) / old_zoom
+    image_anchor_y = (anchor_y - float(state["pan_y"])) / old_zoom
 
     state["zoom"] = new_zoom
+    state["pan_x"] = anchor_x - image_anchor_x * new_zoom
+    state["pan_y"] = anchor_y - image_anchor_y * new_zoom
     dpg.set_value(ZOOM_TEXT_TAG, f"Zoom: {new_zoom * 100:.0f}%")
     _redraw_preview()
-
-    if dpg.does_item_exist("image_area") and old_zoom > 0:
-        scroll_scale = new_zoom / old_zoom
-        dpg.set_x_scroll("image_area", old_x_scroll * scroll_scale)
-        dpg.set_y_scroll("image_area", old_y_scroll * scroll_scale)
 
 
 def _redraw_preview() -> None:
@@ -95,14 +104,20 @@ def _redraw_preview() -> None:
     if dpg.does_item_exist(IMAGE_TAG):
         dpg.delete_item(IMAGE_TAG)
 
-    scaled_width, scaled_height = _scaled_image_size()
     with dpg.drawlist(
-        width=scaled_width,
-        height=scaled_height,
+        width=CANVAS_WIDTH,
+        height=CANVAS_HEIGHT,
         parent="image_area",
         tag=IMAGE_TAG,
     ):
-        dpg.draw_image(TEXTURE_TAG, (0, 0), (scaled_width, scaled_height))
+        scaled_width, scaled_height = _scaled_image_size()
+        pan_x = float(state["pan_x"])
+        pan_y = float(state["pan_y"])
+        dpg.draw_image(
+            TEXTURE_TAG,
+            (pan_x, pan_y),
+            (pan_x + scaled_width, pan_y + scaled_height),
+        )
 
     _redraw_polygon_overlay()
 
@@ -126,12 +141,14 @@ def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
     grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
 
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-    image_left, image_top = dpg.get_item_rect_min(IMAGE_TAG)
+    canvas_left, canvas_top = dpg.get_item_rect_min(IMAGE_TAG)
 
-    displayed_pixel_x = mouse_x - image_left
-    displayed_pixel_y = mouse_y - image_top
+    canvas_x = mouse_x - canvas_left
+    canvas_y = mouse_y - canvas_top
 
     scaled_width, scaled_height = _scaled_image_size()
+    displayed_pixel_x = canvas_x - float(state["pan_x"])
+    displayed_pixel_y = canvas_y - float(state["pan_y"])
 
     if (
         displayed_pixel_x < 0
@@ -182,7 +199,7 @@ def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float]
     pixel_x = grid_x * image_width / grid_width * zoom
     pixel_y = displayed_grid_y * image_height / grid_height * zoom
 
-    return pixel_x, pixel_y
+    return pixel_x + float(state["pan_x"]), pixel_y + float(state["pan_y"])
 
 
 def _update_polygon_points_text() -> None:
@@ -256,6 +273,8 @@ def _redraw_polygon_overlay() -> None:
 
 
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _update_pan_from_mouse()
+
     coords = _mouse_to_world()
     if coords is None:
         dpg.set_value(
@@ -278,6 +297,37 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
             world_y,
         ),
     )
+
+
+def _update_pan_from_mouse() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        state["last_pan_mouse"] = None
+        return
+
+    pan_button_down = (
+        dpg.is_mouse_button_down(dpg.mvMouseButton_Middle)
+        or dpg.is_mouse_button_down(dpg.mvMouseButton_Right)
+    )
+
+    if not pan_button_down:
+        state["last_pan_mouse"] = None
+        return
+
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+
+    if state["last_pan_mouse"] is None:
+        if dpg.is_item_hovered(IMAGE_TAG):
+            state["last_pan_mouse"] = (mouse_x, mouse_y)
+        return
+
+    last_x, last_y = state["last_pan_mouse"]
+    dx = mouse_x - last_x
+    dy = mouse_y - last_y
+
+    state["pan_x"] = float(state["pan_x"]) + dx
+    state["pan_y"] = float(state["pan_y"]) + dy
+    state["last_pan_mouse"] = (mouse_x, mouse_y)
+    _redraw_preview()
 
 
 def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -330,11 +380,15 @@ def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
     if not dpg.is_item_hovered(IMAGE_TAG):
         return
 
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    canvas_left, canvas_top = dpg.get_item_rect_min(IMAGE_TAG)
+    anchor = (mouse_x - canvas_left, mouse_y - canvas_top)
+
     wheel_delta = float(app_data or 0)
     if wheel_delta > 0:
-        _set_zoom(float(state["zoom"]) * ZOOM_STEP)
+        _set_zoom(float(state["zoom"]) * ZOOM_STEP, anchor_canvas_pos=anchor)
     elif wheel_delta < 0:
-        _set_zoom(float(state["zoom"]) / ZOOM_STEP)
+        _set_zoom(float(state["zoom"]) / ZOOM_STEP, anchor_canvas_pos=anchor)
 
 
 def _zoom_in_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -347,11 +401,11 @@ def _zoom_out_callback(_sender=None, _app_data=None, _user_data=None) -> None:
 
 def _reset_view_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["zoom"] = 1.0
+    state["pan_x"] = 0.0
+    state["pan_y"] = 0.0
+    state["last_pan_mouse"] = None
     dpg.set_value(ZOOM_TEXT_TAG, "Zoom: 100%")
     _redraw_preview()
-    if dpg.does_item_exist("image_area"):
-        dpg.set_x_scroll("image_area", 0)
-        dpg.set_y_scroll("image_area", 0)
 
 
 def _reset_roi_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -416,6 +470,9 @@ def _show_png(path: str | Path) -> None:
     state["image_width"] = width
     state["image_height"] = height
     state["zoom"] = 1.0
+    state["pan_x"] = 0.0
+    state["pan_y"] = 0.0
+    state["last_pan_mouse"] = None
     state["roi_first_world"] = None
     state["polygon_points"] = []
 
@@ -506,7 +563,9 @@ def run() -> None:
             with dpg.child_window(
                 tag="image_area",
                 border=False,
-                horizontal_scrollbar=True,
+                horizontal_scrollbar=False,
+                no_scrollbar=True,
+                no_scroll_with_mouse=True,
                 width=-370,
             ):
                 dpg.add_text(
