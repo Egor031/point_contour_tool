@@ -6,6 +6,8 @@ from typing import Literal
 import cv2
 import numpy as np
 
+from app.core.density_grid import DensityGrid
+
 
 ThresholdMode = Literal["auto", "manual"]
 
@@ -129,6 +131,34 @@ def keep_largest_component(mask: np.ndarray) -> np.ndarray:
         cleaned[labels == largest_label] = 1
 
     return cleaned
+
+
+def apply_roi_to_mask(
+    mask: np.ndarray,
+    grid: DensityGrid,
+    roi: tuple[float, float, float, float],
+) -> np.ndarray:
+    min_x, min_y, max_x, max_y = roi
+
+    if min_x > max_x:
+        min_x, max_x = max_x, min_x
+    if min_y > max_y:
+        min_y, max_y = max_y, min_y
+
+    height, width = mask.shape
+
+    x = grid.min_x + (np.arange(width) + 0.5) * grid.cell_size
+    y = grid.min_y + (np.arange(height) + 0.5) * grid.cell_size
+
+    x_inside = (x >= min_x) & (x <= max_x)
+    y_inside = (y >= min_y) & (y <= max_y)
+
+    roi_mask = y_inside[:, np.newaxis] & x_inside[np.newaxis, :]
+
+    filtered = mask.astype(np.uint8).copy()
+    filtered[~roi_mask] = 0
+
+    return filtered
 
 def fill_small_holes(
     mask: np.ndarray,

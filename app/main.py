@@ -20,6 +20,7 @@ from app.core.preview_export import (
     save_holes_preview,
 )
 from app.core.mask_processing import (
+    apply_roi_to_mask,
     build_mask_from_density,
     fill_small_holes,
     keep_largest_component,
@@ -105,6 +106,13 @@ def main() -> None:
         "--keep-largest",
         action="store_true",
         help="Keep only largest connected component in mask",
+    )
+    parser.add_argument(
+        "--roi",
+        type=float,
+        nargs=4,
+        metavar=("min_x", "min_y", "max_x", "max_y"),
+        help="Limit mask processing to ROI in world coordinates: min_x min_y max_x max_y",
     )
     parser.add_argument(
         "--fill-holes-area",
@@ -287,6 +295,15 @@ def main() -> None:
 
     if args.keep_largest:
         mask = keep_largest_component(mask)
+
+    if args.roi is not None:
+        roi = tuple(args.roi)
+        mask = apply_roi_to_mask(mask, grid, roi)
+        print(
+            "Applied ROI: "
+            f"min_x={roi[0]:.3f}, min_y={roi[1]:.3f}, "
+            f"max_x={roi[2]:.3f}, max_y={roi[3]:.3f}"
+        )
     
 
     # Эту маску используем для поиска отверстий.
