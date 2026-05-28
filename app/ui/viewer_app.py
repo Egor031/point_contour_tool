@@ -6,11 +6,17 @@ import dearpygui.dearpygui as dpg
 
 
 TEXTURE_TAG = "preview_texture"
-IMAGE_TAG = "preview_image"
+IMAGE_TAG = "preview_drawlist"
+POLYGON_LAYER_TAG = "polygon_overlay_layer"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
 ROI_OUTPUT_TAG = "roi_output_text"
+POLYGON_COUNT_TAG = "polygon_count_text"
+POLYGON_LAST_TAG = "polygon_last_text"
+POLYGON_POINTS_TAG = "polygon_points_text"
+POLYGON_OUTPUT_TAG = "polygon_output_text"
+ZOOM_TEXT_TAG = "zoom_text"
 
 PARAM_GRID_MIN_X = "param_grid_min_x"
 PARAM_GRID_MIN_Y = "param_grid_min_y"
@@ -18,10 +24,17 @@ PARAM_CELL_SIZE = "param_cell_size"
 PARAM_GRID_WIDTH = "param_original_grid_width"
 PARAM_GRID_HEIGHT = "param_original_grid_height"
 
+MIN_ZOOM = 0.1
+MAX_ZOOM = 16.0
+ZOOM_STEP = 1.25
+
 state = {
     "image_width": 0,
     "image_height": 0,
+    "zoom": 1.0,
     "roi_first_world": None,
+    "mode": "rectangle",
+    "polygon_points": [],
 }
 
 
@@ -40,6 +53,58 @@ def _get_preview_params() -> tuple[float, float, float, int, int] | None:
         return None
 
     return grid_min_x, grid_min_y, cell_size, grid_width, grid_height
+
+
+def _scaled_image_size() -> tuple[int, int]:
+    zoom = float(state["zoom"])
+    width = max(1, int(round(int(state["image_width"]) * zoom)))
+    height = max(1, int(round(int(state["image_height"]) * zoom)))
+
+    return width, height
+
+
+def _set_zoom(zoom: float) -> None:
+    old_zoom = float(state["zoom"])
+    new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
+
+    if abs(new_zoom - old_zoom) < 0.0001:
+        return
+
+    old_x_scroll = dpg.get_x_scroll("image_area") if dpg.does_item_exist("image_area") else 0
+    old_y_scroll = dpg.get_y_scroll("image_area") if dpg.does_item_exist("image_area") else 0
+
+    state["zoom"] = new_zoom
+    dpg.set_value(ZOOM_TEXT_TAG, f"Zoom: {new_zoom * 100:.0f}%")
+    _redraw_preview()
+
+    if dpg.does_item_exist("image_area") and old_zoom > 0:
+        scroll_scale = new_zoom / old_zoom
+        dpg.set_x_scroll("image_area", old_x_scroll * scroll_scale)
+        dpg.set_y_scroll("image_area", old_y_scroll * scroll_scale)
+
+
+def _redraw_preview() -> None:
+    if not dpg.does_item_exist(TEXTURE_TAG):
+        return
+
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return
+
+    if dpg.does_item_exist(IMAGE_TAG):
+        dpg.delete_item(IMAGE_TAG)
+
+    scaled_width, scaled_height = _scaled_image_size()
+    with dpg.drawlist(
+        width=scaled_width,
+        height=scaled_height,
+        parent="image_area",
+        tag=IMAGE_TAG,
+    ):
+        dpg.draw_image(TEXTURE_TAG, (0, 0), (scaled_width, scaled_height))
+
+    _redraw_polygon_overlay()
 
 
 def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
@@ -63,20 +128,131 @@ def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
     image_left, image_top = dpg.get_item_rect_min(IMAGE_TAG)
 
-    pixel_x = mouse_x - image_left
-    pixel_y = mouse_y - image_top
+    displayed_pixel_x = mouse_x - image_left
+    displayed_pixel_y = mouse_y - image_top
 
-    if pixel_x < 0 or pixel_y < 0 or pixel_x >= image_width or pixel_y >= image_height:
+    scaled_width, scaled_height = _scaled_image_size()
+
+    if (
+        displayed_pixel_x < 0
+        or displayed_pixel_y < 0
+        or displayed_pixel_x >= scaled_width
+        or displayed_pixel_y >= scaled_height
+    ):
         return None
 
-    displayed_grid_x = pixel_x * grid_width / image_width
-    displayed_grid_y = pixel_y * grid_height / image_height
+    zoom = float(state["zoom"])
+    original_pixel_x = displayed_pixel_x / zoom
+    original_pixel_y = displayed_pixel_y / zoom
+
+    displayed_grid_x = original_pixel_x * grid_width / image_width
+    displayed_grid_y = original_pixel_y * grid_height / image_height
     original_grid_y = (grid_height - 1) - displayed_grid_y
 
     world_x = grid_min_x + (displayed_grid_x + 0.5) * cell_size
     world_y = grid_min_y + (original_grid_y + 0.5) * cell_size
 
-    return pixel_x, pixel_y, displayed_grid_x, original_grid_y, world_x, world_y
+    return (
+        displayed_pixel_x,
+        displayed_pixel_y,
+        displayed_grid_x,
+        original_grid_y,
+        world_x,
+        world_y,
+    )
+
+
+def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float] | None:
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    params = _get_preview_params()
+    if params is None:
+        return None
+
+    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
+
+    grid_x = (world_x - grid_min_x) / cell_size
+    original_grid_y = (world_y - grid_min_y) / cell_size
+    displayed_grid_y = (grid_height - 1) - original_grid_y
+
+    zoom = float(state["zoom"])
+    pixel_x = grid_x * image_width / grid_width * zoom
+    pixel_y = displayed_grid_y * image_height / grid_height * zoom
+
+    return pixel_x, pixel_y
+
+
+def _update_polygon_points_text() -> None:
+    points = state["polygon_points"]
+    dpg.set_value(POLYGON_COUNT_TAG, f"Polygon points count: {len(points)}")
+
+    if not points:
+        dpg.set_value(POLYGON_LAST_TAG, "Last point: -")
+        dpg.set_value(POLYGON_POINTS_TAG, "Polygon points: none")
+        return
+
+    last_x, last_y = points[-1]
+    dpg.set_value(POLYGON_LAST_TAG, f"Last point: {last_x:.6f}, {last_y:.6f}")
+
+    lines = ["Polygon points:"]
+    for index, (x, y) in enumerate(points, start=1):
+        lines.append(f"{index}: {x:.6f}, {y:.6f}")
+
+    dpg.set_value(POLYGON_POINTS_TAG, "\n".join(lines))
+
+
+def _redraw_polygon_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(POLYGON_LAYER_TAG):
+        dpg.delete_item(POLYGON_LAYER_TAG)
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=POLYGON_LAYER_TAG)
+
+    pixel_points = []
+    for world_x, world_y in state["polygon_points"]:
+        pixel_point = _world_to_image_pixel(world_x, world_y)
+        if pixel_point is not None:
+            pixel_points.append(pixel_point)
+
+    if len(pixel_points) >= 2:
+        for point_a, point_b in zip(pixel_points, pixel_points[1:]):
+            dpg.draw_line(
+                point_a,
+                point_b,
+                color=(255, 210, 70, 255),
+                thickness=2,
+                parent=POLYGON_LAYER_TAG,
+            )
+
+    if len(pixel_points) >= 3:
+        dpg.draw_line(
+            pixel_points[-1],
+            pixel_points[0],
+            color=(255, 210, 70, 180),
+            thickness=2,
+            parent=POLYGON_LAYER_TAG,
+        )
+
+    for index, (pixel_x, pixel_y) in enumerate(pixel_points, start=1):
+        dpg.draw_circle(
+            (pixel_x, pixel_y),
+            4,
+            color=(255, 80, 80, 255),
+            fill=(255, 80, 80, 220),
+            parent=POLYGON_LAYER_TAG,
+        )
+        dpg.draw_text(
+            (pixel_x + 6, pixel_y + 6),
+            str(index),
+            color=(255, 255, 255, 255),
+            size=14,
+            parent=POLYGON_LAYER_TAG,
+        )
 
 
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -110,6 +286,18 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
         return
 
     *_unused, world_x, world_y = coords
+
+    if state["mode"] == "polygon":
+        state["polygon_points"].append((world_x, world_y))
+        dpg.set_value(
+            ROI_STATUS_TAG,
+            f"Polygon ROI: added point {len(state['polygon_points'])}.",
+        )
+        dpg.set_value(POLYGON_OUTPUT_TAG, "")
+        _update_polygon_points_text()
+        _redraw_polygon_overlay()
+        return
+
     first_world = state["roi_first_world"]
 
     if first_world is None:
@@ -135,10 +323,68 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
     )
 
 
+def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if not dpg.is_item_hovered(IMAGE_TAG):
+        return
+
+    wheel_delta = float(app_data or 0)
+    if wheel_delta > 0:
+        _set_zoom(float(state["zoom"]) * ZOOM_STEP)
+    elif wheel_delta < 0:
+        _set_zoom(float(state["zoom"]) / ZOOM_STEP)
+
+
+def _zoom_in_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _set_zoom(float(state["zoom"]) * ZOOM_STEP)
+
+
+def _zoom_out_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _set_zoom(float(state["zoom"]) / ZOOM_STEP)
+
+
+def _reset_view_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["zoom"] = 1.0
+    dpg.set_value(ZOOM_TEXT_TAG, "Zoom: 100%")
+    _redraw_preview()
+    if dpg.does_item_exist("image_area"):
+        dpg.set_x_scroll("image_area", 0)
+        dpg.set_y_scroll("image_area", 0)
+
+
 def _reset_roi_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["roi_first_world"] = None
+    state["mode"] = "rectangle"
     dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
     dpg.set_value(ROI_OUTPUT_TAG, "")
+
+
+def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["mode"] = "polygon"
+    state["roi_first_world"] = None
+    dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
+
+
+def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    points = state["polygon_points"]
+    if len(points) < 3:
+        dpg.set_value(ROI_STATUS_TAG, "Polygon ROI needs at least 3 points.")
+        dpg.set_value(POLYGON_OUTPUT_TAG, "")
+        return
+
+    points_text = ";".join(f"{x:.6f},{y:.6f}" for x, y in points)
+    dpg.set_value(ROI_STATUS_TAG, "Polygon ROI ready.")
+    dpg.set_value(POLYGON_OUTPUT_TAG, f'--roi-poly "{points_text}"')
+
+
+def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["polygon_points"] = []
+    dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    _update_polygon_points_text()
+    _redraw_polygon_overlay()
+    dpg.set_value(ROI_STATUS_TAG, "Polygon ROI cleared.")
 
 
 def _show_png(path: str | Path) -> None:
@@ -167,11 +413,11 @@ def _show_png(path: str | Path) -> None:
     if dpg.does_item_exist("image_hint"):
         dpg.delete_item("image_hint")
 
-    dpg.add_image(TEXTURE_TAG, parent="image_area", tag=IMAGE_TAG)
-
     state["image_width"] = width
     state["image_height"] = height
+    state["zoom"] = 1.0
     state["roi_first_world"] = None
+    state["polygon_points"] = []
 
     if int(dpg.get_value(PARAM_GRID_WIDTH)) <= 0:
         dpg.set_value(PARAM_GRID_WIDTH, width)
@@ -180,6 +426,10 @@ def _show_png(path: str | Path) -> None:
 
     dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
     dpg.set_value(ROI_OUTPUT_TAG, "")
+    dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    dpg.set_value(ZOOM_TEXT_TAG, "Zoom: 100%")
+    _update_polygon_points_text()
+    _redraw_preview()
     _set_status(f"Loaded: {image_path}")
 
 
@@ -211,6 +461,7 @@ def run() -> None:
             button=dpg.mvMouseButton_Left,
             callback=_mouse_click_callback,
         )
+        dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
 
     with dpg.window(label="Point Contour Preview Viewer", tag="main_window"):
         dpg.add_text("Preview viewer for density/mask PNG images.")
@@ -244,16 +495,55 @@ def run() -> None:
             "pixel_x=- pixel_y=- | grid_x=- grid_y=- | world_x=- world_y=-",
             tag=COORDS_TAG,
         )
-        dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
-        dpg.add_button(label="Reset ROI", callback=_reset_roi_callback)
-        dpg.add_text("", tag=ROI_OUTPUT_TAG)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Reset view", callback=_reset_view_callback)
+            dpg.add_button(label="Zoom in", callback=_zoom_in_callback)
+            dpg.add_button(label="Zoom out", callback=_zoom_out_callback)
+            dpg.add_text("Zoom: 100%", tag=ZOOM_TEXT_TAG)
         dpg.add_separator()
 
-        with dpg.child_window(tag="image_area", border=False, horizontal_scrollbar=True):
-            dpg.add_text(
-                "Open a density or mask preview PNG to view it here.",
-                tag="image_hint",
-            )
+        with dpg.group(horizontal=True):
+            with dpg.child_window(
+                tag="image_area",
+                border=False,
+                horizontal_scrollbar=True,
+                width=-370,
+            ):
+                dpg.add_text(
+                    "Open a density or mask preview PNG to view it here.",
+                    tag="image_hint",
+                )
+
+            with dpg.child_window(tag="roi_side_panel", width=350, border=True):
+                dpg.add_text("ROI tools")
+                dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
+                dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
+                dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
+                dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
+                dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
+                dpg.add_separator()
+                dpg.add_text("Rectangle ROI")
+                dpg.add_input_text(
+                    tag=ROI_OUTPUT_TAG,
+                    readonly=True,
+                    multiline=True,
+                    width=-1,
+                    height=55,
+                )
+                dpg.add_separator()
+                dpg.add_text("Polygon ROI")
+                dpg.add_text("Polygon points count: 0", tag=POLYGON_COUNT_TAG)
+                dpg.add_text("Last point: -", tag=POLYGON_LAST_TAG)
+                dpg.add_input_text(
+                    tag=POLYGON_OUTPUT_TAG,
+                    readonly=True,
+                    multiline=True,
+                    width=-1,
+                    height=90,
+                )
+                with dpg.tree_node(label="Full polygon points", default_open=False):
+                    with dpg.child_window(height=220, border=True):
+                        dpg.add_text("Polygon points: none", tag=POLYGON_POINTS_TAG)
 
     dpg.create_viewport(title="Point Contour Preview Viewer", width=1200, height=850)
     dpg.setup_dearpygui()
