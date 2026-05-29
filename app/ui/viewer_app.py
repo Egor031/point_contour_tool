@@ -17,6 +17,20 @@ POLYGON_LAST_TAG = "polygon_last_text"
 POLYGON_POINTS_TAG = "polygon_points_text"
 POLYGON_OUTPUT_TAG = "polygon_output_text"
 ZOOM_TEXT_TAG = "zoom_text"
+COMMAND_OUTPUT_TAG = "command_output_text"
+
+CMD_INPUT_FILE_TAG = "cmd_input_file_path"
+CMD_CELL_TAG = "cmd_cell"
+CMD_THRESHOLD_TAG = "cmd_threshold"
+CMD_FILL_HOLES_TAG = "cmd_fill_holes_area"
+CMD_BOUNDARY_WIDTH_TAG = "cmd_boundary_width_mm"
+CMD_SIMPLIFY_TAG = "cmd_simplify_mm"
+CMD_KEEP_LARGEST_TAG = "cmd_keep_largest"
+CMD_CONTOUR_TAG = "cmd_contour"
+CMD_DXF_TAG = "cmd_dxf"
+CMD_EXPORT_CLEAN_TAG = "cmd_export_clean"
+CMD_EXPORT_BOUNDARY_TAG = "cmd_export_boundary"
+CMD_HOLES_TAG = "cmd_holes"
 
 PARAM_GRID_MIN_X = "param_grid_min_x"
 PARAM_GRID_MIN_Y = "param_grid_min_y"
@@ -45,6 +59,11 @@ state = {
 
 def _set_status(message: str) -> None:
     dpg.set_value(STATUS_TAG, message)
+
+
+def _format_cli_float(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _get_preview_params() -> tuple[float, float, float, int, int] | None:
@@ -369,7 +388,11 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
     dpg.set_value(ROI_STATUS_TAG, "ROI rectangle ready.")
     dpg.set_value(
         ROI_OUTPUT_TAG,
-        f"--roi {min_x:.6f} {min_y:.6f} {max_x:.6f} {max_y:.6f}",
+        "--roi "
+        f"{_format_cli_float(min_x)} "
+        f"{_format_cli_float(min_y)} "
+        f"{_format_cli_float(max_x)} "
+        f"{_format_cli_float(max_y)}",
     )
 
 
@@ -428,7 +451,9 @@ def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> N
         dpg.set_value(POLYGON_OUTPUT_TAG, "")
         return
 
-    points_text = ";".join(f"{x:.6f},{y:.6f}" for x, y in points)
+    points_text = ";".join(
+        f"{_format_cli_float(x)},{_format_cli_float(y)}" for x, y in points
+    )
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI ready.")
     dpg.set_value(POLYGON_OUTPUT_TAG, f'--roi-poly "{points_text}"')
 
@@ -439,6 +464,83 @@ def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> No
     _update_polygon_points_text()
     _redraw_polygon_overlay()
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI cleared.")
+
+
+def _quote_command_arg(value: str) -> str:
+    return '"' + value.replace('"', '\\"') + '"'
+
+
+def _append_option(parts: list[str], name: str, value) -> None:
+    parts.append(name)
+    parts.append(str(value))
+
+
+def _append_float_option(parts: list[str], name: str, value: float) -> None:
+    _append_option(parts, name, _format_cli_float(value))
+
+
+def _generate_command_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    input_file_path = str(dpg.get_value(CMD_INPUT_FILE_TAG)).strip()
+    cell = float(dpg.get_value(CMD_CELL_TAG))
+    threshold = str(dpg.get_value(CMD_THRESHOLD_TAG)).strip() or "auto"
+    fill_holes_area = int(dpg.get_value(CMD_FILL_HOLES_TAG))
+    boundary_width_mm = float(dpg.get_value(CMD_BOUNDARY_WIDTH_TAG))
+    simplify_mm = float(dpg.get_value(CMD_SIMPLIFY_TAG))
+
+    contour_enabled = bool(dpg.get_value(CMD_CONTOUR_TAG))
+    dxf_enabled = bool(dpg.get_value(CMD_DXF_TAG))
+
+    parts = [
+        "python",
+        "-m",
+        "app.main",
+        _quote_command_arg(input_file_path),
+    ]
+
+    _append_float_option(parts, "--cell", cell)
+    _append_option(parts, "--threshold", threshold)
+
+    rectangle_roi = str(dpg.get_value(ROI_OUTPUT_TAG)).strip()
+    if rectangle_roi:
+        parts.append(rectangle_roi)
+
+    polygon_roi = str(dpg.get_value(POLYGON_OUTPUT_TAG)).strip()
+    if polygon_roi:
+        parts.append(polygon_roi)
+
+    if bool(dpg.get_value(CMD_KEEP_LARGEST_TAG)):
+        parts.append("--keep-largest")
+
+    if fill_holes_area > 0:
+        _append_option(parts, "--fill-holes-area", _format_cli_float(fill_holes_area))
+
+    if contour_enabled or dxf_enabled:
+        parts.append("--contour")
+
+    if dxf_enabled:
+        parts.append("--dxf")
+
+    if bool(dpg.get_value(CMD_EXPORT_CLEAN_TAG)):
+        parts.append("--export-clean")
+
+    if bool(dpg.get_value(CMD_EXPORT_BOUNDARY_TAG)):
+        parts.append("--export-boundary")
+        _append_float_option(parts, "--boundary-width-mm", boundary_width_mm)
+
+    if simplify_mm > 0:
+        _append_float_option(parts, "--simplify-mm", simplify_mm)
+
+    if bool(dpg.get_value(CMD_HOLES_TAG)):
+        parts.append("--holes")
+
+    dpg.set_value(COMMAND_OUTPUT_TAG, " ".join(parts))
+
+
+def _copy_command_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    command = str(dpg.get_value(COMMAND_OUTPUT_TAG)).strip()
+    if command:
+        dpg.set_clipboard_text(command)
+        _set_status("Command copied to clipboard.")
 
 
 def _show_png(path: str | Path) -> None:
@@ -603,6 +705,68 @@ def run() -> None:
                 with dpg.tree_node(label="Full polygon points", default_open=False):
                     with dpg.child_window(height=220, border=True):
                         dpg.add_text("Polygon points: none", tag=POLYGON_POINTS_TAG)
+                dpg.add_separator()
+                with dpg.tree_node(label="Command generator", default_open=True):
+                    dpg.add_text("input_file_path")
+                    dpg.add_input_text(
+                        tag=CMD_INPUT_FILE_TAG,
+                        width=-1,
+                    )
+                    dpg.add_text("cell")
+                    dpg.add_input_float(
+                        tag=CMD_CELL_TAG,
+                        default_value=0.5,
+                        width=-1,
+                    )
+                    dpg.add_text("threshold")
+                    dpg.add_input_text(
+                        tag=CMD_THRESHOLD_TAG,
+                        default_value="auto",
+                        width=-1,
+                    )
+                    dpg.add_text("fill_holes_area")
+                    dpg.add_input_int(
+                        tag=CMD_FILL_HOLES_TAG,
+                        default_value=0,
+                        min_value=0,
+                        width=-1,
+                    )
+                    dpg.add_text("boundary_width_mm")
+                    dpg.add_input_float(
+                        tag=CMD_BOUNDARY_WIDTH_TAG,
+                        default_value=5.0,
+                        width=-1,
+                    )
+                    dpg.add_text("simplify_mm")
+                    dpg.add_input_float(
+                        tag=CMD_SIMPLIFY_TAG,
+                        default_value=0.0,
+                        width=-1,
+                    )
+                    dpg.add_checkbox(label="keep_largest", tag=CMD_KEEP_LARGEST_TAG)
+                    dpg.add_checkbox(label="contour", tag=CMD_CONTOUR_TAG)
+                    dpg.add_checkbox(label="dxf", tag=CMD_DXF_TAG)
+                    dpg.add_checkbox(label="export_clean", tag=CMD_EXPORT_CLEAN_TAG)
+                    dpg.add_checkbox(
+                        label="export_boundary",
+                        tag=CMD_EXPORT_BOUNDARY_TAG,
+                    )
+                    dpg.add_checkbox(label="holes", tag=CMD_HOLES_TAG)
+                    dpg.add_button(
+                        label="Generate command",
+                        callback=_generate_command_callback,
+                    )
+                    dpg.add_input_text(
+                        tag=COMMAND_OUTPUT_TAG,
+                        readonly=True,
+                        multiline=True,
+                        width=-1,
+                        height=120,
+                    )
+                    dpg.add_button(
+                        label="Copy command to clipboard",
+                        callback=_copy_command_callback,
+                    )
 
     dpg.create_viewport(title="Point Contour Preview Viewer", width=1200, height=850)
     dpg.setup_dearpygui()
