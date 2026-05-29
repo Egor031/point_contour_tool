@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -39,6 +40,10 @@ from app.core.hole_detector import (
 
 from app.core.xyz_reader import compute_stats
 
+from app.exporters.boundary_xyz_exporter import (
+    build_boundary_band_mask,
+    export_boundary_points,
+)
 from app.exporters.clean_xyz_exporter import export_clean_points
 from app.exporters.dxf_exporter import save_contour_dxf
 
@@ -178,6 +183,19 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--export-boundary",
+        action="store_true",
+        help="Export point cloud near final mask boundary",
+    )
+
+    parser.add_argument(
+        "--boundary-width-mm",
+        type=float,
+        default=5.0,
+        help="Boundary band width in source units. Default: 5.0",
+    )
+
+    parser.add_argument(
         "--simplify-mm",
         type=float,
         default=0.0,
@@ -291,6 +309,14 @@ def main() -> None:
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
     clean_path = (
         output_dir / f"{base_name}_clean_cell_{cell_text}_threshold_{args.threshold}.asc"
+    )
+    boundary_width_text = str(args.boundary_width_mm).replace(".", "_")
+    boundary_path = (
+        output_dir
+        / (
+            f"{base_name}_boundary_cell_{cell_text}_threshold_{args.threshold}"
+            f"_width_{boundary_width_text}mm.asc"
+        )
     )
 
     holes_csv_path = (
@@ -413,6 +439,21 @@ def main() -> None:
             mask=mask,
         )
 
+    boundary_point_count = None
+
+    if args.export_boundary:
+        boundary_width_cells = int(math.ceil(args.boundary_width_mm / grid.cell_size))
+        boundary_mask = build_boundary_band_mask(
+            mask=mask,
+            width_cells=boundary_width_cells,
+        )
+        boundary_point_count = export_boundary_points(
+            input_path=input_path,
+            output_path=boundary_path,
+            grid=grid,
+            boundary_mask=boundary_mask,
+        )
+
     contour_result = None
 
     if args.contour:
@@ -453,6 +494,9 @@ def main() -> None:
     if clean_point_count is not None:
         print(f"Clean points:   {clean_path}")
         print(f"Clean count:    {clean_point_count:,}")
+    if boundary_point_count is not None:
+        print(f"Boundary points:{boundary_path}")
+        print(f"Boundary count: {boundary_point_count:,}")
     if contour_result is not None:
         print(f"Contour preview: {contour_preview_path}")
         print(f"Contour CSV:     {contour_csv_path}")
