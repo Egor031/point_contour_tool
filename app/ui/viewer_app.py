@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import dearpygui.dearpygui as dpg
+import numpy as np
 
 
 TEXTURE_TAG = "preview_texture"
+SELECTION_TEXTURE_TAG = "selection_dim_texture"
 IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
+SELECTION_LAYER_TAG = "selection_dim_layer"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -18,6 +22,7 @@ POLYGON_POINTS_TAG = "polygon_points_text"
 POLYGON_OUTPUT_TAG = "polygon_output_text"
 ZOOM_TEXT_TAG = "zoom_text"
 COMMAND_OUTPUT_TAG = "command_output_text"
+DEBUG_COORDS_TAG = "debug_coords_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -52,6 +57,12 @@ state = {
     "pan_y": 0.0,
     "last_pan_mouse": None,
     "roi_first_world": None,
+    "rectangle_roi": None,
+    "polygon_finished": False,
+    "selection_applied": False,
+    "editing_overlay_visible": True,
+    "selection_kind": None,
+    "selection_polygon_points": [],
     "mode": "rectangle",
     "polygon_points": [],
 }
@@ -85,6 +96,46 @@ def _scaled_image_size() -> tuple[int, int]:
     height = max(1, int(round(int(state["image_height"]) * zoom)))
 
     return width, height
+
+
+def _image_origin() -> tuple[float, float]:
+    return float(state["pan_x"]), float(state["pan_y"])
+
+
+def _screen_to_canvas(mouse_x: float, mouse_y: float) -> tuple[float, float] | None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return None
+
+    canvas_left, canvas_top = dpg.get_item_rect_min(IMAGE_TAG)
+    return mouse_x - canvas_left, mouse_y - canvas_top
+
+
+def screen_to_image(mouse_x: float, mouse_y: float) -> tuple[float, float] | None:
+    canvas_pos = _screen_to_canvas(mouse_x, mouse_y)
+    if canvas_pos is None:
+        return None
+
+    canvas_x, canvas_y = canvas_pos
+    origin_x, origin_y = _image_origin()
+    zoom = float(state["zoom"])
+    if zoom <= 0:
+        return None
+
+    image_x = (canvas_x - origin_x) / zoom
+    image_y = (canvas_y - origin_y) / zoom
+
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_x < 0 or image_y < 0 or image_x >= image_width or image_y >= image_height:
+        return None
+
+    return image_x, image_y
+
+
+def image_to_drawlist(image_x: float, image_y: float) -> tuple[float, float]:
+    origin_x, origin_y = _image_origin()
+    zoom = float(state["zoom"])
+    return origin_x + image_x * zoom, origin_y + image_y * zoom
 
 
 def _set_zoom(
@@ -138,7 +189,31 @@ def _redraw_preview() -> None:
             (pan_x + scaled_width, pan_y + scaled_height),
         )
 
+    _redraw_selection_overlay()
     _redraw_polygon_overlay()
+
+
+def _redraw_selection_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(SELECTION_LAYER_TAG):
+        dpg.delete_item(SELECTION_LAYER_TAG)
+
+    if not state["selection_applied"] or not dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=SELECTION_LAYER_TAG)
+
+    scaled_width, scaled_height = _scaled_image_size()
+    pan_x = float(state["pan_x"])
+    pan_y = float(state["pan_y"])
+    dpg.draw_image(
+        SELECTION_TEXTURE_TAG,
+        (pan_x, pan_y),
+        (pan_x + scaled_width, pan_y + scaled_height),
+        parent=SELECTION_LAYER_TAG,
+    )
 
 
 def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
@@ -160,37 +235,22 @@ def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
     grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
 
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-    canvas_left, canvas_top = dpg.get_item_rect_min(IMAGE_TAG)
-
-    canvas_x = mouse_x - canvas_left
-    canvas_y = mouse_y - canvas_top
-
-    scaled_width, scaled_height = _scaled_image_size()
-    displayed_pixel_x = canvas_x - float(state["pan_x"])
-    displayed_pixel_y = canvas_y - float(state["pan_y"])
-
-    if (
-        displayed_pixel_x < 0
-        or displayed_pixel_y < 0
-        or displayed_pixel_x >= scaled_width
-        or displayed_pixel_y >= scaled_height
-    ):
+    image_pos = screen_to_image(mouse_x, mouse_y)
+    if image_pos is None:
         return None
 
-    zoom = float(state["zoom"])
-    original_pixel_x = displayed_pixel_x / zoom
-    original_pixel_y = displayed_pixel_y / zoom
+    original_pixel_x, original_pixel_y = image_pos
 
     displayed_grid_x = original_pixel_x * grid_width / image_width
     displayed_grid_y = original_pixel_y * grid_height / image_height
     original_grid_y = (grid_height - 1) - displayed_grid_y
 
-    world_x = grid_min_x + (displayed_grid_x + 0.5) * cell_size
-    world_y = grid_min_y + (original_grid_y + 0.5) * cell_size
+    world_x = grid_min_x + displayed_grid_x * cell_size
+    world_y = grid_min_y + original_grid_y * cell_size
 
     return (
-        displayed_pixel_x,
-        displayed_pixel_y,
+        original_pixel_x,
+        original_pixel_y,
         displayed_grid_x,
         original_grid_y,
         world_x,
@@ -214,11 +274,35 @@ def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float]
     original_grid_y = (world_y - grid_min_y) / cell_size
     displayed_grid_y = (grid_height - 1) - original_grid_y
 
-    zoom = float(state["zoom"])
-    pixel_x = grid_x * image_width / grid_width * zoom
-    pixel_y = displayed_grid_y * image_height / grid_height * zoom
+    pixel_x = grid_x * image_width / grid_width
+    pixel_y = displayed_grid_y * image_height / grid_height
 
-    return pixel_x + float(state["pan_x"]), pixel_y + float(state["pan_y"])
+    return image_to_drawlist(pixel_x, pixel_y)
+
+
+def _world_to_original_image_pixel(
+    world_x: float,
+    world_y: float,
+) -> tuple[float, float] | None:
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    params = _get_preview_params()
+    if params is None:
+        return None
+
+    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
+
+    grid_x = (world_x - grid_min_x) / cell_size
+    original_grid_y = (world_y - grid_min_y) / cell_size
+    displayed_grid_y = (grid_height - 1) - original_grid_y
+
+    pixel_x = grid_x * image_width / grid_width
+    pixel_y = displayed_grid_y * image_height / grid_height
+
+    return pixel_x, pixel_y
 
 
 def _update_polygon_points_text() -> None:
@@ -247,7 +331,26 @@ def _redraw_polygon_overlay() -> None:
     if dpg.does_item_exist(POLYGON_LAYER_TAG):
         dpg.delete_item(POLYGON_LAYER_TAG)
 
+    if not state["editing_overlay_visible"]:
+        return
+
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=POLYGON_LAYER_TAG)
+
+    rectangle_roi = state["rectangle_roi"]
+    if rectangle_roi is not None:
+        min_x, min_y, max_x, max_y = rectangle_roi
+        pixel_a = _world_to_image_pixel(min_x, min_y)
+        pixel_b = _world_to_image_pixel(max_x, max_y)
+        if pixel_a is not None and pixel_b is not None:
+            ax, ay = pixel_a
+            bx, by = pixel_b
+            dpg.draw_rectangle(
+                (min(ax, bx), min(ay, by)),
+                (max(ax, bx), max(ay, by)),
+                color=(80, 220, 255, 230),
+                thickness=2,
+                parent=POLYGON_LAYER_TAG,
+            )
 
     pixel_points = []
     for world_x, world_y in state["polygon_points"]:
@@ -293,6 +396,7 @@ def _redraw_polygon_overlay() -> None:
 
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
+    _update_debug_coords()
 
     coords = _mouse_to_world()
     if coords is None:
@@ -314,6 +418,60 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
             grid_y,
             world_x,
             world_y,
+        ),
+    )
+
+
+def _update_debug_coords() -> None:
+    if not dpg.does_item_exist(DEBUG_COORDS_TAG):
+        return
+
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    draw_min_x = 0.0
+    draw_min_y = 0.0
+    local_x = None
+    local_y = None
+
+    if dpg.does_item_exist(IMAGE_TAG):
+        draw_min_x, draw_min_y = dpg.get_item_rect_min(IMAGE_TAG)
+        local_pos = _screen_to_canvas(mouse_x, mouse_y)
+        if local_pos is not None:
+            local_x, local_y = local_pos
+
+    image_pos = screen_to_image(mouse_x, mouse_y)
+    origin_x, origin_y = _image_origin()
+
+    if image_pos is None:
+        image_text = "image_x=- image_y=-"
+    else:
+        image_x, image_y = image_pos
+        image_text = f"image_x={image_x:.2f} image_y={image_y:.2f}"
+
+    if local_x is None or local_y is None:
+        local_text = "local_mouse_x=- local_mouse_y=-"
+    else:
+        local_text = f"local_mouse_x={local_x:.2f} local_mouse_y={local_y:.2f}"
+
+    dpg.set_value(
+        DEBUG_COORDS_TAG,
+        "mouse_screen_x={:.2f} mouse_screen_y={:.2f}\n"
+        "draw_min_x={:.2f} draw_min_y={:.2f}\n"
+        "{}\n"
+        "{}\n"
+        "zoom={:.4f}\n"
+        "pan_x={:.2f} pan_y={:.2f}\n"
+        "image_origin_x={:.2f} image_origin_y={:.2f}".format(
+            mouse_x,
+            mouse_y,
+            draw_min_x,
+            draw_min_y,
+            local_text,
+            image_text,
+            float(state["zoom"]),
+            float(state["pan_x"]),
+            float(state["pan_y"]),
+            origin_x,
+            origin_y,
         ),
     )
 
@@ -358,13 +516,16 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
 
     if state["mode"] == "polygon":
         state["polygon_points"].append((world_x, world_y))
+        state["polygon_finished"] = False
+        state["selection_applied"] = False
+        state["editing_overlay_visible"] = True
         dpg.set_value(
             ROI_STATUS_TAG,
             f"Polygon ROI: added point {len(state['polygon_points'])}.",
         )
         dpg.set_value(POLYGON_OUTPUT_TAG, "")
         _update_polygon_points_text()
-        _redraw_polygon_overlay()
+        _redraw_preview()
         return
 
     first_world = state["roi_first_world"]
@@ -385,6 +546,9 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
     max_y = max(first_y, world_y)
 
     state["roi_first_world"] = None
+    state["rectangle_roi"] = (min_x, min_y, max_x, max_y)
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "ROI rectangle ready.")
     dpg.set_value(
         ROI_OUTPUT_TAG,
@@ -394,6 +558,7 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
         f"{_format_cli_float(max_x)} "
         f"{_format_cli_float(max_y)}",
     )
+    _redraw_preview()
 
 
 def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
@@ -404,8 +569,9 @@ def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
         return
 
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-    canvas_left, canvas_top = dpg.get_item_rect_min(IMAGE_TAG)
-    anchor = (mouse_x - canvas_left, mouse_y - canvas_top)
+    anchor = _screen_to_canvas(mouse_x, mouse_y)
+    if anchor is None:
+        return
 
     wheel_delta = float(app_data or 0)
     if wheel_delta > 0:
@@ -434,36 +600,171 @@ def _reset_view_callback(_sender=None, _app_data=None, _user_data=None) -> None:
 def _reset_roi_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["roi_first_world"] = None
     state["mode"] = "rectangle"
+    state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
-    dpg.set_value(ROI_OUTPUT_TAG, "")
 
 
 def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["mode"] = "polygon"
     state["roi_first_world"] = None
+    state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
 
 
 def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _finish_polygon()
+
+
+def _finish_polygon() -> bool:
     points = state["polygon_points"]
     if len(points) < 3:
         dpg.set_value(ROI_STATUS_TAG, "Polygon ROI needs at least 3 points.")
         dpg.set_value(POLYGON_OUTPUT_TAG, "")
-        return
+        return False
 
     points_text = ";".join(
         f"{_format_cli_float(x)},{_format_cli_float(y)}" for x, y in points
     )
+    state["polygon_finished"] = True
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI ready.")
     dpg.set_value(POLYGON_OUTPUT_TAG, f'--roi-poly "{points_text}"')
+    return True
 
 
 def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["polygon_points"] = []
+    state["polygon_finished"] = False
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
     _update_polygon_points_text()
-    _redraw_polygon_overlay()
+    _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI cleared.")
+
+
+def _clamp_pixel(value: float, upper_limit: int) -> int:
+    return max(0, min(upper_limit - 1, int(round(value))))
+
+
+def _build_selection_inside_mask() -> np.ndarray | None:
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    inside = np.zeros((image_height, image_width), dtype=np.uint8)
+
+    if state["polygon_finished"] and len(state["polygon_points"]) >= 3:
+        points_pixels = []
+        for world_x, world_y in state["polygon_points"]:
+            pixel = _world_to_original_image_pixel(world_x, world_y)
+            if pixel is None:
+                return None
+            pixel_x, pixel_y = pixel
+            points_pixels.append(
+                [
+                    _clamp_pixel(pixel_x, image_width),
+                    _clamp_pixel(pixel_y, image_height),
+                ]
+            )
+
+        polygon = np.array(points_pixels, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(inside, [polygon], 1)
+        state["selection_kind"] = "polygon"
+        state["selection_polygon_points"] = list(state["polygon_points"])
+        return inside
+
+    rectangle_roi = state["rectangle_roi"]
+    if rectangle_roi is not None:
+        min_x, min_y, max_x, max_y = rectangle_roi
+        pixel_a = _world_to_original_image_pixel(min_x, min_y)
+        pixel_b = _world_to_original_image_pixel(max_x, max_y)
+        if pixel_a is None or pixel_b is None:
+            return None
+
+        ax, ay = pixel_a
+        bx, by = pixel_b
+        left = _clamp_pixel(min(ax, bx), image_width)
+        right = _clamp_pixel(max(ax, bx), image_width)
+        top = _clamp_pixel(min(ay, by), image_height)
+        bottom = _clamp_pixel(max(ay, by), image_height)
+        inside[top : bottom + 1, left : right + 1] = 1
+        state["selection_kind"] = "rectangle"
+        state["selection_polygon_points"] = []
+        return inside
+
+    return None
+
+
+def _update_selection_texture(inside_mask: np.ndarray) -> None:
+    image_height, image_width = inside_mask.shape
+    overlay = np.zeros((image_height, image_width, 4), dtype=np.float32)
+    overlay[..., 3] = 0.62
+    overlay[inside_mask > 0, 3] = 0.0
+
+    if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        state["selection_applied"] = False
+        _redraw_preview()
+        dpg.delete_item(SELECTION_TEXTURE_TAG)
+
+    with dpg.texture_registry():
+        dpg.add_static_texture(
+            width=image_width,
+            height=image_height,
+            default_value=overlay.ravel().tolist(),
+            tag=SELECTION_TEXTURE_TAG,
+        )
+
+
+def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if (
+        state["rectangle_roi"] is None
+        and not state["polygon_finished"]
+        and len(state["polygon_points"]) > 0
+    ):
+        if not _finish_polygon():
+            return
+
+    inside_mask = _build_selection_inside_mask()
+    if inside_mask is None:
+        dpg.set_value(ROI_STATUS_TAG, "No rectangle or finished polygon ROI to apply.")
+        return
+
+    _update_selection_texture(inside_mask)
+    state["selection_applied"] = True
+    state["editing_overlay_visible"] = False
+    _redraw_preview()
+    dpg.set_value(ROI_STATUS_TAG, "Selection applied.")
+
+
+def _edit_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
+    _redraw_preview()
+    dpg.set_value(ROI_STATUS_TAG, "Selection edit mode.")
+
+
+def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["roi_first_world"] = None
+    state["rectangle_roi"] = None
+    state["polygon_points"] = []
+    state["polygon_finished"] = False
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
+    state["selection_kind"] = None
+    state["selection_polygon_points"] = []
+
+    dpg.set_value(ROI_OUTPUT_TAG, "")
+    dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    _update_polygon_points_text()
+    _redraw_preview()
+
+    if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        dpg.delete_item(SELECTION_TEXTURE_TAG)
+
+    dpg.set_value(ROI_STATUS_TAG, "Selection cleared.")
 
 
 def _quote_command_arg(value: str) -> str:
@@ -555,6 +856,9 @@ def _show_png(path: str | Path) -> None:
     if dpg.does_item_exist(IMAGE_TAG):
         dpg.delete_item(IMAGE_TAG)
 
+    if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        dpg.delete_item(SELECTION_TEXTURE_TAG)
+
     if dpg.does_item_exist(TEXTURE_TAG):
         dpg.delete_item(TEXTURE_TAG)
 
@@ -576,6 +880,12 @@ def _show_png(path: str | Path) -> None:
     state["pan_y"] = 0.0
     state["last_pan_mouse"] = None
     state["roi_first_world"] = None
+    state["rectangle_roi"] = None
+    state["polygon_finished"] = False
+    state["selection_applied"] = False
+    state["editing_overlay_visible"] = True
+    state["selection_kind"] = None
+    state["selection_polygon_points"] = []
     state["polygon_points"] = []
 
     if int(dpg.get_value(PARAM_GRID_WIDTH)) <= 0:
@@ -682,6 +992,21 @@ def run() -> None:
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
                 dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
                 dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
+                dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
+                dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
+                dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
+                dpg.add_separator()
+                dpg.add_text("Coordinate debug")
+                dpg.add_text(
+                    "mouse_screen_x=- mouse_screen_y=-\n"
+                    "draw_min_x=- draw_min_y=-\n"
+                    "local_mouse_x=- local_mouse_y=-\n"
+                    "image_x=- image_y=-\n"
+                    "zoom=1\n"
+                    "pan_x=0 pan_y=0\n"
+                    "image_origin_x=0 image_origin_y=0",
+                    tag=DEBUG_COORDS_TAG,
+                )
                 dpg.add_separator()
                 dpg.add_text("Rectangle ROI")
                 dpg.add_input_text(
