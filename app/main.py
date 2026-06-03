@@ -41,6 +41,7 @@ from app.core.contour_extractor import (
 from app.core.hole_detector import (
     detect_circular_holes,
     save_holes_csv,
+    save_holes_json,
 )
 
 from app.core.xyz_reader import compute_stats
@@ -337,6 +338,9 @@ def main() -> None:
     holes_csv_path = (
         output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.csv"
     )
+    holes_json_path = (
+        output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.json"
+    )
 
     contour_preview_path = (
         output_dir / f"{base_name}_contour_cell_{cell_text}_threshold_{args.threshold}.png"
@@ -471,6 +475,11 @@ def main() -> None:
             output_path=holes_csv_path,
             only_accepted=False,
         )
+        save_holes_json(
+            holes=holes,
+            output_path=holes_json_path,
+            only_accepted=False,
+        )
 
         save_holes_preview(
             mask=mask_for_holes,
@@ -563,6 +572,7 @@ def main() -> None:
         accepted_holes = [hole for hole in holes if hole.accepted]
 
         print(f"Holes CSV:      {holes_csv_path}")
+        print(f"Holes JSON:     {holes_json_path}")
         print(f"Hole candidates:{len(holes):,}")
         print(f"Accepted holes: {len(accepted_holes):,}")
 

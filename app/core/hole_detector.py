@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -283,3 +284,42 @@ def save_holes_csv(
                 f"{hole.max_error_mm:.6f},"
                 f"{hole.error_ratio:.6f}\n"
             )
+
+
+def save_holes_json(
+    holes: list[HoleCandidate],
+    output_path: str | Path,
+    only_accepted: bool = False,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = []
+    for hole in holes:
+        if only_accepted and not hole.accepted:
+            continue
+
+        payload.append(
+            {
+                "id": hole.id,
+                "accepted": hole.accepted,
+                "reject_reason": hole.reject_reason,
+                "center_x": hole.center_x,
+                "center_y": hole.center_y,
+                "radius": hole.radius,
+                "diameter": hole.diameter,
+                "area_mm2": hole.area_mm2,
+                "bbox_width_mm": hole.bbox_width_mm,
+                "bbox_height_mm": hole.bbox_height_mm,
+                "aspect_ratio": hole.aspect_ratio,
+                "circularity": hole.circularity,
+                "mean_error_mm": hole.mean_error_mm,
+                "max_error_mm": hole.max_error_mm,
+                "error_ratio": hole.error_ratio,
+            }
+        )
+
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
