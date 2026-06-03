@@ -15,9 +15,12 @@ IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
+HOLES_LAYER_TAG = "holes_overlay_layer"
 SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
 SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
+SHOW_ACCEPTED_HOLES_TAG = "show_accepted_holes"
+SHOW_REJECTED_HOLES_TAG = "show_rejected_holes"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -33,6 +36,7 @@ BRUSH_SIZE_TAG = "brush_size_mm"
 BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
+HOLES_STATS_TAG = "holes_stats_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -81,6 +85,7 @@ state = {
     "last_brush_world": None,
     "active_brush_stroke_id": None,
     "next_brush_stroke_id": 1,
+    "holes": [],
     "report_loaded": False,
 }
 
@@ -378,6 +383,7 @@ def _redraw_preview() -> None:
     _redraw_selection_overlay()
     _redraw_polygon_overlay()
     _redraw_mask_edits_overlay()
+    _redraw_holes_overlay()
 
 
 def _redraw_selection_overlay() -> None:
@@ -648,6 +654,71 @@ def _redraw_mask_edits_overlay() -> None:
         )
 
 
+def _hole_draw_radius(radius_mm: float) -> float:
+    params = _get_preview_params()
+    if params is None:
+        return 1.0
+
+    _grid_min_x, _grid_min_y, cell_size, _grid_width, _grid_height = params
+    if cell_size <= 0:
+        return 1.0
+
+    return max(1.0, radius_mm / cell_size * float(state["zoom"]))
+
+
+def _hole_overlay_colors(
+    accepted: bool,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    if accepted:
+        return (80, 220, 120, 230), (80, 220, 120, 45)
+
+    return (255, 140, 50, 230), (255, 110, 40, 45)
+
+
+def _redraw_holes_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(HOLES_LAYER_TAG):
+        dpg.delete_item(HOLES_LAYER_TAG)
+
+    holes = state["holes"]
+    if not holes:
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=HOLES_LAYER_TAG)
+
+    for hole in holes:
+        accepted = bool(hole.get("accepted", False))
+        if accepted:
+            if not _display_layer_enabled(SHOW_ACCEPTED_HOLES_TAG):
+                continue
+        elif not _display_layer_enabled(SHOW_REJECTED_HOLES_TAG):
+            continue
+
+        center = _world_to_image_pixel(hole["center_x"], hole["center_y"])
+        if center is None:
+            continue
+
+        radius = _hole_draw_radius(float(hole["radius"]))
+        color, fill = _hole_overlay_colors(accepted)
+        dpg.draw_circle(
+            center,
+            radius,
+            color=color,
+            fill=fill,
+            thickness=2,
+            parent=HOLES_LAYER_TAG,
+        )
+        dpg.draw_text(
+            (center[0] + radius + 4, center[1] - 7),
+            str(hole.get("id", "")),
+            color=color,
+            size=14,
+            parent=HOLES_LAYER_TAG,
+        )
+
+
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
     _update_mask_brush_from_mouse()
@@ -741,6 +812,23 @@ def _update_mask_edits_count() -> None:
             BRUSH_EDITS_COUNT_TAG,
             f"Brush edits count: {len(state['mask_edits'])}",
         )
+
+
+def _update_holes_stats() -> None:
+    if not dpg.does_item_exist(HOLES_STATS_TAG):
+        return
+
+    holes = state["holes"]
+    accepted_count = sum(1 for hole in holes if bool(hole.get("accepted", False)))
+    rejected_count = len(holes) - accepted_count
+    dpg.set_value(
+        HOLES_STATS_TAG,
+        "holes total: {}\naccepted: {}\nrejected: {}".format(
+            len(holes),
+            accepted_count,
+            rejected_count,
+        ),
+    )
 
 
 def _undo_last_brush_stroke() -> bool:
@@ -1440,6 +1528,66 @@ def _open_report_callback(_sender, app_data) -> None:
     _load_report(selected_path)
 
 
+def _normalize_hole_json_item(item: dict) -> dict:
+    required_fields = ["id", "accepted", "center_x", "center_y", "radius"]
+    for field in required_fields:
+        if field not in item:
+            raise ValueError(f"hole field not found: {field}")
+
+    return {
+        "id": int(item["id"]),
+        "accepted": bool(item["accepted"]),
+        "reject_reason": str(item.get("reject_reason", "")),
+        "center_x": float(item["center_x"]),
+        "center_y": float(item["center_y"]),
+        "radius": float(item["radius"]),
+        "diameter": float(item.get("diameter", float(item["radius"]) * 2.0)),
+    }
+
+
+def _load_holes_json(path: str | Path) -> None:
+    holes_path = Path(path)
+
+    try:
+        data = json.loads(holes_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _set_status(f"Could not load holes.json: {exc}")
+        return
+
+    try:
+        raw_holes = data["holes"] if isinstance(data, dict) else data
+        if not isinstance(raw_holes, list):
+            raise ValueError("holes must be a list")
+
+        holes = []
+        for item in raw_holes:
+            if not isinstance(item, dict):
+                raise ValueError("hole item must be an object")
+            holes.append(_normalize_hole_json_item(item))
+    except Exception as exc:
+        _set_status(f"Could not parse holes.json: {exc}")
+        return
+
+    state["holes"] = holes
+    _update_holes_stats()
+    _redraw_preview()
+    accepted_count = sum(1 for hole in holes if bool(hole.get("accepted", False)))
+    rejected_count = len(holes) - accepted_count
+    _set_status(
+        "Holes loaded: "
+        f"total={len(holes)}, accepted={accepted_count}, rejected={rejected_count}"
+    )
+
+
+def _open_holes_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_holes_json(selected_path)
+
+
 def run() -> None:
     dpg.create_context()
 
@@ -1473,6 +1621,16 @@ def run() -> None:
     ):
         dpg.add_file_extension(".json", color=(120, 220, 140, 255))
 
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_open_holes_callback,
+        tag="open_holes_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".json", color=(255, 160, 80, 255))
+
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
         dpg.add_mouse_click_handler(
@@ -1491,6 +1649,10 @@ def run() -> None:
         dpg.add_button(
             label="Load report.txt",
             callback=lambda: dpg.show_item("open_report_dialog"),
+        )
+        dpg.add_button(
+            label="Load holes.json",
+            callback=lambda: dpg.show_item("open_holes_dialog"),
         )
         dpg.add_text("No .asc/.xyz processing is performed here.", tag=STATUS_TAG)
         dpg.add_separator()
@@ -1573,6 +1735,22 @@ def run() -> None:
                     tag=SHOW_MASK_ADD_EDITS_TAG,
                     default_value=True,
                     callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show accepted holes",
+                    tag=SHOW_ACCEPTED_HOLES_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show rejected holes",
+                    tag=SHOW_REJECTED_HOLES_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_text(
+                    "holes total: 0\naccepted: 0\nrejected: 0",
+                    tag=HOLES_STATS_TAG,
                 )
                 dpg.add_separator()
                 dpg.add_text("Mask edit brush")
