@@ -15,6 +15,9 @@ IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
+SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
+SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
+SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -222,6 +225,13 @@ def _warn_preview_grid_params_not_loaded() -> bool:
     if dpg.does_item_exist(ROI_STATUS_TAG):
         dpg.set_value(ROI_STATUS_TAG, message)
     return True
+
+
+def _display_layer_enabled(tag: str, default: bool = True) -> bool:
+    if not dpg.does_item_exist(tag):
+        return default
+
+    return bool(dpg.get_value(tag))
 
 
 def _scaled_image_size() -> tuple[int, int]:
@@ -504,6 +514,9 @@ def _redraw_polygon_overlay() -> None:
     if not state["editing_overlay_visible"]:
         return
 
+    if not _display_layer_enabled(SHOW_ROI_OVERLAY_TAG):
+        return
+
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=POLYGON_LAYER_TAG)
 
     rectangle_roi = state["rectangle_roi"]
@@ -610,12 +623,19 @@ def _redraw_mask_edits_overlay() -> None:
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=MASK_EDITS_LAYER_TAG)
 
     for edit in state["mask_edits"]:
+        edit_mode = str(edit.get("mode", "remove"))
+        if edit_mode == "add":
+            if not _display_layer_enabled(SHOW_MASK_ADD_EDITS_TAG):
+                continue
+        elif not _display_layer_enabled(SHOW_MASK_REMOVE_EDITS_TAG):
+            continue
+
         pixel_point = _world_to_image_pixel(edit["x"], edit["y"])
         if pixel_point is None:
             continue
 
         radius = _brush_radius_to_draw_radius(edit["radius_mm"])
-        color, fill = _brush_edit_colors(str(edit.get("mode", "remove")))
+        color, fill = _brush_edit_colors(edit_mode)
         dpg.draw_circle(
             pixel_point,
             radius,
@@ -1485,6 +1505,26 @@ def run() -> None:
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
                 dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
+                dpg.add_separator()
+                dpg.add_text("Display layers")
+                dpg.add_checkbox(
+                    label="Show ROI overlay",
+                    tag=SHOW_ROI_OVERLAY_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show mask remove edits",
+                    tag=SHOW_MASK_REMOVE_EDITS_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show mask add edits",
+                    tag=SHOW_MASK_ADD_EDITS_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
                 dpg.add_separator()
                 dpg.add_text("Mask edit brush")
                 dpg.add_text("Brush mode")
