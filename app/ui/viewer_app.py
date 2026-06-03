@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import cv2
@@ -12,6 +14,7 @@ SELECTION_TEXTURE_TAG = "selection_dim_texture"
 IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
+MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -23,6 +26,9 @@ POLYGON_OUTPUT_TAG = "polygon_output_text"
 ZOOM_TEXT_TAG = "zoom_text"
 COMMAND_OUTPUT_TAG = "command_output_text"
 DEBUG_COORDS_TAG = "debug_coords_text"
+BRUSH_SIZE_TAG = "brush_size_mm"
+BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
+LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -30,6 +36,7 @@ CMD_THRESHOLD_TAG = "cmd_threshold"
 CMD_FILL_HOLES_TAG = "cmd_fill_holes_area"
 CMD_BOUNDARY_WIDTH_TAG = "cmd_boundary_width_mm"
 CMD_SIMPLIFY_TAG = "cmd_simplify_mm"
+CMD_MASK_EDITS_TAG = "cmd_mask_edits"
 CMD_KEEP_LARGEST_TAG = "cmd_keep_largest"
 CMD_CONTOUR_TAG = "cmd_contour"
 CMD_DXF_TAG = "cmd_dxf"
@@ -65,6 +72,10 @@ state = {
     "selection_polygon_points": [],
     "mode": "rectangle",
     "polygon_points": [],
+    "mask_edits": [],
+    "last_brush_image": None,
+    "last_brush_world": None,
+    "report_loaded": False,
 }
 
 
@@ -88,6 +99,128 @@ def _get_preview_params() -> tuple[float, float, float, int, int] | None:
         return None
 
     return grid_min_x, grid_min_y, cell_size, grid_width, grid_height
+
+
+def _parse_report_float_value(value: str) -> float:
+    value = value.strip().replace(" ", "")
+    if "," in value and "." in value:
+        value = value.replace(",", "")
+    elif "," in value:
+        parts = value.split(",")
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 6:
+            value = ".".join(parts)
+        else:
+            value = value.replace(",", "")
+
+    return float(value)
+
+
+def _parse_report_int_value(value: str) -> int:
+    value = value.strip().replace(" ", "").replace(",", "")
+    return int(round(float(value)))
+
+
+def _find_report_float(text: str, patterns: list[str], label: str) -> float:
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        if match:
+            return _parse_report_float_value(match.group(1))
+
+    raise ValueError(f"Field not found: {label}.")
+
+
+def _find_report_int(text: str, patterns: list[str], label: str) -> int:
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        if match:
+            return _parse_report_int_value(match.group(1))
+
+    raise ValueError(f"Field not found: {label}.")
+
+
+def _parse_report_text(text: str) -> tuple[float, float, float, int, int]:
+    number = r"([-+]?\d[\d,]*(?:\.\d+)?)"
+    normalized = text
+
+    grid_min_x = _find_report_float(
+        normalized,
+        [
+            rf"Bounding\s+box\s*:\s*.*?^\s*X\s*:\s*{number}\s*\.\.",
+            rf"^\s*X\s*:\s*{number}\s*\.\.",
+            rf"Bounding\s+box\s+X\s+min\s*[:=]\s*{number}",
+        ],
+        "Bounding box X min",
+    )
+    grid_min_y = _find_report_float(
+        normalized,
+        [
+            rf"Bounding\s+box\s*:\s*.*?^\s*Y\s*:\s*{number}\s*\.\.",
+            rf"^\s*Y\s*:\s*{number}\s*\.\.",
+            rf"Bounding\s+box\s+Y\s+min\s*[:=]\s*{number}",
+        ],
+        "Bounding box Y min",
+    )
+    cell_size = _find_report_float(
+        normalized,
+        [
+            rf"Density\s+grid\s*:\s*.*?^\s*Cell\s+size\s*[:=]\s*{number}",
+            rf"Cell\s+size\s*[:=]\s*{number}",
+        ],
+        "Density grid Cell size",
+    )
+    width_cells = _find_report_int(
+        normalized,
+        [
+            rf"Density\s+grid\s*:\s*.*?^\s*Width\s+cells\s*[:=]\s*{number}",
+            rf"Width\s+cells\s*[:=]\s*{number}",
+        ],
+        "Width cells",
+    )
+    height_cells = _find_report_int(
+        normalized,
+        [
+            rf"Density\s+grid\s*:\s*.*?^\s*Height\s+cells\s*[:=]\s*{number}",
+            rf"Height\s+cells\s*[:=]\s*{number}",
+        ],
+        "Height cells",
+    )
+
+    if cell_size <= 0 or width_cells <= 0 or height_cells <= 0:
+        raise ValueError("Report contains non-positive grid values.")
+
+    return grid_min_x, grid_min_y, cell_size, width_cells, height_cells
+
+
+def _preview_grid_params_are_default() -> bool:
+    params = _get_preview_params()
+    if params is None:
+        return True
+
+    grid_min_x, grid_min_y, _cell_size, _grid_width, _grid_height = params
+    return (
+        not bool(state["report_loaded"])
+        and abs(grid_min_x) < 0.000001
+        and abs(grid_min_y) < 0.000001
+    )
+
+
+def _warn_preview_grid_params_not_loaded() -> bool:
+    if not _preview_grid_params_are_default():
+        return False
+
+    message = "Preview grid parameters are not loaded. Load report.txt first."
+    _set_status(message)
+    if dpg.does_item_exist(ROI_STATUS_TAG):
+        dpg.set_value(ROI_STATUS_TAG, message)
+    return True
 
 
 def _scaled_image_size() -> tuple[int, int]:
@@ -136,6 +269,46 @@ def image_to_drawlist(image_x: float, image_y: float) -> tuple[float, float]:
     origin_x, origin_y = _image_origin()
     zoom = float(state["zoom"])
     return origin_x + image_x * zoom, origin_y + image_y * zoom
+
+
+def image_to_world(
+    image_x: float,
+    image_y: float,
+) -> tuple[float, float, float, float] | None:
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return None
+
+    params = _get_preview_params()
+    if params is None:
+        return None
+
+    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
+    displayed_grid_x = image_x
+    original_grid_y = (grid_height - 1) - image_y
+
+    world_x = grid_min_x + (displayed_grid_x + 0.5) * cell_size
+    world_y = grid_min_y + (original_grid_y + 0.5) * cell_size
+
+    return displayed_grid_x, original_grid_y, world_x, world_y
+
+
+def screen_to_world(
+    mouse_x: float,
+    mouse_y: float,
+) -> tuple[float, float, float, float, float, float] | None:
+    image_pos = screen_to_image(mouse_x, mouse_y)
+    if image_pos is None:
+        return None
+
+    image_x, image_y = image_pos
+    world_pos = image_to_world(image_x, image_y)
+    if world_pos is None:
+        return None
+
+    grid_x, grid_y, world_x, world_y = world_pos
+    return image_x, image_y, grid_x, grid_y, world_x, world_y
 
 
 def _set_zoom(
@@ -191,6 +364,7 @@ def _redraw_preview() -> None:
 
     _redraw_selection_overlay()
     _redraw_polygon_overlay()
+    _redraw_mask_edits_overlay()
 
 
 def _redraw_selection_overlay() -> None:
@@ -223,39 +397,8 @@ def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
     if not dpg.is_item_hovered(IMAGE_TAG):
         return None
 
-    image_width = int(state["image_width"])
-    image_height = int(state["image_height"])
-    if image_width <= 0 or image_height <= 0:
-        return None
-
-    params = _get_preview_params()
-    if params is None:
-        return None
-
-    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
-
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-    image_pos = screen_to_image(mouse_x, mouse_y)
-    if image_pos is None:
-        return None
-
-    original_pixel_x, original_pixel_y = image_pos
-
-    displayed_grid_x = original_pixel_x * grid_width / image_width
-    displayed_grid_y = original_pixel_y * grid_height / image_height
-    original_grid_y = (grid_height - 1) - displayed_grid_y
-
-    world_x = grid_min_x + displayed_grid_x * cell_size
-    world_y = grid_min_y + original_grid_y * cell_size
-
-    return (
-        original_pixel_x,
-        original_pixel_y,
-        displayed_grid_x,
-        original_grid_y,
-        world_x,
-        world_y,
-    )
+    return screen_to_world(mouse_x, mouse_y)
 
 
 def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float] | None:
@@ -268,14 +411,14 @@ def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float]
     if params is None:
         return None
 
-    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
+    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
 
-    grid_x = (world_x - grid_min_x) / cell_size
-    original_grid_y = (world_y - grid_min_y) / cell_size
+    grid_x = (world_x - grid_min_x) / cell_size - 0.5
+    original_grid_y = (world_y - grid_min_y) / cell_size - 0.5
     displayed_grid_y = (grid_height - 1) - original_grid_y
 
-    pixel_x = grid_x * image_width / grid_width
-    pixel_y = displayed_grid_y * image_height / grid_height
+    pixel_x = grid_x
+    pixel_y = displayed_grid_y
 
     return image_to_drawlist(pixel_x, pixel_y)
 
@@ -293,14 +436,14 @@ def _world_to_original_image_pixel(
     if params is None:
         return None
 
-    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
+    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
 
-    grid_x = (world_x - grid_min_x) / cell_size
-    original_grid_y = (world_y - grid_min_y) / cell_size
+    grid_x = (world_x - grid_min_x) / cell_size - 0.5
+    original_grid_y = (world_y - grid_min_y) / cell_size - 0.5
     displayed_grid_y = (grid_height - 1) - original_grid_y
 
-    pixel_x = grid_x * image_width / grid_width
-    pixel_y = displayed_grid_y * image_height / grid_height
+    pixel_x = grid_x
+    pixel_y = displayed_grid_y
 
     return pixel_x, pixel_y
 
@@ -394,8 +537,52 @@ def _redraw_polygon_overlay() -> None:
         )
 
 
+def _brush_radius_to_draw_radius(radius_mm: float) -> float:
+    params = _get_preview_params()
+    if params is None:
+        return 1.0
+
+    _grid_min_x, _grid_min_y, cell_size, grid_width, _grid_height = params
+    image_width = int(state["image_width"])
+    if cell_size <= 0 or grid_width <= 0 or image_width <= 0:
+        return 1.0
+
+    radius_cells = radius_mm / cell_size
+    radius_image_px = radius_cells * image_width / grid_width
+    return max(1.0, radius_image_px * float(state["zoom"]))
+
+
+def _redraw_mask_edits_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(MASK_EDITS_LAYER_TAG):
+        dpg.delete_item(MASK_EDITS_LAYER_TAG)
+
+    if not state["mask_edits"]:
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=MASK_EDITS_LAYER_TAG)
+
+    for edit in state["mask_edits"]:
+        pixel_point = _world_to_image_pixel(edit["x"], edit["y"])
+        if pixel_point is None:
+            continue
+
+        radius = _brush_radius_to_draw_radius(edit["radius_mm"])
+        dpg.draw_circle(
+            pixel_point,
+            radius,
+            color=(255, 80, 80, 210),
+            fill=(255, 60, 60, 85),
+            thickness=2,
+            parent=MASK_EDITS_LAYER_TAG,
+        )
+
+
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
+    _update_mask_eraser_from_mouse()
     _update_debug_coords()
 
     coords = _mouse_to_world()
@@ -419,6 +606,99 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
             world_x,
             world_y,
         ),
+    )
+
+
+def _update_mask_eraser_from_mouse() -> None:
+    if state["mode"] != "mask_eraser":
+        state["last_brush_image"] = None
+        state["last_brush_world"] = None
+        return
+
+    if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
+        state["last_brush_image"] = None
+        state["last_brush_world"] = None
+        return
+
+    if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
+        return
+
+    if _warn_preview_grid_params_not_loaded():
+        return
+
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    coords = screen_to_world(mouse_x, mouse_y)
+    if coords is None:
+        return
+
+    image_x, image_y, _grid_x, _grid_y, world_x, world_y = coords
+    radius_mm = float(dpg.get_value(BRUSH_SIZE_TAG))
+    radius_mm = max(0.001, radius_mm)
+
+    last_brush_image = state["last_brush_image"]
+    if last_brush_image is not None:
+        last_x, last_y = last_brush_image
+        dx = image_x - last_x
+        dy = image_y - last_y
+        if (dx * dx + dy * dy) ** 0.5 < 2.0:
+            return
+
+    state["mask_edits"].append(
+        {
+            "mode": "remove",
+            "x": world_x,
+            "y": world_y,
+            "radius_mm": radius_mm,
+        }
+    )
+    state["last_brush_image"] = (image_x, image_y)
+    state["last_brush_world"] = (world_x, world_y)
+    _update_mask_edits_count()
+    _update_last_brush_debug()
+    _redraw_preview()
+
+
+def _update_mask_edits_count() -> None:
+    if dpg.does_item_exist(BRUSH_EDITS_COUNT_TAG):
+        dpg.set_value(
+            BRUSH_EDITS_COUNT_TAG,
+            f"Brush edits count: {len(state['mask_edits'])}",
+        )
+
+
+def _update_last_brush_debug() -> None:
+    if not dpg.does_item_exist(LAST_BRUSH_DEBUG_TAG):
+        return
+
+    params = _get_preview_params()
+    if params is None:
+        grid_min_text = "grid_min_x=-\ngrid_min_y=-"
+    else:
+        grid_min_x, grid_min_y, _cell_size, _grid_width, _grid_height = params
+        grid_min_text = (
+            f"grid_min_x={grid_min_x:.6f}\n"
+            f"grid_min_y={grid_min_y:.6f}"
+        )
+
+    last_brush_image = state["last_brush_image"]
+    last_brush_world = state["last_brush_world"]
+
+    if last_brush_image is None or last_brush_world is None:
+        dpg.set_value(
+            LAST_BRUSH_DEBUG_TAG,
+            f"{grid_min_text}\nlast brush image x/y: -\nlast brush world x/y: -",
+        )
+        return
+
+    image_x, image_y = last_brush_image
+    world_x, world_y = last_brush_world
+    dpg.set_value(
+        LAST_BRUSH_DEBUG_TAG,
+        f"{grid_min_text}\n"
+        "last brush image x/y: "
+        f"{image_x:.2f}, {image_y:.2f}\n"
+        "last brush world x/y: "
+        f"{world_x:.6f}, {world_y:.6f}",
     )
 
 
@@ -508,6 +788,12 @@ def _update_pan_from_mouse() -> None:
 
 
 def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if state["mode"] == "mask_eraser":
+        return
+
+    if _warn_preview_grid_params_not_loaded():
+        return
+
     coords = _mouse_to_world()
     if coords is None:
         return
@@ -609,6 +895,13 @@ def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> Non
     state["roi_first_world"] = None
     state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
+
+
+def _mask_eraser_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["mode"] = "mask_eraser"
+    state["roi_first_world"] = None
+    state["last_brush_image"] = None
+    dpg.set_value(ROI_STATUS_TAG, "Mask eraser mode: hold left mouse button.")
 
 
 def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -767,6 +1060,43 @@ def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
     dpg.set_value(ROI_STATUS_TAG, "Selection cleared.")
 
 
+def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["mask_edits"] = []
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
+    _update_mask_edits_count()
+    _update_last_brush_debug()
+    _redraw_preview()
+    _set_status("Mask edits cleared.")
+
+
+def _write_mask_edits_json(output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    if output_path.suffix.lower() != ".json":
+        output_path = output_path.with_suffix(output_path.suffix + ".json")
+
+    payload = {
+        "edits": state["mask_edits"],
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _set_status(f"Mask edits saved: {output_path.resolve()}")
+
+
+def _save_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    dpg.show_item("save_mask_edits_dialog")
+
+
+def _save_mask_edits_dialog_callback(_sender, app_data) -> None:
+    file_path_name = app_data.get("file_path_name")
+    if not file_path_name:
+        return
+
+    _write_mask_edits_json(file_path_name)
+
+
 def _quote_command_arg(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
 
@@ -787,6 +1117,7 @@ def _generate_command_callback(_sender=None, _app_data=None, _user_data=None) ->
     fill_holes_area = int(dpg.get_value(CMD_FILL_HOLES_TAG))
     boundary_width_mm = float(dpg.get_value(CMD_BOUNDARY_WIDTH_TAG))
     simplify_mm = float(dpg.get_value(CMD_SIMPLIFY_TAG))
+    mask_edits_path = str(dpg.get_value(CMD_MASK_EDITS_TAG)).strip()
 
     contour_enabled = bool(dpg.get_value(CMD_CONTOUR_TAG))
     dxf_enabled = bool(dpg.get_value(CMD_DXF_TAG))
@@ -811,6 +1142,9 @@ def _generate_command_callback(_sender=None, _app_data=None, _user_data=None) ->
 
     if bool(dpg.get_value(CMD_KEEP_LARGEST_TAG)):
         parts.append("--keep-largest")
+
+    if mask_edits_path:
+        _append_option(parts, "--mask-edits", _quote_command_arg(mask_edits_path))
 
     if fill_holes_area > 0:
         _append_option(parts, "--fill-holes-area", _format_cli_float(fill_holes_area))
@@ -887,6 +1221,9 @@ def _show_png(path: str | Path) -> None:
     state["selection_kind"] = None
     state["selection_polygon_points"] = []
     state["polygon_points"] = []
+    state["mask_edits"] = []
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
 
     if int(dpg.get_value(PARAM_GRID_WIDTH)) <= 0:
         dpg.set_value(PARAM_GRID_WIDTH, width)
@@ -898,6 +1235,8 @@ def _show_png(path: str | Path) -> None:
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
     dpg.set_value(ZOOM_TEXT_TAG, "Zoom: 100%")
     _update_polygon_points_text()
+    _update_mask_edits_count()
+    _update_last_brush_debug()
     _redraw_preview()
     _set_status(f"Loaded: {image_path}")
 
@@ -909,6 +1248,54 @@ def _open_file_callback(_sender, app_data) -> None:
 
     selected_path = next(iter(selections.values()))
     _show_png(selected_path)
+
+
+def _load_report(path: str | Path) -> None:
+    report_path = Path(path)
+
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = report_path.read_text(encoding="cp1251")
+    except Exception as exc:
+        _set_status(f"Could not load report.txt: {exc}")
+        return
+
+    try:
+        grid_min_x, grid_min_y, cell_size, width_cells, height_cells = (
+            _parse_report_text(text)
+        )
+    except Exception as exc:
+        _set_status(f"Could not parse report.txt: {exc}")
+        return
+
+    dpg.set_value(PARAM_GRID_MIN_X, grid_min_x)
+    dpg.set_value(PARAM_GRID_MIN_Y, grid_min_y)
+    dpg.set_value(PARAM_CELL_SIZE, cell_size)
+    dpg.set_value(PARAM_GRID_WIDTH, width_cells)
+    dpg.set_value(PARAM_GRID_HEIGHT, height_cells)
+    if dpg.does_item_exist(CMD_CELL_TAG):
+        dpg.set_value(CMD_CELL_TAG, cell_size)
+
+    state["report_loaded"] = True
+    _update_last_brush_debug()
+
+    _set_status(
+        "Report loaded: "
+        f"grid_min_x={grid_min_x:.6f}, "
+        f"grid_min_y={grid_min_y:.6f}, "
+        f"cell={cell_size:.6f}, "
+        f"size={width_cells}x{height_cells}"
+    )
+
+
+def _open_report_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_report(selected_path)
 
 
 def run() -> None:
@@ -924,6 +1311,26 @@ def run() -> None:
     ):
         dpg.add_file_extension(".png", color=(80, 180, 255, 255))
 
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_open_report_callback,
+        tag="open_report_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".txt", color=(120, 220, 140, 255))
+
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_save_mask_edits_dialog_callback,
+        tag="save_mask_edits_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".json", color=(120, 220, 140, 255))
+
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
         dpg.add_mouse_click_handler(
@@ -937,6 +1344,10 @@ def run() -> None:
         dpg.add_button(
             label="Open PNG",
             callback=lambda: dpg.show_item("open_png_dialog"),
+        )
+        dpg.add_button(
+            label="Load report.txt",
+            callback=lambda: dpg.show_item("open_report_dialog"),
         )
         dpg.add_text("No .asc/.xyz processing is performed here.", tag=STATUS_TAG)
         dpg.add_separator()
@@ -990,11 +1401,34 @@ def run() -> None:
                 dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
+                dpg.add_button(label="Mask eraser", callback=_mask_eraser_mode_callback)
                 dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
                 dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
                 dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
+                dpg.add_separator()
+                dpg.add_text("Mask eraser")
+                dpg.add_text("Brush size mm")
+                dpg.add_input_float(
+                    tag=BRUSH_SIZE_TAG,
+                    default_value=5.0,
+                    min_value=0.001,
+                    width=-1,
+                )
+                dpg.add_text("Brush edits count: 0", tag=BRUSH_EDITS_COUNT_TAG)
+                dpg.add_text(
+                    "grid_min_x=-\n"
+                    "grid_min_y=-\n"
+                    "last brush image x/y: -\n"
+                    "last brush world x/y: -",
+                    tag=LAST_BRUSH_DEBUG_TAG,
+                )
+                dpg.add_button(label="Clear mask edits", callback=_clear_mask_edits_callback)
+                dpg.add_button(
+                    label="Save mask edits JSON",
+                    callback=_save_mask_edits_callback,
+                )
                 dpg.add_separator()
                 dpg.add_text("Coordinate debug")
                 dpg.add_text(
@@ -1066,6 +1500,11 @@ def run() -> None:
                     dpg.add_input_float(
                         tag=CMD_SIMPLIFY_TAG,
                         default_value=0.0,
+                        width=-1,
+                    )
+                    dpg.add_text("mask_edits")
+                    dpg.add_input_text(
+                        tag=CMD_MASK_EDITS_TAG,
                         width=-1,
                     )
                     dpg.add_checkbox(label="keep_largest", tag=CMD_KEEP_LARGEST_TAG)

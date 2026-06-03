@@ -28,6 +28,11 @@ from app.core.mask_processing import (
     keep_largest_component,
     remove_small_components,
 )
+from app.core.mask_edits import (
+    apply_mask_edits,
+    load_mask_edits,
+    save_mask_edits_debug_preview,
+)
 from app.core.contour_extractor import (
     build_external_contour,
     save_contour_csv,
@@ -156,6 +161,10 @@ def main() -> None:
         "--roi-poly",
         type=parse_roi_poly,
         help="Limit mask processing to polygon ROI: x1,y1;x2,y2;x3,y3;...",
+    )
+    parser.add_argument(
+        "--mask-edits",
+        help="Path to mask edits JSON from preview viewer",
     )
     parser.add_argument(
         "--fill-holes-area",
@@ -306,6 +315,12 @@ def main() -> None:
         output_dir / f"{base_name}_density_cell_{cell_text}_smooth_{smooth_text}mm.png"
     )
     mask_path = output_dir / f"{base_name}_mask_cell_{cell_text}_threshold_{args.threshold}.png"
+    mask_after_edits_path = (
+        output_dir / f"{base_name}_mask_after_edits_cell_{cell_text}_threshold_{args.threshold}.png"
+    )
+    mask_edits_debug_path = (
+        output_dir / f"{base_name}_mask_edits_debug_cell_{cell_text}_threshold_{args.threshold}.png"
+    )
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
     clean_path = (
         output_dir / f"{base_name}_clean_cell_{cell_text}_threshold_{args.threshold}.asc"
@@ -383,6 +398,44 @@ def main() -> None:
         print(
             "Applied polygon ROI: "
             f"points={len(args.roi_poly)}, mask_cells={int(mask.sum()):,}"
+        )
+
+    if args.mask_edits:
+        mask_edits = load_mask_edits(args.mask_edits)
+        mask_before_edits = mask.copy()
+        mask_cells_before_edits = int(mask.sum())
+        mask, mask_edits_stats = apply_mask_edits(mask, grid, mask_edits)
+        mask_cells_after_edits = int(mask.sum())
+        mask_cells_changed_by_edits = int((mask != mask_before_edits).sum())
+        print(f"Applied mask edits: {len(mask_edits):,}")
+        print(f"Mask cells before edits: {mask_cells_before_edits:,}")
+        print(f"Mask cells after edits:  {mask_cells_after_edits:,}")
+        print(f"Mask cells changed by edits: {mask_cells_changed_by_edits:,}")
+        print(f"Mask edits total: {mask_edits_stats.total_edits:,}")
+        print(f"Mask edits inside grid: {mask_edits_stats.edits_inside_grid:,}")
+        print(f"Mask edits outside grid: {mask_edits_stats.edits_outside_grid:,}")
+        print(
+            "Mask edits touched white mask: "
+            f"{mask_edits_stats.edits_that_touched_white_mask:,}"
+        )
+        print(f"Mask edits changed cells: {mask_edits_stats.changed_cells:,}")
+        print(
+            "Mask edits world bbox: "
+            f"{mask_edits_stats.world_min_x}, {mask_edits_stats.world_min_y} .. "
+            f"{mask_edits_stats.world_max_x}, {mask_edits_stats.world_max_y}"
+        )
+        print(
+            "Mask edits pixel bbox: "
+            f"{mask_edits_stats.pixel_min_ix}, {mask_edits_stats.pixel_min_iy} .. "
+            f"{mask_edits_stats.pixel_max_ix}, {mask_edits_stats.pixel_max_iy}"
+        )
+        save_mask_preview(mask, mask_after_edits_path, max_size=args.preview_size)
+        save_mask_edits_debug_preview(
+            mask=mask_before_edits,
+            grid=grid,
+            edits=mask_edits,
+            output_path=mask_edits_debug_path,
+            max_size=args.preview_size,
         )
     
 
