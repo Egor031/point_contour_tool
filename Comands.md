@@ -90,3 +90,5 @@ python -m app.main data\input\test_01.asc --cell 1.8 --threshold 3 --keep-larges
 С polygon ROI:
 
 python -m app.main data\input\test_01.asc --cell 1.8 --threshold 3 --roi-poly "..." --keep-largest --contour --dxf --export-clean --export-boundary --boundary-width-mm 1
+
+python -m app.main data\input\test_big.xyz --cell 1.2 --threshold 3 --roi 492.652082 -282.355775 1638.652128 29.644237 --mask-edits "D:\ZherlitsynEE\point_contour_tool\data\addtest.json" --keep-largest --holes --min-hole-diameter-mm 4.2 --contour --dxf

@@ -27,6 +27,7 @@ ZOOM_TEXT_TAG = "zoom_text"
 COMMAND_OUTPUT_TAG = "command_output_text"
 DEBUG_COORDS_TAG = "debug_coords_text"
 BRUSH_SIZE_TAG = "brush_size_mm"
+BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 
@@ -467,6 +468,32 @@ def _update_polygon_points_text() -> None:
     dpg.set_value(POLYGON_POINTS_TAG, "\n".join(lines))
 
 
+def _undo_last_polygon_point() -> bool:
+    if state["selection_applied"]:
+        dpg.set_value(ROI_STATUS_TAG, "Edit selection first.")
+        return False
+
+    points = state["polygon_points"]
+    if not points:
+        dpg.set_value(ROI_STATUS_TAG, "No polygon points to undo.")
+        _update_polygon_points_text()
+        return False
+
+    points.pop()
+    state["polygon_finished"] = False
+    state["editing_overlay_visible"] = True
+    dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    _update_polygon_points_text()
+    _redraw_preview()
+
+    if points:
+        dpg.set_value(ROI_STATUS_TAG, "Last polygon point removed.")
+    else:
+        dpg.set_value(ROI_STATUS_TAG, "Polygon points cleared.")
+
+    return True
+
+
 def _redraw_polygon_overlay() -> None:
     if not dpg.does_item_exist(IMAGE_TAG):
         return
@@ -552,6 +579,24 @@ def _brush_radius_to_draw_radius(radius_mm: float) -> float:
     return max(1.0, radius_image_px * float(state["zoom"]))
 
 
+def _get_brush_edit_mode() -> str:
+    if not dpg.does_item_exist(BRUSH_MODE_TAG):
+        return "remove"
+
+    mode_label = str(dpg.get_value(BRUSH_MODE_TAG))
+    if mode_label == "Add to mask":
+        return "add"
+
+    return "remove"
+
+
+def _brush_edit_colors(mode: str) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    if mode == "add":
+        return (60, 170, 255, 220), (60, 150, 255, 90)
+
+    return (255, 80, 80, 210), (255, 60, 60, 85)
+
+
 def _redraw_mask_edits_overlay() -> None:
     if not dpg.does_item_exist(IMAGE_TAG):
         return
@@ -570,11 +615,12 @@ def _redraw_mask_edits_overlay() -> None:
             continue
 
         radius = _brush_radius_to_draw_radius(edit["radius_mm"])
+        color, fill = _brush_edit_colors(str(edit.get("mode", "remove")))
         dpg.draw_circle(
             pixel_point,
             radius,
-            color=(255, 80, 80, 210),
-            fill=(255, 60, 60, 85),
+            color=color,
+            fill=fill,
             thickness=2,
             parent=MASK_EDITS_LAYER_TAG,
         )
@@ -582,7 +628,7 @@ def _redraw_mask_edits_overlay() -> None:
 
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
-    _update_mask_eraser_from_mouse()
+    _update_mask_brush_from_mouse()
     _update_debug_coords()
 
     coords = _mouse_to_world()
@@ -609,8 +655,8 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     )
 
 
-def _update_mask_eraser_from_mouse() -> None:
-    if state["mode"] != "mask_eraser":
+def _update_mask_brush_from_mouse() -> None:
+    if state["mode"] != "mask_brush":
         state["last_brush_image"] = None
         state["last_brush_world"] = None
         return
@@ -634,6 +680,7 @@ def _update_mask_eraser_from_mouse() -> None:
     image_x, image_y, _grid_x, _grid_y, world_x, world_y = coords
     radius_mm = float(dpg.get_value(BRUSH_SIZE_TAG))
     radius_mm = max(0.001, radius_mm)
+    brush_mode = _get_brush_edit_mode()
 
     last_brush_image = state["last_brush_image"]
     if last_brush_image is not None:
@@ -645,7 +692,7 @@ def _update_mask_eraser_from_mouse() -> None:
 
     state["mask_edits"].append(
         {
-            "mode": "remove",
+            "mode": brush_mode,
             "x": world_x,
             "y": world_y,
             "radius_mm": radius_mm,
@@ -788,7 +835,7 @@ def _update_pan_from_mouse() -> None:
 
 
 def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    if state["mode"] == "mask_eraser":
+    if state["mode"] == "mask_brush":
         return
 
     if _warn_preview_grid_params_not_loaded():
@@ -897,15 +944,23 @@ def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> Non
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
 
 
-def _mask_eraser_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["mode"] = "mask_eraser"
+def _mask_brush_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["mode"] = "mask_brush"
     state["roi_first_world"] = None
     state["last_brush_image"] = None
-    dpg.set_value(ROI_STATUS_TAG, "Mask eraser mode: hold left mouse button.")
+    dpg.set_value(ROI_STATUS_TAG, "Mask brush mode: hold left mouse button.")
 
 
 def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _finish_polygon()
+
+
+def _undo_last_polygon_point_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    _undo_last_polygon_point()
 
 
 def _finish_polygon() -> bool:
@@ -935,6 +990,24 @@ def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> No
     _update_polygon_points_text()
     _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI cleared.")
+
+
+def _key_press_callback(_sender=None, app_data=None, _user_data=None) -> None:
+    if state["mode"] != "polygon":
+        return
+
+    key = app_data
+    undo_shortcut = (
+        key == dpg.mvKey_Z
+        and (
+            dpg.is_key_down(dpg.mvKey_LControl)
+            or dpg.is_key_down(dpg.mvKey_RControl)
+        )
+    )
+    backspace = key == dpg.mvKey_Back
+
+    if undo_shortcut or backspace:
+        _undo_last_polygon_point()
 
 
 def _clamp_pixel(value: float, upper_limit: int) -> int:
@@ -1338,6 +1411,7 @@ def run() -> None:
             callback=_mouse_click_callback,
         )
         dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
+        dpg.add_key_press_handler(callback=_key_press_callback)
 
     with dpg.window(label="Point Contour Preview Viewer", tag="main_window"):
         dpg.add_text("Preview viewer for density/mask PNG images.")
@@ -1401,14 +1475,25 @@ def run() -> None:
                 dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
-                dpg.add_button(label="Mask eraser", callback=_mask_eraser_mode_callback)
+                dpg.add_button(label="Mask brush", callback=_mask_brush_mode_callback)
                 dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
+                dpg.add_button(
+                    label="Undo last polygon point",
+                    callback=_undo_last_polygon_point_callback,
+                )
                 dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
                 dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
                 dpg.add_separator()
-                dpg.add_text("Mask eraser")
+                dpg.add_text("Mask edit brush")
+                dpg.add_text("Brush mode")
+                dpg.add_combo(
+                    ["Remove from mask", "Add to mask"],
+                    tag=BRUSH_MODE_TAG,
+                    default_value="Remove from mask",
+                    width=-1,
+                )
                 dpg.add_text("Brush size mm")
                 dpg.add_input_float(
                     tag=BRUSH_SIZE_TAG,
