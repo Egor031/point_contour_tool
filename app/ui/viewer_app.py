@@ -79,6 +79,8 @@ state = {
     "mask_edits": [],
     "last_brush_image": None,
     "last_brush_world": None,
+    "active_brush_stroke_id": None,
+    "next_brush_stroke_id": 1,
     "report_loaded": False,
 }
 
@@ -679,11 +681,13 @@ def _update_mask_brush_from_mouse() -> None:
     if state["mode"] != "mask_brush":
         state["last_brush_image"] = None
         state["last_brush_world"] = None
+        state["active_brush_stroke_id"] = None
         return
 
     if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
         state["last_brush_image"] = None
         state["last_brush_world"] = None
+        state["active_brush_stroke_id"] = None
         return
 
     if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
@@ -701,6 +705,11 @@ def _update_mask_brush_from_mouse() -> None:
     radius_mm = float(dpg.get_value(BRUSH_SIZE_TAG))
     radius_mm = max(0.001, radius_mm)
     brush_mode = _get_brush_edit_mode()
+    stroke_id = state["active_brush_stroke_id"]
+    if stroke_id is None:
+        stroke_id = int(state["next_brush_stroke_id"])
+        state["active_brush_stroke_id"] = stroke_id
+        state["next_brush_stroke_id"] = stroke_id + 1
 
     last_brush_image = state["last_brush_image"]
     if last_brush_image is not None:
@@ -712,6 +721,7 @@ def _update_mask_brush_from_mouse() -> None:
 
     state["mask_edits"].append(
         {
+            "stroke_id": stroke_id,
             "mode": brush_mode,
             "x": world_x,
             "y": world_y,
@@ -731,6 +741,40 @@ def _update_mask_edits_count() -> None:
             BRUSH_EDITS_COUNT_TAG,
             f"Brush edits count: {len(state['mask_edits'])}",
         )
+
+
+def _undo_last_brush_stroke() -> bool:
+    edits = state["mask_edits"]
+    if not edits:
+        _set_status("No brush strokes to undo.")
+        return False
+
+    last_edit = edits[-1]
+    stroke_id = last_edit.get("stroke_id")
+    if stroke_id is None:
+        edits.pop()
+        removed_count = 1
+    else:
+        kept_edits = [edit for edit in edits if edit.get("stroke_id") != stroke_id]
+        removed_count = len(edits) - len(kept_edits)
+        state["mask_edits"] = kept_edits
+
+    state["active_brush_stroke_id"] = None
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
+    _update_mask_edits_count()
+    _update_last_brush_debug()
+    _redraw_preview()
+    _set_status(f"Undid brush stroke: removed {removed_count} edits.")
+    return True
+
+
+def _undo_last_brush_stroke_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    _undo_last_brush_stroke()
 
 
 def _update_last_brush_debug() -> None:
@@ -1013,9 +1057,6 @@ def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> No
 
 
 def _key_press_callback(_sender=None, app_data=None, _user_data=None) -> None:
-    if state["mode"] != "polygon":
-        return
-
     key = app_data
     undo_shortcut = (
         key == dpg.mvKey_Z
@@ -1026,8 +1067,12 @@ def _key_press_callback(_sender=None, app_data=None, _user_data=None) -> None:
     )
     backspace = key == dpg.mvKey_Back
 
-    if undo_shortcut or backspace:
+    if state["mode"] == "polygon" and (undo_shortcut or backspace):
         _undo_last_polygon_point()
+        return
+
+    if state["mode"] == "mask_brush" and undo_shortcut:
+        _undo_last_brush_stroke()
 
 
 def _clamp_pixel(value: float, upper_limit: int) -> int:
@@ -1157,6 +1202,8 @@ def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) ->
     state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
+    state["active_brush_stroke_id"] = None
+    state["next_brush_stroke_id"] = 1
     _update_mask_edits_count()
     _update_last_brush_debug()
     _redraw_preview()
@@ -1317,6 +1364,8 @@ def _show_png(path: str | Path) -> None:
     state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
+    state["active_brush_stroke_id"] = None
+    state["next_brush_stroke_id"] = 1
 
     if int(dpg.get_value(PARAM_GRID_WIDTH)) <= 0:
         dpg.set_value(PARAM_GRID_WIDTH, width)
@@ -1548,6 +1597,10 @@ def run() -> None:
                     "last brush image x/y: -\n"
                     "last brush world x/y: -",
                     tag=LAST_BRUSH_DEBUG_TAG,
+                )
+                dpg.add_button(
+                    label="Undo last brush stroke",
+                    callback=_undo_last_brush_stroke_callback,
                 )
                 dpg.add_button(label="Clear mask edits", callback=_clear_mask_edits_callback)
                 dpg.add_button(
