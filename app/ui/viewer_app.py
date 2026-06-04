@@ -16,6 +16,7 @@ POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 HOLES_LAYER_TAG = "holes_overlay_layer"
+BRUSH_CURSOR_LAYER_TAG = "brush_cursor_overlay_layer"
 SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
 SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
@@ -83,6 +84,7 @@ state = {
     "mask_edits": [],
     "last_brush_image": None,
     "last_brush_world": None,
+    "brush_cursor_image": None,
     "active_brush_stroke_id": None,
     "next_brush_stroke_id": 1,
     "holes": [],
@@ -384,6 +386,7 @@ def _redraw_preview() -> None:
     _redraw_polygon_overlay()
     _redraw_mask_edits_overlay()
     _redraw_holes_overlay()
+    _redraw_brush_cursor_overlay()
 
 
 def _redraw_selection_overlay() -> None:
@@ -654,6 +657,50 @@ def _redraw_mask_edits_overlay() -> None:
         )
 
 
+def _redraw_brush_cursor_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(BRUSH_CURSOR_LAYER_TAG):
+        dpg.delete_item(BRUSH_CURSOR_LAYER_TAG)
+
+    if state["mode"] != "mask_brush":
+        return
+
+    image_pos = state["brush_cursor_image"]
+    if image_pos is None:
+        return
+
+    radius_mm = max(0.001, float(dpg.get_value(BRUSH_SIZE_TAG)))
+    radius = _brush_radius_to_draw_radius(radius_mm)
+    center = image_to_drawlist(*image_pos)
+    color, _fill = _brush_edit_colors(_get_brush_edit_mode())
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=BRUSH_CURSOR_LAYER_TAG)
+    dpg.draw_circle(
+        center,
+        radius,
+        color=color,
+        fill=(0, 0, 0, 0),
+        thickness=2,
+        parent=BRUSH_CURSOR_LAYER_TAG,
+    )
+
+
+def _update_brush_cursor_from_mouse() -> None:
+    image_pos = None
+    if (
+        state["mode"] == "mask_brush"
+        and dpg.does_item_exist(IMAGE_TAG)
+        and dpg.is_item_hovered(IMAGE_TAG)
+    ):
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+        image_pos = screen_to_image(mouse_x, mouse_y)
+
+    state["brush_cursor_image"] = image_pos
+    _redraw_brush_cursor_overlay()
+
+
 def _hole_draw_radius(radius_mm: float) -> float:
     params = _get_preview_params()
     if params is None:
@@ -722,6 +769,7 @@ def _redraw_holes_overlay() -> None:
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
     _update_mask_brush_from_mouse()
+    _update_brush_cursor_from_mouse()
     _update_debug_coords()
 
     coords = _mouse_to_world()
@@ -1085,14 +1133,18 @@ def _reset_view_callback(_sender=None, _app_data=None, _user_data=None) -> None:
 def _reset_roi_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["roi_first_world"] = None
     state["mode"] = "rectangle"
+    state["brush_cursor_image"] = None
     state["editing_overlay_visible"] = True
+    _redraw_brush_cursor_overlay()
     dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
 
 
 def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["mode"] = "polygon"
     state["roi_first_world"] = None
+    state["brush_cursor_image"] = None
     state["editing_overlay_visible"] = True
+    _redraw_brush_cursor_overlay()
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
 
 
@@ -1100,7 +1152,12 @@ def _mask_brush_mode_callback(_sender=None, _app_data=None, _user_data=None) -> 
     state["mode"] = "mask_brush"
     state["roi_first_world"] = None
     state["last_brush_image"] = None
+    _update_brush_cursor_from_mouse()
     dpg.set_value(ROI_STATUS_TAG, "Mask brush mode: hold left mouse button.")
+
+
+def _brush_settings_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _redraw_brush_cursor_overlay()
 
 
 def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -1290,6 +1347,7 @@ def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) ->
     state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
+    state["brush_cursor_image"] = None
     state["active_brush_stroke_id"] = None
     state["next_brush_stroke_id"] = 1
     _update_mask_edits_count()
@@ -1452,6 +1510,7 @@ def _show_png(path: str | Path) -> None:
     state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
+    state["brush_cursor_image"] = None
     state["active_brush_stroke_id"] = None
     state["next_brush_stroke_id"] = 1
 
@@ -1760,6 +1819,7 @@ def run() -> None:
                     tag=BRUSH_MODE_TAG,
                     default_value="Remove from mask",
                     width=-1,
+                    callback=_brush_settings_callback,
                 )
                 dpg.add_text("Brush size mm")
                 dpg.add_input_float(
@@ -1767,6 +1827,7 @@ def run() -> None:
                     default_value=5.0,
                     min_value=0.001,
                     width=-1,
+                    callback=_brush_settings_callback,
                 )
                 dpg.add_text("Brush edits count: 0", tag=BRUSH_EDITS_COUNT_TAG)
                 dpg.add_text(
