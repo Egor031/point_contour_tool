@@ -37,6 +37,7 @@ class HoleCandidate:
 
     accepted: bool
     reject_reason: str = ""
+    group_id: str | None = None
 
 
 def _fit_circle_least_squares(points_xy: np.ndarray) -> tuple[float, float, float]:
@@ -242,6 +243,58 @@ def detect_circular_holes(
     return holes
 
 
+def cluster_holes_by_diameter(
+    holes: list[HoleCandidate],
+    tolerance_mm: float,
+) -> list[dict]:
+    if tolerance_mm < 0:
+        raise ValueError("tolerance_mm must be non-negative")
+
+    for hole in holes:
+        hole.group_id = None
+
+    accepted_holes = sorted(
+        (hole for hole in holes if hole.accepted),
+        key=lambda hole: hole.diameter,
+    )
+
+    grouped_holes: list[list[HoleCandidate]] = []
+    for hole in accepted_holes:
+        if not grouped_holes:
+            grouped_holes.append([hole])
+            continue
+
+        current_group = grouped_holes[-1]
+        current_diameter = sum(item.diameter for item in current_group) / len(
+            current_group
+        )
+        if abs(hole.diameter - current_diameter) <= tolerance_mm:
+            current_group.append(hole)
+        else:
+            grouped_holes.append([hole])
+
+    groups = []
+    for group_number, group_holes in enumerate(grouped_holes, start=1):
+        group_id = f"G{group_number}"
+        diameter = sum(hole.diameter for hole in group_holes) / len(group_holes)
+
+        for hole in group_holes:
+            hole.group_id = group_id
+
+        groups.append(
+            {
+                "id": group_id,
+                "name": f"Ø{diameter:.3f}",
+                "diameter": diameter,
+                "radius": diameter / 2.0,
+                "count": len(group_holes),
+                "enabled": True,
+            }
+        )
+
+    return groups
+
+
 def save_holes_csv(
     holes: list[HoleCandidate],
     output_path: str | Path,
@@ -289,35 +342,43 @@ def save_holes_csv(
 def save_holes_json(
     holes: list[HoleCandidate],
     output_path: str | Path,
+    groups: list[dict] | None = None,
     only_accepted: bool = False,
 ) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = []
+    holes_payload = []
     for hole in holes:
         if only_accepted and not hole.accepted:
             continue
 
-        payload.append(
-            {
-                "id": hole.id,
-                "accepted": hole.accepted,
-                "reject_reason": hole.reject_reason,
-                "center_x": hole.center_x,
-                "center_y": hole.center_y,
-                "radius": hole.radius,
-                "diameter": hole.diameter,
-                "area_mm2": hole.area_mm2,
-                "bbox_width_mm": hole.bbox_width_mm,
-                "bbox_height_mm": hole.bbox_height_mm,
-                "aspect_ratio": hole.aspect_ratio,
-                "circularity": hole.circularity,
-                "mean_error_mm": hole.mean_error_mm,
-                "max_error_mm": hole.max_error_mm,
-                "error_ratio": hole.error_ratio,
-            }
-        )
+        hole_payload = {
+            "id": hole.id,
+            "accepted": hole.accepted,
+            "reject_reason": hole.reject_reason,
+            "center_x": hole.center_x,
+            "center_y": hole.center_y,
+            "radius": hole.radius,
+            "diameter": hole.diameter,
+            "area_mm2": hole.area_mm2,
+            "bbox_width_mm": hole.bbox_width_mm,
+            "bbox_height_mm": hole.bbox_height_mm,
+            "aspect_ratio": hole.aspect_ratio,
+            "circularity": hole.circularity,
+            "mean_error_mm": hole.mean_error_mm,
+            "max_error_mm": hole.max_error_mm,
+            "error_ratio": hole.error_ratio,
+        }
+        if hole.group_id is not None:
+            hole_payload["group_id"] = hole.group_id
+
+        holes_payload.append(hole_payload)
+
+    payload = {
+        "groups": groups or [],
+        "holes": holes_payload,
+    }
 
     output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),

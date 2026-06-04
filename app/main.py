@@ -39,6 +39,7 @@ from app.core.contour_extractor import (
 )
 
 from app.core.hole_detector import (
+    cluster_holes_by_diameter,
     detect_circular_holes,
     save_holes_csv,
     save_holes_json,
@@ -244,6 +245,13 @@ def main() -> None:
         type=float,
         default=0.18,
         help="Maximum mean fitting error divided by radius. Default: 0.18",
+    )
+
+    parser.add_argument(
+        "--hole-group-tolerance-mm",
+        type=float,
+        default=1.5,
+        help="Maximum diameter difference within a hole group. Default: 1.5",
     )
 
     args = parser.parse_args()
@@ -455,6 +463,7 @@ def main() -> None:
         mask = fill_small_holes(mask, args.fill_holes_area)
 
     holes = []
+    hole_groups = []
 
     if args.holes:
         max_hole_diameter = (
@@ -469,6 +478,10 @@ def main() -> None:
             min_circularity=args.min_circularity,
             max_error_ratio=args.max_circle_error_ratio,
         )
+        hole_groups = cluster_holes_by_diameter(
+            holes=holes,
+            tolerance_mm=args.hole_group_tolerance_mm,
+        )
 
         save_holes_csv(
             holes=holes,
@@ -478,6 +491,7 @@ def main() -> None:
         save_holes_json(
             holes=holes,
             output_path=holes_json_path,
+            groups=hole_groups,
             only_accepted=False,
         )
 

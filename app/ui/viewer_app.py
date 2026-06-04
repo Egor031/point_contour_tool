@@ -24,6 +24,9 @@ SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
 SHOW_ACCEPTED_HOLES_TAG = "show_accepted_holes"
 SHOW_REJECTED_HOLES_TAG = "show_rejected_holes"
+SHOW_UNGROUPED_HOLES_TAG = "show_ungrouped_holes"
+SHOW_OVERSIZED_HOLES_TAG = "show_oversized_holes"
+MAX_DISPLAYED_HOLE_DIAMETER_TAG = "max_displayed_hole_diameter_mm"
 SHOW_CONTOUR_TAG = "show_contour"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
@@ -41,6 +44,7 @@ BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
+HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
 CONTOUR_INFO_TAG = "contour_info_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
@@ -92,6 +96,8 @@ state = {
     "active_brush_stroke_id": None,
     "next_brush_stroke_id": 1,
     "holes": [],
+    "hole_groups": [],
+    "visible_hole_group_ids": {},
     "contour_points": [],
     "contour_file": "",
     "report_loaded": False,
@@ -742,10 +748,27 @@ def _redraw_holes_overlay() -> None:
 
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=HOLES_LAYER_TAG)
 
+    max_diameter = float(dpg.get_value(MAX_DISPLAYED_HOLE_DIAMETER_TAG))
+    show_oversized = _display_layer_enabled(
+        SHOW_OVERSIZED_HOLES_TAG,
+        default=False,
+    )
+    visible_group_ids = state["visible_hole_group_ids"]
+
     for hole in holes:
         accepted = bool(hole.get("accepted", False))
+        diameter = float(hole.get("diameter", float(hole["radius"]) * 2.0))
+        if not show_oversized and max_diameter > 0 and diameter > max_diameter:
+            continue
+
         if accepted:
             if not _display_layer_enabled(SHOW_ACCEPTED_HOLES_TAG):
+                continue
+            group_id = hole.get("group_id")
+            if group_id:
+                if not visible_group_ids.get(str(group_id), False):
+                    continue
+            elif not _display_layer_enabled(SHOW_UNGROUPED_HOLES_TAG):
                 continue
         elif not _display_layer_enabled(SHOW_REJECTED_HOLES_TAG):
             continue
@@ -914,16 +937,60 @@ def _update_holes_stats() -> None:
         return
 
     holes = state["holes"]
+    groups = state["hole_groups"]
     accepted_count = sum(1 for hole in holes if bool(hole.get("accepted", False)))
     rejected_count = len(holes) - accepted_count
     dpg.set_value(
         HOLES_STATS_TAG,
-        "holes total: {}\naccepted: {}\nrejected: {}".format(
+        "holes total: {}\naccepted: {}\nrejected: {}\ngroups count: {}".format(
             len(holes),
             accepted_count,
             rejected_count,
+            len(groups),
         ),
     )
+
+
+def _hole_group_visibility_callback(sender, _app_data=None, user_data=None) -> None:
+    group_id = str(user_data)
+    state["visible_hole_group_ids"][group_id] = bool(dpg.get_value(sender))
+    _redraw_preview()
+
+
+def _update_hole_groups_display() -> None:
+    if not dpg.does_item_exist(HOLE_GROUPS_CONTAINER_TAG):
+        return
+
+    dpg.delete_item(HOLE_GROUPS_CONTAINER_TAG, children_only=True)
+    groups = state["hole_groups"]
+    if not groups:
+        dpg.add_text(
+            "No hole groups loaded.",
+            parent=HOLE_GROUPS_CONTAINER_TAG,
+            wrap=285,
+        )
+        return
+
+    for group in groups:
+        group_id = str(group.get("id", ""))
+        visible = state["visible_hole_group_ids"].get(group_id, True)
+        with dpg.group(parent=HOLE_GROUPS_CONTAINER_TAG):
+            dpg.add_checkbox(
+                label=f"Show group {group_id}",
+                default_value=visible,
+                callback=_hole_group_visibility_callback,
+                user_data=group_id,
+            )
+            dpg.add_text(
+                "{} | diameter={:.3f} | count={} | enabled={}".format(
+                    str(group.get("name", "")),
+                    float(group.get("diameter", 0.0)),
+                    int(group.get("count", 0)),
+                    bool(group.get("enabled", True)),
+                ),
+                wrap=285,
+            )
+            dpg.add_separator()
 
 
 def _update_contour_info() -> None:
@@ -1663,6 +1730,9 @@ def _normalize_hole_json_item(item: dict) -> dict:
         "center_y": float(item["center_y"]),
         "radius": float(item["radius"]),
         "diameter": float(item.get("diameter", float(item["radius"]) * 2.0)),
+        "group_id": (
+            str(item["group_id"]) if item.get("group_id") is not None else None
+        ),
     }
 
 
@@ -1677,20 +1747,43 @@ def _load_holes_json(path: str | Path) -> None:
 
     try:
         raw_holes = data["holes"] if isinstance(data, dict) else data
+        raw_groups = data.get("groups", []) if isinstance(data, dict) else []
         if not isinstance(raw_holes, list):
             raise ValueError("holes must be a list")
+        if not isinstance(raw_groups, list):
+            raise ValueError("groups must be a list")
 
         holes = []
         for item in raw_holes:
             if not isinstance(item, dict):
                 raise ValueError("hole item must be an object")
             holes.append(_normalize_hole_json_item(item))
+
+        hole_groups = []
+        for item in raw_groups:
+            if not isinstance(item, dict):
+                raise ValueError("group item must be an object")
+            hole_groups.append(
+                {
+                    "id": str(item.get("id", "")),
+                    "name": str(item.get("name", "")),
+                    "diameter": float(item.get("diameter", 0.0)),
+                    "radius": float(item.get("radius", 0.0)),
+                    "count": int(item.get("count", 0)),
+                    "enabled": bool(item.get("enabled", True)),
+                }
+            )
     except Exception as exc:
         _set_status(f"Could not parse holes.json: {exc}")
         return
 
     state["holes"] = holes
+    state["hole_groups"] = hole_groups
+    state["visible_hole_group_ids"] = {
+        str(group["id"]): bool(group.get("enabled", True)) for group in hole_groups
+    }
     _update_holes_stats()
+    _update_hole_groups_display()
     _redraw_preview()
     accepted_count = sum(1 for hole in holes if bool(hole.get("accepted", False)))
     rejected_count = len(holes) - accepted_count
@@ -1707,6 +1800,16 @@ def _open_holes_callback(_sender, app_data) -> None:
 
     selected_path = next(iter(selections.values()))
     _load_holes_json(selected_path)
+
+
+def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["holes"] = []
+    state["hole_groups"] = []
+    state["visible_hole_group_ids"] = {}
+    _update_holes_stats()
+    _update_hole_groups_display()
+    _redraw_preview()
+    _set_status("Holes cleared.")
 
 
 def _load_contour_csv(path: str | Path) -> None:
@@ -1938,15 +2041,44 @@ def run() -> None:
                     callback=lambda: _redraw_preview(),
                 )
                 dpg.add_checkbox(
+                    label="Show ungrouped holes",
+                    tag=SHOW_UNGROUPED_HOLES_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_text("Max displayed hole diameter mm")
+                dpg.add_input_float(
+                    tag=MAX_DISPLAYED_HOLE_DIAMETER_TAG,
+                    default_value=200.0,
+                    min_value=0.0,
+                    width=-1,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show oversized holes",
+                    tag=SHOW_OVERSIZED_HOLES_TAG,
+                    default_value=False,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
                     label="Show contour",
                     tag=SHOW_CONTOUR_TAG,
                     default_value=True,
                     callback=lambda: _redraw_preview(),
                 )
                 dpg.add_text(
-                    "holes total: 0\naccepted: 0\nrejected: 0",
+                    "holes total: 0\naccepted: 0\nrejected: 0\ngroups count: 0",
                     tag=HOLES_STATS_TAG,
                 )
+                dpg.add_button(label="Clear holes", callback=_clear_holes_callback)
+                dpg.add_text("Hole groups")
+                with dpg.child_window(
+                    tag=HOLE_GROUPS_CONTAINER_TAG,
+                    height=220,
+                    border=True,
+                    horizontal_scrollbar=False,
+                ):
+                    dpg.add_text("No hole groups loaded.", wrap=285)
                 dpg.add_text(
                     "Contour file: -\nContour points count: 0",
                     tag=CONTOUR_INFO_TAG,
