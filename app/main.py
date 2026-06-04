@@ -52,7 +52,7 @@ from app.exporters.boundary_xyz_exporter import (
     export_boundary_points,
 )
 from app.exporters.clean_xyz_exporter import export_clean_points
-from app.exporters.dxf_exporter import save_contour_dxf
+from app.exporters.dxf_exporter import load_holes_json_circles, save_contour_dxf
 
 
 def parse_roi_poly(value: str) -> list[tuple[float, float]]:
@@ -185,6 +185,11 @@ def main() -> None:
         "--dxf",
         action="store_true",
         help="Export extracted contour to DXF. Requires --contour.",
+    )
+
+    parser.add_argument(
+        "--holes-json",
+        help="Path to edited holes JSON for optional DXF circle export",
     )
 
     parser.add_argument(
@@ -530,6 +535,10 @@ def main() -> None:
             boundary_mask=boundary_mask,
         )
 
+    dxf_holes = []
+    if args.holes_json:
+        dxf_holes = load_holes_json_circles(args.holes_json)
+
     contour_result = None
 
     if args.contour:
@@ -556,6 +565,7 @@ def main() -> None:
                 contour_world=contour_result.contour_world,
                 output_path=contour_dxf_path,
                 close=True,
+                holes=dxf_holes,
             )
 
     t3 = time.perf_counter()
@@ -573,6 +583,9 @@ def main() -> None:
     if boundary_point_count is not None:
         print(f"Boundary points:{boundary_path}")
         print(f"Boundary count: {boundary_point_count:,}")
+    if args.holes_json:
+        print(f"Holes JSON input:{args.holes_json}")
+        print(f"DXF holes count: {len(dxf_holes):,}")
     if contour_result is not None:
         print(f"Contour preview: {contour_preview_path}")
         print(f"Contour CSV:     {contour_csv_path}")
