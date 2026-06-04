@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
 from pathlib import Path
@@ -17,11 +18,13 @@ SELECTION_LAYER_TAG = "selection_dim_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 HOLES_LAYER_TAG = "holes_overlay_layer"
 BRUSH_CURSOR_LAYER_TAG = "brush_cursor_overlay_layer"
+CONTOUR_LAYER_TAG = "contour_overlay_layer"
 SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
 SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
 SHOW_ACCEPTED_HOLES_TAG = "show_accepted_holes"
 SHOW_REJECTED_HOLES_TAG = "show_rejected_holes"
+SHOW_CONTOUR_TAG = "show_contour"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -38,6 +41,7 @@ BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
+CONTOUR_INFO_TAG = "contour_info_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -88,6 +92,8 @@ state = {
     "active_brush_stroke_id": None,
     "next_brush_stroke_id": 1,
     "holes": [],
+    "contour_points": [],
+    "contour_file": "",
     "report_loaded": False,
 }
 
@@ -386,6 +392,7 @@ def _redraw_preview() -> None:
     _redraw_polygon_overlay()
     _redraw_mask_edits_overlay()
     _redraw_holes_overlay()
+    _redraw_contour_overlay()
     _redraw_brush_cursor_overlay()
 
 
@@ -766,6 +773,46 @@ def _redraw_holes_overlay() -> None:
         )
 
 
+def _redraw_contour_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(CONTOUR_LAYER_TAG):
+        dpg.delete_item(CONTOUR_LAYER_TAG)
+
+    contour_points = state["contour_points"]
+    if not contour_points or not _display_layer_enabled(SHOW_CONTOUR_TAG):
+        return
+
+    draw_points = []
+    for world_x, world_y in contour_points:
+        point = _world_to_image_pixel(world_x, world_y)
+        if point is not None:
+            draw_points.append(point)
+
+    if len(draw_points) < 2:
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=CONTOUR_LAYER_TAG)
+    for point_a, point_b in zip(draw_points, draw_points[1:]):
+        dpg.draw_line(
+            point_a,
+            point_b,
+            color=(80, 240, 255, 245),
+            thickness=2,
+            parent=CONTOUR_LAYER_TAG,
+        )
+
+    if len(draw_points) >= 3:
+        dpg.draw_line(
+            draw_points[-1],
+            draw_points[0],
+            color=(80, 240, 255, 245),
+            thickness=2,
+            parent=CONTOUR_LAYER_TAG,
+        )
+
+
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
     _update_mask_brush_from_mouse()
@@ -876,6 +923,18 @@ def _update_holes_stats() -> None:
             accepted_count,
             rejected_count,
         ),
+    )
+
+
+def _update_contour_info() -> None:
+    if not dpg.does_item_exist(CONTOUR_INFO_TAG):
+        return
+
+    contour_file = str(state["contour_file"]) or "-"
+    dpg.set_value(
+        CONTOUR_INFO_TAG,
+        f"Contour file: {contour_file}\n"
+        f"Contour points count: {len(state['contour_points'])}",
     )
 
 
@@ -1527,7 +1586,10 @@ def _show_png(path: str | Path) -> None:
     _update_mask_edits_count()
     _update_last_brush_debug()
     _redraw_preview()
-    _set_status(f"Loaded: {image_path}")
+    if state["contour_points"]:
+        _set_status("Preview changed. Loaded contour may belong to another result.")
+    else:
+        _set_status(f"Loaded: {image_path}")
 
 
 def _open_file_callback(_sender, app_data) -> None:
@@ -1647,6 +1709,60 @@ def _open_holes_callback(_sender, app_data) -> None:
     _load_holes_json(selected_path)
 
 
+def _load_contour_csv(path: str | Path) -> None:
+    contour_path = Path(path)
+
+    try:
+        with contour_path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+            field_names = {str(name).strip().lower() for name in reader.fieldnames or []}
+            if "x" not in field_names or "y" not in field_names:
+                raise ValueError("CSV must contain x,y columns")
+
+            contour_points = []
+            for row_number, row in enumerate(reader, start=2):
+                normalized_row = {
+                    str(key).strip().lower(): value for key, value in row.items()
+                }
+                try:
+                    contour_points.append(
+                        (float(normalized_row["x"]), float(normalized_row["y"]))
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"invalid contour coordinates at row {row_number}"
+                    ) from exc
+
+        if not contour_points:
+            raise ValueError("contour CSV contains no points")
+    except Exception as exc:
+        _set_status(f"Could not load contour CSV: {exc}")
+        return
+
+    state["contour_points"] = contour_points
+    state["contour_file"] = str(contour_path)
+    _update_contour_info()
+    _redraw_preview()
+    _set_status(f"Contour loaded: {contour_path}, points={len(contour_points)}")
+
+
+def _open_contour_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_contour_csv(selected_path)
+
+
+def _clear_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["contour_points"] = []
+    state["contour_file"] = ""
+    _update_contour_info()
+    _redraw_preview()
+    _set_status("Contour cleared.")
+
+
 def run() -> None:
     dpg.create_context()
 
@@ -1690,6 +1806,16 @@ def run() -> None:
     ):
         dpg.add_file_extension(".json", color=(255, 160, 80, 255))
 
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_open_contour_callback,
+        tag="open_contour_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".csv", color=(80, 240, 255, 255))
+
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
         dpg.add_mouse_click_handler(
@@ -1712,6 +1838,10 @@ def run() -> None:
         dpg.add_button(
             label="Load holes.json",
             callback=lambda: dpg.show_item("open_holes_dialog"),
+        )
+        dpg.add_button(
+            label="Load contour CSV",
+            callback=lambda: dpg.show_item("open_contour_dialog"),
         )
         dpg.add_text("No .asc/.xyz processing is performed here.", tag=STATUS_TAG)
         dpg.add_separator()
@@ -1807,10 +1937,21 @@ def run() -> None:
                     default_value=True,
                     callback=lambda: _redraw_preview(),
                 )
+                dpg.add_checkbox(
+                    label="Show contour",
+                    tag=SHOW_CONTOUR_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
                 dpg.add_text(
                     "holes total: 0\naccepted: 0\nrejected: 0",
                     tag=HOLES_STATS_TAG,
                 )
+                dpg.add_text(
+                    "Contour file: -\nContour points count: 0",
+                    tag=CONTOUR_INFO_TAG,
+                )
+                dpg.add_button(label="Clear contour", callback=_clear_contour_callback)
                 dpg.add_separator()
                 dpg.add_text("Mask edit brush")
                 dpg.add_text("Brush mode")
