@@ -45,6 +45,10 @@ BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
 HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
+MOVE_HOLE_ID_TAG = "move_hole_id"
+MOVE_HOLE_TARGET_GROUP_TAG = "move_hole_target_group"
+EDIT_GROUP_TARGET_TAG = "edit_group_target"
+EDIT_GROUP_DIAMETER_TAG = "edit_group_diameter"
 CONTOUR_INFO_TAG = "contour_info_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
@@ -754,18 +758,34 @@ def _redraw_holes_overlay() -> None:
         default=False,
     )
     visible_group_ids = state["visible_hole_group_ids"]
+    groups_by_id = {
+        str(group.get("id", "")): group for group in state["hole_groups"]
+    }
 
     for hole in holes:
         accepted = bool(hole.get("accepted", False))
-        diameter = float(hole.get("diameter", float(hole["radius"]) * 2.0))
-        if not show_oversized and max_diameter > 0 and diameter > max_diameter:
+        group_id = hole.get("group_id")
+        group = groups_by_id.get(str(group_id)) if accepted and group_id else None
+        if group is not None:
+            displayed_diameter = float(group.get("diameter", 0.0))
+            displayed_radius = float(group.get("radius", displayed_diameter / 2.0))
+        else:
+            displayed_diameter = float(
+                hole.get("diameter", float(hole["radius"]) * 2.0)
+            )
+            displayed_radius = float(hole["radius"])
+
+        if (
+            not show_oversized
+            and max_diameter > 0
+            and displayed_diameter > max_diameter
+        ):
             continue
 
         if accepted:
             if not _display_layer_enabled(SHOW_ACCEPTED_HOLES_TAG):
                 continue
-            group_id = hole.get("group_id")
-            if group_id:
+            if group is not None:
                 if not visible_group_ids.get(str(group_id), False):
                     continue
             elif not _display_layer_enabled(SHOW_UNGROUPED_HOLES_TAG):
@@ -777,7 +797,7 @@ def _redraw_holes_overlay() -> None:
         if center is None:
             continue
 
-        radius = _hole_draw_radius(float(hole["radius"]))
+        radius = _hole_draw_radius(displayed_radius)
         color, fill = _hole_overlay_colors(accepted)
         dpg.draw_circle(
             center,
@@ -991,6 +1011,107 @@ def _update_hole_groups_display() -> None:
                 wrap=285,
             )
             dpg.add_separator()
+
+
+def _recount_hole_group_counts() -> None:
+    accepted_counts: dict[str, int] = {}
+    for hole in state["holes"]:
+        if not bool(hole.get("accepted", False)):
+            continue
+
+        group_id = hole.get("group_id")
+        if group_id is None:
+            continue
+
+        group_id = str(group_id)
+        accepted_counts[group_id] = accepted_counts.get(group_id, 0) + 1
+
+    for group in state["hole_groups"]:
+        group_id = str(group.get("id", ""))
+        group["count"] = accepted_counts.get(group_id, 0)
+
+
+def _update_hole_group_target_combo() -> None:
+    group_ids = [str(group.get("id", "")) for group in state["hole_groups"]]
+    for tag in (MOVE_HOLE_TARGET_GROUP_TAG, EDIT_GROUP_TARGET_TAG):
+        if not dpg.does_item_exist(tag):
+            continue
+
+        current_value = str(dpg.get_value(tag) or "")
+        if current_value not in group_ids:
+            current_value = group_ids[0] if group_ids else ""
+
+        dpg.configure_item(tag, items=group_ids)
+        dpg.set_value(tag, current_value)
+
+
+def _move_hole_to_group_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    hole_id = int(dpg.get_value(MOVE_HOLE_ID_TAG))
+    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
+
+    hole = next(
+        (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
+        None,
+    )
+    if hole is None:
+        _set_status(f"Hole not found: {hole_id}")
+        return
+
+    group = next(
+        (
+            item
+            for item in state["hole_groups"]
+            if str(item.get("id", "")) == target_group_id
+        ),
+        None,
+    )
+    if group is None:
+        _set_status(f"Hole group not found: {target_group_id}")
+        return
+
+    hole["group_id"] = target_group_id
+    _recount_hole_group_counts()
+    _update_hole_groups_display()
+    _update_holes_stats()
+    _redraw_preview()
+    _set_status(f"Hole {hole_id} moved to group {target_group_id}.")
+
+
+def _apply_group_diameter_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    group_id = str(dpg.get_value(EDIT_GROUP_TARGET_TAG) or "").strip()
+    diameter = float(dpg.get_value(EDIT_GROUP_DIAMETER_TAG))
+
+    group = next(
+        (
+            item
+            for item in state["hole_groups"]
+            if str(item.get("id", "")) == group_id
+        ),
+        None,
+    )
+    if group is None:
+        _set_status(f"Hole group not found: {group_id}")
+        return
+
+    if diameter <= 0:
+        _set_status("New group diameter must be greater than 0.")
+        return
+
+    diameter_text = _format_cli_float(diameter)
+    group["diameter"] = diameter
+    group["radius"] = diameter / 2.0
+    group["name"] = f"Ø{diameter_text}"
+    _update_hole_groups_display()
+    _redraw_preview()
+    _set_status(f"Group {group_id} diameter updated to {diameter_text} mm.")
 
 
 def _update_contour_info() -> None:
@@ -1509,6 +1630,38 @@ def _save_mask_edits_dialog_callback(_sender, app_data) -> None:
     _write_mask_edits_json(file_path_name)
 
 
+def _write_edited_holes_json(output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    if output_path.suffix.lower() != ".json":
+        output_path = output_path.with_suffix(output_path.suffix + ".json")
+
+    payload = {
+        "groups": state["hole_groups"],
+        "holes": state["holes"],
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _set_status(f"Edited holes JSON saved: {output_path.resolve()}")
+
+
+def _save_edited_holes_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    dpg.show_item("save_edited_holes_dialog")
+
+
+def _save_edited_holes_dialog_callback(_sender, app_data) -> None:
+    file_path_name = app_data.get("file_path_name")
+    if not file_path_name:
+        return
+
+    _write_edited_holes_json(file_path_name)
+
+
 def _quote_command_arg(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
 
@@ -1782,8 +1935,10 @@ def _load_holes_json(path: str | Path) -> None:
     state["visible_hole_group_ids"] = {
         str(group["id"]): bool(group.get("enabled", True)) for group in hole_groups
     }
+    _recount_hole_group_counts()
     _update_holes_stats()
     _update_hole_groups_display()
+    _update_hole_group_target_combo()
     _redraw_preview()
     accepted_count = sum(1 for hole in holes if bool(hole.get("accepted", False)))
     rejected_count = len(holes) - accepted_count
@@ -1808,6 +1963,7 @@ def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None
     state["visible_hole_group_ids"] = {}
     _update_holes_stats()
     _update_hole_groups_display()
+    _update_hole_group_target_combo()
     _redraw_preview()
     _set_status("Holes cleared.")
 
@@ -1908,6 +2064,16 @@ def run() -> None:
         height=400,
     ):
         dpg.add_file_extension(".json", color=(255, 160, 80, 255))
+
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_save_edited_holes_dialog_callback,
+        tag="save_edited_holes_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".json", color=(80, 220, 160, 255))
 
     with dpg.file_dialog(
         directory_selector=False,
@@ -2071,6 +2237,10 @@ def run() -> None:
                     tag=HOLES_STATS_TAG,
                 )
                 dpg.add_button(label="Clear holes", callback=_clear_holes_callback)
+                dpg.add_button(
+                    label="Save edited holes JSON",
+                    callback=_save_edited_holes_callback,
+                )
                 dpg.add_text("Hole groups")
                 with dpg.child_window(
                     tag=HOLE_GROUPS_CONTAINER_TAG,
@@ -2079,6 +2249,42 @@ def run() -> None:
                     horizontal_scrollbar=False,
                 ):
                     dpg.add_text("No hole groups loaded.", wrap=285)
+                dpg.add_text("Move hole between groups")
+                dpg.add_text("Selected hole ID")
+                dpg.add_input_int(
+                    tag=MOVE_HOLE_ID_TAG,
+                    default_value=0,
+                    min_value=0,
+                    width=-1,
+                )
+                dpg.add_text("Target group ID")
+                dpg.add_combo(
+                    [],
+                    tag=MOVE_HOLE_TARGET_GROUP_TAG,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label="Move hole to group",
+                    callback=_move_hole_to_group_callback,
+                )
+                dpg.add_text("Edit hole group")
+                dpg.add_text("Target group ID")
+                dpg.add_combo(
+                    [],
+                    tag=EDIT_GROUP_TARGET_TAG,
+                    width=-1,
+                )
+                dpg.add_text("New group diameter mm")
+                dpg.add_input_float(
+                    tag=EDIT_GROUP_DIAMETER_TAG,
+                    default_value=1.0,
+                    min_value=0.001,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label="Apply group diameter",
+                    callback=_apply_group_diameter_callback,
+                )
                 dpg.add_text(
                     "Contour file: -\nContour points count: 0",
                     tag=CONTOUR_INFO_TAG,
