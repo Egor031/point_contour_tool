@@ -1743,7 +1743,7 @@ def _copy_command_callback(_sender=None, _app_data=None, _user_data=None) -> Non
         _set_status("Command copied to clipboard.")
 
 
-def _show_png(path: str | Path) -> None:
+def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     image_path = Path(path)
 
     try:
@@ -1786,12 +1786,13 @@ def _show_png(path: str | Path) -> None:
     state["selection_kind"] = None
     state["selection_polygon_points"] = []
     state["polygon_points"] = []
-    state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
     state["brush_cursor_image"] = None
     state["active_brush_stroke_id"] = None
     state["next_brush_stroke_id"] = 1
+    if clear_mask_edits:
+        state["mask_edits"] = []
 
     if int(dpg.get_value(PARAM_GRID_WIDTH)) <= 0:
         dpg.set_value(PARAM_GRID_WIDTH, width)
@@ -1819,6 +1820,73 @@ def _open_file_callback(_sender, app_data) -> None:
 
     selected_path = next(iter(selections.values()))
     _show_png(selected_path)
+
+
+def _first_existing_path(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _find_processing_result_files(png_path: str | Path) -> dict[str, Path | None]:
+    png_path = Path(png_path)
+    folder = png_path.parent
+    stem = png_path.stem
+
+    report_candidates = [folder / "report.txt"]
+    contour_candidates = [folder / "contour.csv"]
+    holes_candidates = [folder / "holes.json"]
+
+    marker = "_density_cell_"
+    if marker in stem:
+        base_name, cell_text = stem.split(marker, 1)
+        if "_smooth_" in cell_text:
+            cell_text = cell_text.split("_smooth_", 1)[0]
+
+        report_candidates.insert(0, folder / f"{base_name}_report_cell_{cell_text}.txt")
+        contour_candidates = sorted(
+            folder.glob(f"{base_name}_contour_cell_{cell_text}_threshold_*.csv")
+        ) + contour_candidates
+        holes_candidates = sorted(
+            folder.glob(f"{base_name}_holes_cell_{cell_text}_threshold_*.json")
+        ) + holes_candidates
+
+    return {
+        "report": _first_existing_path(report_candidates),
+        "contour": _first_existing_path(contour_candidates),
+        "holes": _first_existing_path(holes_candidates),
+    }
+
+
+def _load_processing_result(path: str | Path) -> None:
+    png_path = Path(path)
+    _show_png(png_path, clear_mask_edits=False)
+
+    related_files = _find_processing_result_files(png_path)
+    if related_files["report"] is not None:
+        _load_report(related_files["report"])
+    if related_files["contour"] is not None:
+        _load_contour_csv(related_files["contour"])
+    if related_files["holes"] is not None:
+        _load_holes_json(related_files["holes"])
+
+    status_lines = [
+        f"Report: {'found' if related_files['report'] is not None else 'not found'}",
+        f"Contour: {'found' if related_files['contour'] is not None else 'not found'}",
+        f"Holes: {'found' if related_files['holes'] is not None else 'not found'}",
+    ]
+    _set_status("\n".join(status_lines))
+
+
+def _open_processing_result_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_processing_result(selected_path)
 
 
 def _load_report(path: str | Path) -> None:
@@ -2038,6 +2106,16 @@ def run() -> None:
     with dpg.file_dialog(
         directory_selector=False,
         show=False,
+        callback=_open_processing_result_callback,
+        tag="open_processing_result_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".png", color=(120, 220, 180, 255))
+
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
         callback=_open_report_callback,
         tag="open_report_dialog",
         width=700,
@@ -2099,6 +2177,10 @@ def run() -> None:
         dpg.add_button(
             label="Open PNG",
             callback=lambda: dpg.show_item("open_png_dialog"),
+        )
+        dpg.add_button(
+            label="Load processing result",
+            callback=lambda: dpg.show_item("open_processing_result_dialog"),
         )
         dpg.add_button(
             label="Load report.txt",
