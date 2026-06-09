@@ -19,6 +19,7 @@ MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 HOLES_LAYER_TAG = "holes_overlay_layer"
 BRUSH_CURSOR_LAYER_TAG = "brush_cursor_overlay_layer"
 CONTOUR_LAYER_TAG = "contour_overlay_layer"
+MIXED_CONTOUR_LAYER_TAG = "mixed_contour_overlay_layer"
 SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
 SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
@@ -28,6 +29,8 @@ SHOW_UNGROUPED_HOLES_TAG = "show_ungrouped_holes"
 SHOW_OVERSIZED_HOLES_TAG = "show_oversized_holes"
 MAX_DISPLAYED_HOLE_DIAMETER_TAG = "max_displayed_hole_diameter_mm"
 SHOW_CONTOUR_TAG = "show_contour"
+SHOW_MIXED_CONTOUR_LINES_TAG = "show_mixed_contour_lines"
+SHOW_MIXED_CONTOUR_GAPS_TAG = "show_mixed_contour_gaps"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
@@ -50,6 +53,7 @@ MOVE_HOLE_TARGET_GROUP_TAG = "move_hole_target_group"
 EDIT_GROUP_TARGET_TAG = "edit_group_target"
 EDIT_GROUP_DIAMETER_TAG = "edit_group_diameter"
 CONTOUR_INFO_TAG = "contour_info_text"
+MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -104,6 +108,8 @@ state = {
     "visible_hole_group_ids": {},
     "contour_points": [],
     "contour_file": "",
+    "mixed_contour_elements": [],
+    "mixed_contour_file": "",
     "report_loaded": False,
 }
 
@@ -403,6 +409,7 @@ def _redraw_preview() -> None:
     _redraw_mask_edits_overlay()
     _redraw_holes_overlay()
     _redraw_contour_overlay()
+    _redraw_mixed_contour_overlay()
     _redraw_brush_cursor_overlay()
 
 
@@ -856,6 +863,61 @@ def _redraw_contour_overlay() -> None:
         )
 
 
+def _redraw_mixed_contour_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(MIXED_CONTOUR_LAYER_TAG):
+        dpg.delete_item(MIXED_CONTOUR_LAYER_TAG)
+
+    elements = state["mixed_contour_elements"]
+    if not elements:
+        return
+
+    show_lines = _display_layer_enabled(SHOW_MIXED_CONTOUR_LINES_TAG)
+    show_gaps = _display_layer_enabled(SHOW_MIXED_CONTOUR_GAPS_TAG)
+    if not show_lines and not show_gaps:
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=MIXED_CONTOUR_LAYER_TAG)
+    for element in elements:
+        element_type = str(element.get("type", "")).upper()
+        if element_type == "LINE":
+            if not show_lines:
+                continue
+            start = element.get("start", {})
+            end = element.get("end", {})
+            point_a = _world_to_image_pixel(float(start["x"]), float(start["y"]))
+            point_b = _world_to_image_pixel(float(end["x"]), float(end["y"]))
+            if point_a is None or point_b is None:
+                continue
+
+            dpg.draw_line(
+                point_a,
+                point_b,
+                color=(255, 245, 90, 255),
+                thickness=3,
+                parent=MIXED_CONTOUR_LAYER_TAG,
+            )
+        elif element_type == "POLYLINE":
+            if not show_gaps:
+                continue
+            draw_points = []
+            for point in element.get("points", []):
+                draw_point = _world_to_image_pixel(float(point["x"]), float(point["y"]))
+                if draw_point is not None:
+                    draw_points.append(draw_point)
+
+            for point_a, point_b in zip(draw_points, draw_points[1:]):
+                dpg.draw_line(
+                    point_a,
+                    point_b,
+                    color=(255, 120, 220, 235),
+                    thickness=2,
+                    parent=MIXED_CONTOUR_LAYER_TAG,
+                )
+
+
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_pan_from_mouse()
     _update_mask_brush_from_mouse()
@@ -1123,6 +1185,30 @@ def _update_contour_info() -> None:
         CONTOUR_INFO_TAG,
         f"Contour file: {contour_file}\n"
         f"Contour points count: {len(state['contour_points'])}",
+    )
+
+
+def _mixed_contour_counts() -> tuple[int, int, int]:
+    elements = state["mixed_contour_elements"]
+    lines_count = sum(1 for item in elements if str(item.get("type", "")).upper() == "LINE")
+    gaps_count = sum(
+        1 for item in elements if str(item.get("type", "")).upper() == "POLYLINE"
+    )
+    return len(elements), lines_count, gaps_count
+
+
+def _update_mixed_contour_info() -> None:
+    if not dpg.does_item_exist(MIXED_CONTOUR_INFO_TAG):
+        return
+
+    total_count, lines_count, gaps_count = _mixed_contour_counts()
+    mixed_file = str(state["mixed_contour_file"]) or "-"
+    dpg.set_value(
+        MIXED_CONTOUR_INFO_TAG,
+        f"Mixed contour file: {mixed_file}\n"
+        f"Elements: {total_count}\n"
+        f"Lines: {lines_count}\n"
+        f"Polyline gaps: {gaps_count}",
     )
 
 
@@ -1838,6 +1924,7 @@ def _find_processing_result_files(png_path: str | Path) -> dict[str, Path | None
     report_candidates = [folder / "report.txt"]
     contour_candidates = [folder / "contour.csv"]
     holes_candidates = [folder / "holes.json"]
+    mixed_contour_candidates = sorted(folder.glob("*_mixed_contour.json"))
 
     marker = "_density_cell_"
     if marker in stem:
@@ -1852,11 +1939,15 @@ def _find_processing_result_files(png_path: str | Path) -> dict[str, Path | None
         holes_candidates = sorted(
             folder.glob(f"{base_name}_holes_cell_{cell_text}_threshold_*.json")
         ) + holes_candidates
+        mixed_contour_candidates = [
+            folder / f"{base_name}_mixed_contour.json",
+        ] + mixed_contour_candidates
 
     return {
         "report": _first_existing_path(report_candidates),
         "contour": _first_existing_path(contour_candidates),
         "holes": _first_existing_path(holes_candidates),
+        "mixed_contour": _first_existing_path(mixed_contour_candidates),
     }
 
 
@@ -1871,11 +1962,15 @@ def _load_processing_result(path: str | Path) -> None:
         _load_contour_csv(related_files["contour"])
     if related_files["holes"] is not None:
         _load_holes_json(related_files["holes"])
+    if related_files["mixed_contour"] is not None:
+        _load_mixed_contour_json(related_files["mixed_contour"])
 
     status_lines = [
         f"Report: {'found' if related_files['report'] is not None else 'not found'}",
         f"Contour: {'found' if related_files['contour'] is not None else 'not found'}",
         f"Holes: {'found' if related_files['holes'] is not None else 'not found'}",
+        "Mixed contour: "
+        f"{'found' if related_files['mixed_contour'] is not None else 'not found'}",
     ]
     _set_status("\n".join(status_lines))
 
@@ -2090,6 +2185,97 @@ def _clear_contour_callback(_sender=None, _app_data=None, _user_data=None) -> No
     _set_status("Contour cleared.")
 
 
+def _normalize_mixed_contour_element(item: dict) -> dict:
+    element_type = str(item.get("type", "")).upper()
+    if element_type == "LINE":
+        start = item.get("start")
+        end = item.get("end")
+        if not isinstance(start, dict) or not isinstance(end, dict):
+            raise ValueError("LINE element must contain start/end objects")
+
+        return {
+            "id": int(item.get("id", 0)),
+            "type": "LINE",
+            "source": str(item.get("source", "")),
+            "original_line_id": item.get("original_line_id"),
+            "start": {"x": float(start["x"]), "y": float(start["y"])},
+            "end": {"x": float(end["x"]), "y": float(end["y"])},
+        }
+
+    if element_type == "POLYLINE":
+        raw_points = item.get("points")
+        if not isinstance(raw_points, list):
+            raise ValueError("POLYLINE element must contain points list")
+
+        points = []
+        for point in raw_points:
+            if not isinstance(point, dict):
+                raise ValueError("POLYLINE point must be an object")
+            points.append({"x": float(point["x"]), "y": float(point["y"])})
+
+        return {
+            "id": int(item.get("id", 0)),
+            "type": "POLYLINE",
+            "source": str(item.get("source", "")),
+            "contour_start_index": item.get("contour_start_index"),
+            "contour_end_index": item.get("contour_end_index"),
+            "points": points,
+        }
+
+    raise ValueError(f"Unsupported mixed contour element type: {element_type}")
+
+
+def _load_mixed_contour_json(path: str | Path) -> None:
+    mixed_path = Path(path)
+
+    try:
+        data = json.loads(mixed_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _set_status(f"Could not load mixed contour JSON: {exc}")
+        return
+
+    try:
+        raw_elements = data.get("elements", data) if isinstance(data, dict) else data
+        if not isinstance(raw_elements, list):
+            raise ValueError("mixed contour elements must be a list")
+
+        elements = []
+        for item in raw_elements:
+            if not isinstance(item, dict):
+                raise ValueError("mixed contour element must be an object")
+            elements.append(_normalize_mixed_contour_element(item))
+    except Exception as exc:
+        _set_status(f"Could not parse mixed contour JSON: {exc}")
+        return
+
+    state["mixed_contour_elements"] = elements
+    state["mixed_contour_file"] = str(mixed_path)
+    _update_mixed_contour_info()
+    _redraw_preview()
+    total_count, lines_count, gaps_count = _mixed_contour_counts()
+    _set_status(
+        "Mixed contour loaded: "
+        f"elements={total_count}, lines={lines_count}, polyline gaps={gaps_count}"
+    )
+
+
+def _open_mixed_contour_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_mixed_contour_json(selected_path)
+
+
+def _clear_mixed_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    state["mixed_contour_elements"] = []
+    state["mixed_contour_file"] = ""
+    _update_mixed_contour_info()
+    _redraw_preview()
+    _set_status("Mixed contour cleared.")
+
+
 def run() -> None:
     dpg.create_context()
 
@@ -2163,6 +2349,16 @@ def run() -> None:
     ):
         dpg.add_file_extension(".csv", color=(80, 240, 255, 255))
 
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
+        callback=_open_mixed_contour_callback,
+        tag="open_mixed_contour_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".json", color=(255, 220, 90, 255))
+
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
         dpg.add_mouse_click_handler(
@@ -2193,6 +2389,10 @@ def run() -> None:
         dpg.add_button(
             label="Load contour CSV",
             callback=lambda: dpg.show_item("open_contour_dialog"),
+        )
+        dpg.add_button(
+            label="Load mixed contour JSON",
+            callback=lambda: dpg.show_item("open_mixed_contour_dialog"),
         )
         dpg.add_text("No .asc/.xyz processing is performed here.", tag=STATUS_TAG)
         dpg.add_separator()
@@ -2314,6 +2514,18 @@ def run() -> None:
                     default_value=True,
                     callback=lambda: _redraw_preview(),
                 )
+                dpg.add_checkbox(
+                    label="Show mixed contour lines",
+                    tag=SHOW_MIXED_CONTOUR_LINES_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show mixed contour polyline gaps",
+                    tag=SHOW_MIXED_CONTOUR_GAPS_TAG,
+                    default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
                 dpg.add_text(
                     "holes total: 0\naccepted: 0\nrejected: 0\ngroups count: 0",
                     tag=HOLES_STATS_TAG,
@@ -2372,6 +2584,14 @@ def run() -> None:
                     tag=CONTOUR_INFO_TAG,
                 )
                 dpg.add_button(label="Clear contour", callback=_clear_contour_callback)
+                dpg.add_text(
+                    "Mixed contour file: -\nElements: 0\nLines: 0\nPolyline gaps: 0",
+                    tag=MIXED_CONTOUR_INFO_TAG,
+                )
+                dpg.add_button(
+                    label="Clear mixed contour",
+                    callback=_clear_mixed_contour_callback,
+                )
                 dpg.add_separator()
                 dpg.add_text("Mask edit brush")
                 dpg.add_text("Brush mode")

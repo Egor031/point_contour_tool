@@ -1629,6 +1629,48 @@ def save_mixed_contour_dxf(
     doc.saveas(output_path)
 
 
+def save_mixed_contour_with_holes_dxf(
+    elements: list[dict],
+    output_path: str | Path,
+    holes: list[dict] | None = None,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = ezdxf.new("R2010")
+    doc.units = ezdxf.units.MM
+    doc.layers.add(name="MIXED_LINES", color=5)
+    doc.layers.add(name="MIXED_POLYLINE_GAPS", color=1)
+    doc.layers.add(name="HOLES", color=3)
+
+    msp = doc.modelspace()
+    for element in elements:
+        if element["type"] == "LINE":
+            start = element["start"]
+            end = element["end"]
+            msp.add_line(
+                (start["x"], start["y"]),
+                (end["x"], end["y"]),
+                dxfattribs={"layer": "MIXED_LINES"},
+            )
+        elif element["type"] == "POLYLINE":
+            points = [(point["x"], point["y"]) for point in element["points"]]
+            if len(points) >= 2:
+                msp.add_lwpolyline(
+                    points,
+                    dxfattribs={"layer": "MIXED_POLYLINE_GAPS"},
+                )
+
+    for hole in holes or []:
+        msp.add_circle(
+            center=(float(hole["center_x"]), float(hole["center_y"])),
+            radius=float(hole["radius"]),
+            dxfattribs={"layer": "HOLES"},
+        )
+
+    doc.saveas(output_path)
+
+
 def save_refined_lines_dxf(
     lines: list[RefinedLine],
     output_path: str | Path,
@@ -1699,6 +1741,8 @@ def run_line_approximation(
     mixed_contour: bool = False,
     mixed_contour_json_path: str | Path | None = None,
     mixed_contour_dxf_path: str | Path | None = None,
+    mixed_with_holes_dxf_path: str | Path | None = None,
+    mixed_dxf_holes: list[dict] | None = None,
 ) -> LineApproximationResult:
     contour_points = load_contour_csv(contour_csv_path)
     boundary_points = load_boundary_points(boundary_points_path)
@@ -1752,5 +1796,11 @@ def run_line_approximation(
             save_mixed_contour_json(mixed_elements, mixed_contour_json_path)
         if mixed_contour_dxf_path is not None:
             save_mixed_contour_dxf(mixed_elements, mixed_contour_dxf_path)
+        if mixed_with_holes_dxf_path is not None:
+            save_mixed_contour_with_holes_dxf(
+                mixed_elements,
+                mixed_with_holes_dxf_path,
+                holes=mixed_dxf_holes,
+            )
 
     return result

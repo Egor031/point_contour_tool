@@ -408,8 +408,16 @@ def main() -> None:
         action="store_true",
         help="Build experimental mixed contour from accepted lines and source contour gaps",
     )
+    parser.add_argument(
+        "--mixed-dxf",
+        action="store_true",
+        help="Export experimental mixed contour and holes into one DXF. Requires --mixed-contour.",
+    )
 
     args = parser.parse_args()
+
+    if args.mixed_dxf and not args.mixed_contour:
+        raise ValueError("--mixed-dxf requires --mixed-contour")
 
     if args.approx_lines:
         if not args.approx_contour_csv:
@@ -426,6 +434,10 @@ def main() -> None:
         chained_lines_dxf_path = output_dir / f"{base_name}_refined_chained_lines.dxf"
         mixed_contour_json_path = output_dir / f"{base_name}_mixed_contour.json"
         mixed_contour_dxf_path = output_dir / f"{base_name}_mixed_contour.dxf"
+        mixed_with_holes_dxf_path = output_dir / f"{base_name}_mixed_with_holes.dxf"
+        mixed_dxf_holes = []
+        if args.mixed_dxf and args.holes_json:
+            mixed_dxf_holes = load_holes_json_circles(args.holes_json)
 
         line_result = run_line_approximation(
             contour_csv_path=args.approx_contour_csv,
@@ -463,6 +475,10 @@ def main() -> None:
             mixed_contour=args.mixed_contour,
             mixed_contour_json_path=mixed_contour_json_path,
             mixed_contour_dxf_path=mixed_contour_dxf_path,
+            mixed_with_holes_dxf_path=(
+                mixed_with_holes_dxf_path if args.mixed_dxf else None
+            ),
+            mixed_dxf_holes=mixed_dxf_holes,
         )
 
         print(f"Refined lines JSON: {refined_lines_json_path}")
@@ -480,6 +496,10 @@ def main() -> None:
             print(f"Mixed contour JSON: {mixed_contour_json_path}")
             print(f"Mixed contour DXF:  {mixed_contour_dxf_path}")
             print(f"Mixed contour elements: {len(line_result.mixed_contour_elements):,}")
+        if args.mixed_dxf:
+            if not mixed_dxf_holes:
+                print("Warning: no holes available for mixed_with_holes.dxf")
+            print(f"Mixed with holes DXF: {mixed_with_holes_dxf_path}")
         print(f"Total segments:     {line_result.total_segments:,}")
         print(f"Accepted lines:     {len(line_result.lines):,}")
         print(f"Rejected segments:  {len(line_result.rejected_segments):,}")

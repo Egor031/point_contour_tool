@@ -7,10 +7,7 @@ import ezdxf
 import numpy as np
 
 
-def load_holes_json_circles(path: str | Path) -> list[dict]:
-    path = Path(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
-
+def holes_payload_to_circles(data) -> list[dict]:
     if isinstance(data, dict):
         holes = data.get("holes", [])
         groups = data.get("groups", [])
@@ -66,6 +63,12 @@ def load_holes_json_circles(path: str | Path) -> list[dict]:
         )
 
     return circles
+
+
+def load_holes_json_circles(path: str | Path) -> list[dict]:
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return holes_payload_to_circles(data)
 
 
 def save_contour_dxf(
