@@ -44,6 +44,7 @@ from app.core.hole_detector import (
     save_holes_csv,
     save_holes_json,
 )
+from app.core.line_approximation import run_line_approximation
 
 from app.core.xyz_reader import compute_stats
 
@@ -92,6 +93,7 @@ def main() -> None:
 
     parser.add_argument(
         "input_file",
+        nargs="?",
         help="Path to .asc/.xyz file",
     )
 
@@ -259,7 +261,238 @@ def main() -> None:
         help="Maximum diameter difference within a hole group. Default: 1.5",
     )
 
+    parser.add_argument(
+        "--approx-lines",
+        action="store_true",
+        help="Experimental: approximate straight contour segments from boundary points",
+    )
+    parser.add_argument(
+        "--approx-contour-csv",
+        help="Contour CSV with x,y columns for --approx-lines",
+    )
+    parser.add_argument(
+        "--approx-boundary-points",
+        help="Boundary point cloud file with x y z points for --approx-lines",
+    )
+    parser.add_argument(
+        "--line-simplify-mm",
+        type=float,
+        default=5.0,
+        help="Douglas-Peucker tolerance for line approximation. Default: 5.0",
+    )
+    parser.add_argument(
+        "--line-fit-band-mm",
+        type=float,
+        default=3.0,
+        help="Boundary point band around simplified contour segment. Default: 3.0",
+    )
+    parser.add_argument(
+        "--min-line-points",
+        type=int,
+        default=20,
+        help="Minimum boundary points for a fitted line. Default: 20",
+    )
+    parser.add_argument(
+        "--min-line-length-mm",
+        type=float,
+        default=20.0,
+        help="Minimum accepted line length. Default: 20.0",
+    )
+    parser.add_argument(
+        "--max-line-mean-error-mm",
+        type=float,
+        default=1.0,
+        help="Maximum mean line fitting error. Default: 1.0",
+    )
+    parser.add_argument(
+        "--max-line-error-mm",
+        type=float,
+        default=3.0,
+        help="Maximum line fitting error. Default: 3.0",
+    )
+    parser.add_argument(
+        "--line-edge-percentile",
+        type=float,
+        default=20.0,
+        help="Outer edge percentile used for line fitting. Default: 20.0",
+    )
+    parser.add_argument(
+        "--line-trim-outlier-percent",
+        type=float,
+        default=10.0,
+        help="Largest-error points percent trimmed before final line fit. Default: 10.0",
+    )
+    parser.add_argument(
+        "--max-line-angle-diff-deg",
+        type=float,
+        default=12.0,
+        help="Maximum angle difference between segment and fitted line. Default: 12.0",
+    )
+    parser.add_argument(
+        "--line-end-trim-percent",
+        type=float,
+        default=10.0,
+        help="Percent trimmed from each segment end before line fitting. Default: 10.0",
+    )
+    parser.add_argument(
+        "--line-window-mm",
+        type=float,
+        default=30.0,
+        help="Sliding window length for straight core detection. Default: 30.0",
+    )
+    parser.add_argument(
+        "--line-window-step-mm",
+        type=float,
+        default=10.0,
+        help="Sliding window step for straight core detection. Default: 10.0",
+    )
+    parser.add_argument(
+        "--max-window-mean-error-mm",
+        type=float,
+        default=1.0,
+        help="Maximum mean fit error for a good line core window. Default: 1.0",
+    )
+    parser.add_argument(
+        "--max-window-angle-diff-deg",
+        type=float,
+        default=5.0,
+        help="Maximum angle difference between neighboring good windows. Default: 5.0",
+    )
+    parser.add_argument(
+        "--max-point-contour-distance-mm",
+        type=float,
+        default=6.0,
+        help="Maximum boundary point distance to source contour segment. Default: 6.0",
+    )
+    parser.add_argument(
+        "--max-line-contour-distance-mm",
+        type=float,
+        default=5.0,
+        help="Maximum fitted line distance to source mask contour. Default: 5.0",
+    )
+    parser.add_argument(
+        "--debug-line-id",
+        type=int,
+        help="Save debug CSV/JSON files for one experimental line segment id",
+    )
+    parser.add_argument(
+        "--show-line-labels",
+        action="store_true",
+        help="Add accepted line id labels to experimental refined_lines.dxf",
+    )
+    parser.add_argument(
+        "--line-label-height-mm",
+        type=float,
+        default=10.0,
+        help="Text height for experimental refined line labels. Default: 10.0",
+    )
+    parser.add_argument(
+        "--chain-lines",
+        action="store_true",
+        help="Build experimental chained contour from accepted refined lines",
+    )
+    parser.add_argument(
+        "--max-chain-intersection-distance-mm",
+        type=float,
+        default=150.0,
+        help="Maximum accepted distance from chained intersection to source segments. Default: 150.0",
+    )
+    parser.add_argument(
+        "--parallel-angle-eps-deg",
+        type=float,
+        default=3.0,
+        help="Angle threshold for treating neighboring refined lines as parallel. Default: 3.0",
+    )
+    parser.add_argument(
+        "--mixed-contour",
+        action="store_true",
+        help="Build experimental mixed contour from accepted lines and source contour gaps",
+    )
+
     args = parser.parse_args()
+
+    if args.approx_lines:
+        if not args.approx_contour_csv:
+            raise ValueError("--approx-contour-csv is required with --approx-lines")
+        if not args.approx_boundary_points:
+            raise ValueError("--approx-boundary-points is required with --approx-lines")
+
+        output_dir = Path(args.out)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_name = Path(args.approx_contour_csv).stem
+        refined_lines_json_path = output_dir / f"{base_name}_refined_lines.json"
+        refined_lines_dxf_path = output_dir / f"{base_name}_refined_lines.dxf"
+        chained_lines_json_path = output_dir / f"{base_name}_refined_chained_lines.json"
+        chained_lines_dxf_path = output_dir / f"{base_name}_refined_chained_lines.dxf"
+        mixed_contour_json_path = output_dir / f"{base_name}_mixed_contour.json"
+        mixed_contour_dxf_path = output_dir / f"{base_name}_mixed_contour.dxf"
+
+        line_result = run_line_approximation(
+            contour_csv_path=args.approx_contour_csv,
+            boundary_points_path=args.approx_boundary_points,
+            output_json_path=refined_lines_json_path,
+            output_dxf_path=refined_lines_dxf_path,
+            line_simplify_mm=args.line_simplify_mm,
+            line_fit_band_mm=args.line_fit_band_mm,
+            min_line_points=args.min_line_points,
+            min_line_length_mm=args.min_line_length_mm,
+            max_line_mean_error_mm=args.max_line_mean_error_mm,
+            max_line_error_mm=args.max_line_error_mm,
+            line_edge_percentile=args.line_edge_percentile,
+            line_trim_outlier_percent=args.line_trim_outlier_percent,
+            max_line_angle_diff_deg=args.max_line_angle_diff_deg,
+            line_end_trim_percent=args.line_end_trim_percent,
+            line_window_mm=args.line_window_mm,
+            line_window_step_mm=args.line_window_step_mm,
+            max_window_mean_error_mm=args.max_window_mean_error_mm,
+            max_window_angle_diff_deg=args.max_window_angle_diff_deg,
+            max_point_contour_distance_mm=args.max_point_contour_distance_mm,
+            max_line_contour_distance_mm=args.max_line_contour_distance_mm,
+            debug_line_id=args.debug_line_id,
+            debug_output_dir=output_dir,
+            debug_base_name=base_name,
+            show_line_labels=args.show_line_labels,
+            line_label_height_mm=args.line_label_height_mm,
+            chain_lines=args.chain_lines,
+            chained_json_path=chained_lines_json_path,
+            chained_dxf_path=chained_lines_dxf_path,
+            max_chain_intersection_distance_mm=(
+                args.max_chain_intersection_distance_mm
+            ),
+            parallel_angle_eps_deg=args.parallel_angle_eps_deg,
+            mixed_contour=args.mixed_contour,
+            mixed_contour_json_path=mixed_contour_json_path,
+            mixed_contour_dxf_path=mixed_contour_dxf_path,
+        )
+
+        print(f"Refined lines JSON: {refined_lines_json_path}")
+        print(f"Refined lines DXF:  {refined_lines_dxf_path}")
+        if args.chain_lines:
+            print(f"Chained lines JSON: {chained_lines_json_path}")
+            print(f"Chained lines DXF:  {chained_lines_dxf_path}")
+            print(f"Chained lines count: {len(line_result.chained_lines):,}")
+            print(
+                "Successful intersections: "
+                f"{line_result.chained_successful_intersections:,}"
+            )
+            print(f"Chained warnings count: {line_result.chained_warnings_count:,}")
+        if args.mixed_contour:
+            print(f"Mixed contour JSON: {mixed_contour_json_path}")
+            print(f"Mixed contour DXF:  {mixed_contour_dxf_path}")
+            print(f"Mixed contour elements: {len(line_result.mixed_contour_elements):,}")
+        print(f"Total segments:     {line_result.total_segments:,}")
+        print(f"Accepted lines:     {len(line_result.lines):,}")
+        print(f"Rejected segments:  {len(line_result.rejected_segments):,}")
+        print("Rejected by reason:")
+        if line_result.rejected_by_reason:
+            for reason, count in sorted(line_result.rejected_by_reason.items()):
+                print(f"  {reason}: {count:,}")
+        else:
+            print("  none: 0")
+        return
+
+    if not args.input_file:
+        raise ValueError("input_file is required unless --approx-lines is used")
 
     input_path = Path(args.input_file)
     output_dir = Path(args.out)
