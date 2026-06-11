@@ -2037,7 +2037,40 @@ def _newest_matching_file(folder: Path, pattern: str) -> tuple[Path | None, int]
     return newest, len(matches)
 
 
-def _find_source_result_files(source_path: str | Path) -> tuple[dict[str, Path | None], bool]:
+def _find_source_preview_file(folder: Path, stem: str) -> tuple[Path | None, int]:
+    forbidden_words = (
+        "contour",
+        "holes",
+        "mixed",
+        "refined",
+        "debug",
+        "mask_edits",
+        "overlay",
+        "line",
+    )
+    stem_lower = stem.lower()
+    png_candidates = [
+        path
+        for path in folder.glob(f"{stem}*.png")
+        if path.is_file()
+        and path.name.lower().startswith(stem_lower)
+        and not any(word in path.name.lower() for word in forbidden_words)
+    ]
+
+    for marker in ("density_preview", "density", "preview"):
+        matches = [
+            path for path in png_candidates if marker in path.name.lower()
+        ]
+        if matches:
+            newest = max(matches, key=lambda path: path.stat().st_mtime)
+            return newest, len(matches)
+
+    return None, 0
+
+
+def _find_source_result_files(
+    source_path: str | Path,
+) -> tuple[dict[str, Path | None], bool, bool]:
     source_path = Path(source_path)
     stem = source_path.stem
     output_folder = Path.cwd() / "data" / "output"
@@ -2051,16 +2084,22 @@ def _find_source_result_files(source_path: str | Path) -> tuple[dict[str, Path |
     }
 
     if not output_folder.exists():
-        return result, False
+        return result, False, False
 
     patterns = {
-        "preview": f"{stem}*.png",
         "report": f"{stem}*report*.txt",
         "contour": f"{stem}*contour*.csv",
         "holes": f"{stem}*holes*.json",
         "mixed_contour": f"{stem}*mixed_contour*.json",
         "demo_summary": f"{stem}*demo_summary*.txt",
     }
+
+    preview_path, preview_matches_count = _find_source_preview_file(
+        output_folder,
+        stem,
+    )
+    result["preview"] = preview_path
+    multiple_raw_previews_found = preview_matches_count > 1
 
     multiple_found = False
     for key, pattern in patterns.items():
@@ -2069,7 +2108,7 @@ def _find_source_result_files(source_path: str | Path) -> tuple[dict[str, Path |
         if matches_count > 1:
             multiple_found = True
 
-    return result, multiple_found
+    return result, multiple_found, multiple_raw_previews_found
 
 
 def _find_processing_result_files(png_path: str | Path) -> dict[str, Path | None]:
@@ -2141,7 +2180,9 @@ def _open_processing_result_callback(_sender, app_data) -> None:
 
 
 def _load_result_by_source_file(source_path: str | Path) -> None:
-    related_files, multiple_found = _find_source_result_files(source_path)
+    related_files, multiple_found, multiple_raw_previews_found = (
+        _find_source_result_files(source_path)
+    )
     found_any = any(path is not None for path in related_files.values())
     if not found_any:
         _set_status("No matching processed result found for source file.")
@@ -2173,6 +2214,10 @@ def _load_result_by_source_file(source_path: str | Path) -> None:
         "Demo summary: "
         f"{'found' if related_files['demo_summary'] is not None else 'not found'}",
     ]
+    if related_files["preview"] is None:
+        status_lines.append("Raw density preview not found for source file.")
+    if multiple_raw_previews_found:
+        status_lines.append("Multiple matching raw previews found, loaded newest.")
     if multiple_found:
         status_lines.append("Multiple matching results found, loaded newest.")
 
