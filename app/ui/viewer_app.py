@@ -54,6 +54,7 @@ EDIT_GROUP_TARGET_TAG = "edit_group_target"
 EDIT_GROUP_DIAMETER_TAG = "edit_group_diameter"
 CONTOUR_INFO_TAG = "contour_info_text"
 MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
+DEMO_SUMMARY_INFO_TAG = "demo_summary_info_text"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -110,6 +111,7 @@ state = {
     "contour_file": "",
     "mixed_contour_elements": [],
     "mixed_contour_file": "",
+    "demo_summary_file": "",
     "report_loaded": False,
 }
 
@@ -1107,21 +1109,36 @@ def _update_hole_group_target_combo() -> None:
         dpg.set_value(tag, current_value)
 
 
-def _move_hole_to_group_callback(
-    _sender=None,
-    _app_data=None,
-    _user_data=None,
-) -> None:
+def _get_selected_hole() -> tuple[int | None, dict | None]:
     hole_id = int(dpg.get_value(MOVE_HOLE_ID_TAG))
-    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
-
     hole = next(
         (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
         None,
     )
     if hole is None:
         _set_status(f"Hole not found: {hole_id}")
+        return hole_id, None
+
+    return hole_id, hole
+
+
+def _refresh_hole_views() -> None:
+    _recount_hole_group_counts()
+    _update_hole_groups_display()
+    _update_holes_stats()
+    _redraw_preview()
+
+
+def _move_hole_to_group_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    hole_id, hole = _get_selected_hole()
+    if hole is None:
         return
+
+    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
 
     group = next(
         (
@@ -1136,11 +1153,58 @@ def _move_hole_to_group_callback(
         return
 
     hole["group_id"] = target_group_id
-    _recount_hole_group_counts()
-    _update_hole_groups_display()
-    _update_holes_stats()
-    _redraw_preview()
+    _refresh_hole_views()
     _set_status(f"Hole {hole_id} moved to group {target_group_id}.")
+
+
+def _accept_selected_hole_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    hole_id, hole = _get_selected_hole()
+    if hole is None:
+        return
+
+    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
+    if not hole.get("group_id") and target_group_id:
+        group = next(
+            (
+                item
+                for item in state["hole_groups"]
+                if str(item.get("id", "")) == target_group_id
+            ),
+            None,
+        )
+        if group is None:
+            _set_status(f"Hole group not found: {target_group_id}")
+            return
+
+        hole["group_id"] = target_group_id
+
+    hole["accepted"] = True
+    hole["enabled"] = True
+    hole["reject_reason"] = ""
+    _refresh_hole_views()
+    _set_status(f"Hole {hole_id} accepted.")
+
+
+def _reject_selected_hole_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    hole_id, hole = _get_selected_hole()
+    if hole is None:
+        return
+
+    hole["accepted"] = False
+    hole["enabled"] = False
+    if not hole.get("reject_reason"):
+        hole["reject_reason"] = "manual_reject"
+
+    _refresh_hole_views()
+    _set_status(f"Hole {hole_id} rejected.")
 
 
 def _apply_group_diameter_callback(
@@ -1210,6 +1274,54 @@ def _update_mixed_contour_info() -> None:
         f"Lines: {lines_count}\n"
         f"Polyline gaps: {gaps_count}",
     )
+
+
+def _update_demo_summary_info() -> None:
+    if not dpg.does_item_exist(DEMO_SUMMARY_INFO_TAG):
+        return
+
+    summary_file = str(state["demo_summary_file"]) or "-"
+    dpg.set_value(DEMO_SUMMARY_INFO_TAG, f"Demo summary file: {summary_file}")
+
+
+def _reset_report_params() -> None:
+    state["report_loaded"] = False
+    if dpg.does_item_exist(PARAM_GRID_MIN_X):
+        dpg.set_value(PARAM_GRID_MIN_X, 0.0)
+    if dpg.does_item_exist(PARAM_GRID_MIN_Y):
+        dpg.set_value(PARAM_GRID_MIN_Y, 0.0)
+    if dpg.does_item_exist(PARAM_CELL_SIZE):
+        dpg.set_value(PARAM_CELL_SIZE, 1.0)
+    if dpg.does_item_exist(PARAM_GRID_WIDTH):
+        dpg.set_value(PARAM_GRID_WIDTH, 0)
+    if dpg.does_item_exist(PARAM_GRID_HEIGHT):
+        dpg.set_value(PARAM_GRID_HEIGHT, 0)
+
+
+def _clear_loaded_result_state() -> None:
+    state["contour_points"] = []
+    state["contour_file"] = ""
+    state["holes"] = []
+    state["hole_groups"] = []
+    state["visible_hole_group_ids"] = {}
+    state["mixed_contour_elements"] = []
+    state["mixed_contour_file"] = ""
+    state["mask_edits"] = []
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
+    state["brush_cursor_image"] = None
+    state["active_brush_stroke_id"] = None
+    state["next_brush_stroke_id"] = 1
+    state["demo_summary_file"] = ""
+    _reset_report_params()
+    _update_contour_info()
+    _update_holes_stats()
+    _update_hole_groups_display()
+    _update_hole_group_target_combo()
+    _update_mixed_contour_info()
+    _update_mask_edits_count()
+    _update_last_brush_debug()
+    _update_demo_summary_info()
 
 
 def _undo_last_brush_stroke() -> bool:
@@ -1916,6 +2028,50 @@ def _first_existing_path(candidates: list[Path]) -> Path | None:
     return None
 
 
+def _newest_matching_file(folder: Path, pattern: str) -> tuple[Path | None, int]:
+    matches = [path for path in folder.glob(pattern) if path.is_file()]
+    if not matches:
+        return None, 0
+
+    newest = max(matches, key=lambda path: path.stat().st_mtime)
+    return newest, len(matches)
+
+
+def _find_source_result_files(source_path: str | Path) -> tuple[dict[str, Path | None], bool]:
+    source_path = Path(source_path)
+    stem = source_path.stem
+    output_folder = Path.cwd() / "data" / "output"
+    result: dict[str, Path | None] = {
+        "preview": None,
+        "report": None,
+        "contour": None,
+        "holes": None,
+        "mixed_contour": None,
+        "demo_summary": None,
+    }
+
+    if not output_folder.exists():
+        return result, False
+
+    patterns = {
+        "preview": f"{stem}*.png",
+        "report": f"{stem}*report*.txt",
+        "contour": f"{stem}*contour*.csv",
+        "holes": f"{stem}*holes*.json",
+        "mixed_contour": f"{stem}*mixed_contour*.json",
+        "demo_summary": f"{stem}*demo_summary*.txt",
+    }
+
+    multiple_found = False
+    for key, pattern in patterns.items():
+        path, matches_count = _newest_matching_file(output_folder, pattern)
+        result[key] = path
+        if matches_count > 1:
+            multiple_found = True
+
+    return result, multiple_found
+
+
 def _find_processing_result_files(png_path: str | Path) -> dict[str, Path | None]:
     png_path = Path(png_path)
     folder = png_path.parent
@@ -1984,6 +2140,54 @@ def _open_processing_result_callback(_sender, app_data) -> None:
     _load_processing_result(selected_path)
 
 
+def _load_result_by_source_file(source_path: str | Path) -> None:
+    related_files, multiple_found = _find_source_result_files(source_path)
+    found_any = any(path is not None for path in related_files.values())
+    if not found_any:
+        _set_status("No matching processed result found for source file.")
+        return
+
+    _clear_loaded_result_state()
+
+    if related_files["preview"] is not None:
+        _show_png(related_files["preview"], clear_mask_edits=False)
+    if related_files["report"] is not None:
+        _load_report(related_files["report"])
+    if related_files["contour"] is not None:
+        _load_contour_csv(related_files["contour"])
+    if related_files["holes"] is not None:
+        _load_holes_json(related_files["holes"])
+    if related_files["mixed_contour"] is not None:
+        _load_mixed_contour_json(related_files["mixed_contour"])
+    if related_files["demo_summary"] is not None:
+        state["demo_summary_file"] = str(related_files["demo_summary"])
+        _update_demo_summary_info()
+
+    status_lines = [
+        f"Preview: {'found' if related_files['preview'] is not None else 'not found'}",
+        f"Report: {'found' if related_files['report'] is not None else 'not found'}",
+        f"Contour: {'found' if related_files['contour'] is not None else 'not found'}",
+        f"Holes: {'found' if related_files['holes'] is not None else 'not found'}",
+        "Mixed contour: "
+        f"{'found' if related_files['mixed_contour'] is not None else 'not found'}",
+        "Demo summary: "
+        f"{'found' if related_files['demo_summary'] is not None else 'not found'}",
+    ]
+    if multiple_found:
+        status_lines.append("Multiple matching results found, loaded newest.")
+
+    _set_status("\n".join(status_lines))
+
+
+def _open_source_result_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+
+    selected_path = next(iter(selections.values()))
+    _load_result_by_source_file(selected_path)
+
+
 def _load_report(path: str | Path) -> None:
     report_path = Path(path)
 
@@ -2041,6 +2245,7 @@ def _normalize_hole_json_item(item: dict) -> dict:
     return {
         "id": int(item["id"]),
         "accepted": bool(item["accepted"]),
+        "enabled": bool(item.get("enabled", True)),
         "reject_reason": str(item.get("reject_reason", "")),
         "center_x": float(item["center_x"]),
         "center_y": float(item["center_y"]),
@@ -2302,6 +2507,18 @@ def run() -> None:
     with dpg.file_dialog(
         directory_selector=False,
         show=False,
+        callback=_open_source_result_callback,
+        tag="open_source_result_dialog",
+        width=700,
+        height=400,
+    ):
+        dpg.add_file_extension(".asc", color=(255, 200, 120, 255))
+        dpg.add_file_extension(".xyz", color=(255, 200, 120, 255))
+        dpg.add_file_extension(".xyzn", color=(255, 200, 120, 255))
+
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
         callback=_open_report_callback,
         tag="open_report_dialog",
         width=700,
@@ -2377,6 +2594,10 @@ def run() -> None:
         dpg.add_button(
             label="Load processing result",
             callback=lambda: dpg.show_item("open_processing_result_dialog"),
+        )
+        dpg.add_button(
+            label="Load result by source file",
+            callback=lambda: dpg.show_item("open_source_result_dialog"),
         )
         dpg.add_button(
             label="Load report.txt",
@@ -2561,6 +2782,16 @@ def run() -> None:
                     label="Move hole to group",
                     callback=_move_hole_to_group_callback,
                 )
+                dpg.add_button(
+                    label="Accept selected hole",
+                    callback=_accept_selected_hole_callback,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label="Reject selected hole",
+                    callback=_reject_selected_hole_callback,
+                    width=-1,
+                )
                 dpg.add_text("Edit hole group")
                 dpg.add_text("Target group ID")
                 dpg.add_combo(
@@ -2588,6 +2819,7 @@ def run() -> None:
                     "Mixed contour file: -\nElements: 0\nLines: 0\nPolyline gaps: 0",
                     tag=MIXED_CONTOUR_INFO_TAG,
                 )
+                dpg.add_text("Demo summary file: -", tag=DEMO_SUMMARY_INFO_TAG)
                 dpg.add_button(
                     label="Clear mixed contour",
                     callback=_clear_mixed_contour_callback,

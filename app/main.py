@@ -46,7 +46,7 @@ from app.core.hole_detector import (
 )
 from app.core.line_approximation import run_line_approximation
 
-from app.core.xyz_reader import compute_stats
+from app.core.xyz_reader import compute_stats, export_decimated_points
 
 from app.exporters.boundary_xyz_exporter import (
     build_boundary_band_mask,
@@ -84,6 +84,41 @@ def parse_roi_poly(value: str) -> list[tuple[float, float]]:
         raise argparse.ArgumentTypeError("ROI polygon must contain at least 3 points")
 
     return points
+
+
+def write_demo_summary(output_path: str | Path, lines: list[str]) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _summary_value(value) -> str:
+    if value is None:
+        return "not available"
+    return str(value)
+
+
+def _path_if(condition: bool, path: Path) -> str:
+    return str(path) if condition else "not available"
+
+
+def _file_size_text(path: Path | None) -> str:
+    if path is None:
+        return "not available"
+    try:
+        return str(path.stat().st_size)
+    except OSError:
+        return "not available"
+
+
+def _demo_summary_notes() -> list[str]:
+    return [
+        "Notes:",
+        "- Contour is generated from density/mask representation.",
+        "- Mixed contour is experimental.",
+        "- Holes are currently detected from density/mask; point-based hole refinement is not implemented yet.",
+        "- Polyline gaps preserve complex, curved or short geometry.",
+    ]
 
 
 def main() -> None:
@@ -204,6 +239,25 @@ def main() -> None:
         "--export-boundary",
         action="store_true",
         help="Export point cloud near final mask boundary",
+    )
+
+    parser.add_argument(
+        "--export-decimated",
+        action="store_true",
+        help="Export streaming grid-decimated point cloud for CAD preview",
+    )
+
+    parser.add_argument(
+        "--decimate-cell-mm",
+        type=float,
+        default=2.0,
+        help="Decimation grid cell size. Default: 2.0",
+    )
+
+    parser.add_argument(
+        "--demo-summary",
+        action="store_true",
+        help="Write a demonstration summary report at the end of processing",
     )
 
     parser.add_argument(
@@ -500,6 +554,60 @@ def main() -> None:
             if not mixed_dxf_holes:
                 print("Warning: no holes available for mixed_with_holes.dxf")
             print(f"Mixed with holes DXF: {mixed_with_holes_dxf_path}")
+        if args.demo_summary:
+            demo_summary_path = output_dir / f"{base_name}_demo_summary.txt"
+            mixed_line_count = sum(
+                1
+                for item in line_result.mixed_contour_elements
+                if str(item.get("type", "")).upper() == "LINE"
+            )
+            mixed_polyline_count = sum(
+                1
+                for item in line_result.mixed_contour_elements
+                if str(item.get("type", "")).upper() == "POLYLINE"
+            )
+            summary_lines = [
+                "Demo summary",
+                "",
+                f"Input file path: {_summary_value(args.approx_boundary_points)}",
+                "Input file size: not available",
+                f"Cell size: {_summary_value(args.cell)}",
+                f"Threshold: {_summary_value(args.threshold)}",
+                "Grid size: not available",
+                "",
+                "Contour:",
+                "  enabled: disabled",
+                "  contour points count: not available",
+                "  contour output path: not available",
+                "",
+                "Holes:",
+                f"  enabled: {'enabled' if args.holes_json else 'disabled'}",
+                "  total holes: not available",
+                "  accepted holes: not available",
+                "  rejected holes: not available",
+                "  groups count: not available",
+                f"  holes json path: {_summary_value(args.holes_json)}",
+                "",
+                "DXF:",
+                "  ordinary dxf path: not available",
+                f"  mixed_with_holes.dxf path: {_path_if(args.mixed_dxf, mixed_with_holes_dxf_path)}",
+                "",
+                "Refined lines:",
+                f"  refined lines count: {len(line_result.lines)}",
+                f"  refined_lines.json path: {refined_lines_json_path}",
+                f"  refined_lines.dxf path: {refined_lines_dxf_path}",
+                "",
+                "Mixed contour:",
+                f"  total elements: {len(line_result.mixed_contour_elements) if args.mixed_contour else 'not available'}",
+                f"  LINE count: {mixed_line_count if args.mixed_contour else 'not available'}",
+                f"  POLYLINE count: {mixed_polyline_count if args.mixed_contour else 'not available'}",
+                f"  mixed_contour.json path: {_path_if(args.mixed_contour, mixed_contour_json_path)}",
+                f"  mixed_contour.dxf path: {_path_if(args.mixed_contour, mixed_contour_dxf_path)}",
+                "",
+                *_demo_summary_notes(),
+            ]
+            write_demo_summary(demo_summary_path, summary_lines)
+            print(f"Demo summary: {demo_summary_path}")
         print(f"Total segments:     {line_result.total_segments:,}")
         print(f"Accepted lines:     {len(line_result.lines):,}")
         print(f"Rejected segments:  {len(line_result.rejected_segments):,}")
@@ -523,6 +631,12 @@ def main() -> None:
 
     if not input_path.exists():
         raise FileNotFoundError(f"Файл не найден: {input_path}")
+
+    input_file_size = input_path.stat().st_size
+    if input_file_size > 10 * 1024 * 1024 * 1024:
+        print(
+            "Warning: large input file, decimated export is recommended for CAD preview."
+        )
 
     base_name = input_path.stem
 
@@ -589,6 +703,7 @@ def main() -> None:
         output_dir / f"{base_name}_mask_edits_debug_cell_{cell_text}_threshold_{args.threshold}.png"
     )
     report_path = output_dir / f"{base_name}_report_cell_{cell_text}.txt"
+    demo_summary_path = output_dir / f"{base_name}_demo_summary.txt"
     clean_path = (
         output_dir / f"{base_name}_clean_cell_{cell_text}_threshold_{args.threshold}.asc"
     )
@@ -600,6 +715,8 @@ def main() -> None:
             f"_width_{boundary_width_text}mm.asc"
         )
     )
+    decimate_cell_text = str(args.decimate_cell_mm).replace(".", "_")
+    decimated_path = output_dir / f"{base_name}_decimated_cell_{decimate_cell_text}.asc"
 
     holes_csv_path = (
         output_dir / f"{base_name}_holes_cell_{cell_text}_threshold_{args.threshold}.csv"
@@ -763,6 +880,16 @@ def main() -> None:
     save_mask_preview(mask, mask_path, max_size=args.preview_size)
     save_report(stats, grid, report_path)
 
+    decimated_point_count = None
+
+    if args.export_decimated:
+        decimated_point_count = export_decimated_points(
+            input_path=input_path,
+            output_path=decimated_path,
+            stats=stats,
+            decimate_cell_mm=args.decimate_cell_mm,
+        )
+
     clean_point_count = None
 
     if args.export_clean:
@@ -830,6 +957,16 @@ def main() -> None:
     print(f"Report:         {report_path}")
     print(f"Mask threshold: {mask_result.threshold:.3f}")
     print(f"Mask cells:     {int(mask.sum()):,}")
+    if decimated_point_count is not None:
+        reduction_ratio = (
+            stats.point_count / decimated_point_count
+            if decimated_point_count > 0
+            else 0.0
+        )
+        print(f"Decimated points: {decimated_path}")
+        print(f"Input points count:    {stats.point_count:,}")
+        print(f"Exported points count: {decimated_point_count:,}")
+        print(f"Reduction ratio:       {reduction_ratio:.3f}x")
     if clean_point_count is not None:
         print(f"Clean points:   {clean_path}")
         print(f"Clean count:    {clean_point_count:,}")
@@ -868,6 +1005,73 @@ def main() -> None:
         if len(accepted_holes) > 20:
             print("  ...")
     print(f"Holes preview:  {holes_preview_path}")
+    if args.demo_summary:
+        total_holes = len(holes) if args.holes else "not available"
+        accepted_holes_count = (
+            sum(1 for hole in holes if hole.accepted) if args.holes else "not available"
+        )
+        rejected_holes_count = (
+            len(holes) - sum(1 for hole in holes if hole.accepted)
+            if args.holes
+            else "not available"
+        )
+        holes_json_summary_path = (
+            str(args.holes_json)
+            if args.holes_json
+            else str(holes_json_path)
+            if args.holes
+            else "not available"
+        )
+        if grid is not None and hasattr(grid, "width_cells") and hasattr(grid, "height_cells"):
+            grid_size = f"{grid.width_cells} x {grid.height_cells}"
+        elif grid is not None and hasattr(grid, "density"):
+            grid_size = f"{grid.density.shape[1]} x {grid.density.shape[0]}"
+        else:
+            grid_size = "not available"
+
+        summary_lines = [
+            "Demo summary",
+            "",
+            f"Input file path: {input_path}",
+            f"Input file size: {_file_size_text(input_path)}",
+            f"Cell size: {args.cell}",
+            f"Threshold: {mask_result.threshold:.3f}",
+            f"Grid size: {grid_size}",
+            "",
+            "Contour:",
+            f"  enabled: {'enabled' if args.contour else 'disabled'}",
+            "  contour points count: "
+            f"{contour_result.point_count if contour_result is not None else 'not available'}",
+            f"  contour output path: {_path_if(contour_result is not None, contour_csv_path)}",
+            "",
+            "Holes:",
+            f"  enabled: {'enabled' if args.holes else 'disabled'}",
+            f"  total holes: {total_holes}",
+            f"  accepted holes: {accepted_holes_count}",
+            f"  rejected holes: {rejected_holes_count}",
+            f"  groups count: {len(hole_groups) if args.holes else 'not available'}",
+            f"  holes json path: {holes_json_summary_path}",
+            "",
+            "DXF:",
+            f"  ordinary dxf path: {_path_if(bool(args.dxf and contour_result is not None), contour_dxf_path)}",
+            "  mixed_with_holes.dxf path: not available",
+            "",
+            "Refined lines:",
+            "  refined lines count: not available",
+            "  refined_lines.json path: not available",
+            "  refined_lines.dxf path: not available",
+            "",
+            "Mixed contour:",
+            "  total elements: not available",
+            "  LINE count: not available",
+            "  POLYLINE count: not available",
+            "  mixed_contour.json path: not available",
+            "  mixed_contour.dxf path: not available",
+            "",
+            *_demo_summary_notes(),
+        ]
+        write_demo_summary(demo_summary_path, summary_lines)
+        print(f"Demo summary:   {demo_summary_path}")
     print(f"Время сохранения: {t3 - t2:.2f} сек")
 
     print(f"\nГотово. Общее время: {t3 - t0:.2f} сек")

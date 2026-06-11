@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -125,3 +126,37 @@ def compute_stats(file_path: str | Path) -> PointCloudStats:
         min_z=min_z,
         max_z=max_z,
     )
+
+
+def export_decimated_points(
+    input_path: str | Path,
+    output_path: str | Path,
+    stats: PointCloudStats,
+    decimate_cell_mm: float,
+) -> int:
+    if decimate_cell_mm <= 0:
+        raise ValueError("decimate_cell_mm must be positive")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    seen_cells: set[tuple[int, int]] = set()
+    exported_count = 0
+
+    with output_path.open("w", encoding="utf-8", newline="") as output_file:
+        for x, y, z in iter_xyz_points(
+            input_path,
+            show_progress=True,
+            desc="Decimated export",
+        ):
+            ix = math.floor((x - stats.min_x) / decimate_cell_mm)
+            iy = math.floor((y - stats.min_y) / decimate_cell_mm)
+            cell_key = (ix, iy)
+            if cell_key in seen_cells:
+                continue
+
+            seen_cells.add(cell_key)
+            output_file.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+            exported_count += 1
+
+    return exported_count
