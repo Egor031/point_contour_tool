@@ -17,6 +17,7 @@ POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 HOLES_LAYER_TAG = "holes_overlay_layer"
+MANUAL_HOLE_CENTER_LAYER_TAG = "manual_hole_center_overlay_layer"
 BRUSH_CURSOR_LAYER_TAG = "brush_cursor_overlay_layer"
 CONTOUR_LAYER_TAG = "contour_overlay_layer"
 MIXED_CONTOUR_LAYER_TAG = "mixed_contour_overlay_layer"
@@ -52,6 +53,10 @@ MOVE_HOLE_ID_TAG = "move_hole_id"
 MOVE_HOLE_TARGET_GROUP_TAG = "move_hole_target_group"
 EDIT_GROUP_TARGET_TAG = "edit_group_target"
 EDIT_GROUP_DIAMETER_TAG = "edit_group_diameter"
+MANUAL_HOLE_X_TAG = "manual_hole_x"
+MANUAL_HOLE_Y_TAG = "manual_hole_y"
+MANUAL_HOLE_DIAMETER_TAG = "manual_hole_diameter"
+MANUAL_HOLE_PICK_TAG = "manual_hole_pick_center"
 CONTOUR_INFO_TAG = "contour_info_text"
 MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
 DEMO_SUMMARY_INFO_TAG = "demo_summary_info_text"
@@ -107,6 +112,9 @@ state = {
     "holes": [],
     "hole_groups": [],
     "visible_hole_group_ids": {},
+    "pick_manual_hole_center": False,
+    "manual_hole_center_world": None,
+    "suppress_brush_until_mouse_release": False,
     "contour_points": [],
     "contour_file": "",
     "mixed_contour_elements": [],
@@ -410,6 +418,7 @@ def _redraw_preview() -> None:
     _redraw_polygon_overlay()
     _redraw_mask_edits_overlay()
     _redraw_holes_overlay()
+    _redraw_manual_hole_center_overlay()
     _redraw_contour_overlay()
     _redraw_mixed_contour_overlay()
     _redraw_brush_cursor_overlay()
@@ -825,6 +834,47 @@ def _redraw_holes_overlay() -> None:
         )
 
 
+def _redraw_manual_hole_center_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(MANUAL_HOLE_CENTER_LAYER_TAG):
+        dpg.delete_item(MANUAL_HOLE_CENTER_LAYER_TAG)
+
+    center_world = state["manual_hole_center_world"]
+    if center_world is None:
+        return
+
+    pixel_point = _world_to_image_pixel(center_world[0], center_world[1])
+    if pixel_point is None:
+        return
+
+    x, y = pixel_point
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=MANUAL_HOLE_CENTER_LAYER_TAG)
+    dpg.draw_circle(
+        (x, y),
+        6,
+        color=(80, 180, 255, 255),
+        fill=(80, 180, 255, 80),
+        thickness=2,
+        parent=MANUAL_HOLE_CENTER_LAYER_TAG,
+    )
+    dpg.draw_line(
+        (x - 10, y),
+        (x + 10, y),
+        color=(80, 180, 255, 255),
+        thickness=2,
+        parent=MANUAL_HOLE_CENTER_LAYER_TAG,
+    )
+    dpg.draw_line(
+        (x, y - 10),
+        (x, y + 10),
+        color=(80, 180, 255, 255),
+        thickness=2,
+        parent=MANUAL_HOLE_CENTER_LAYER_TAG,
+    )
+
+
 def _redraw_contour_overlay() -> None:
     if not dpg.does_item_exist(IMAGE_TAG):
         return
@@ -956,6 +1006,11 @@ def _update_mask_brush_from_mouse() -> None:
         state["last_brush_world"] = None
         state["active_brush_stroke_id"] = None
         return
+
+    if state["suppress_brush_until_mouse_release"]:
+        if dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
+            return
+        state["suppress_brush_until_mouse_release"] = False
 
     if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
         state["last_brush_image"] = None
@@ -1207,6 +1262,99 @@ def _reject_selected_hole_callback(
     _set_status(f"Hole {hole_id} rejected.")
 
 
+def _manual_hole_pick_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    enabled = bool(dpg.get_value(MANUAL_HOLE_PICK_TAG))
+    state["pick_manual_hole_center"] = enabled
+    if enabled:
+        _set_status("Pick hole center: click preview.")
+    else:
+        _set_status("Pick hole center disabled.")
+
+
+def _finish_manual_hole_center_pick(world_x: float, world_y: float) -> None:
+    state["manual_hole_center_world"] = (world_x, world_y)
+    state["pick_manual_hole_center"] = False
+    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
+        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
+    state["suppress_brush_until_mouse_release"] = True
+    dpg.set_value(MANUAL_HOLE_X_TAG, world_x)
+    dpg.set_value(MANUAL_HOLE_Y_TAG, world_y)
+    _redraw_preview()
+    _set_status(
+        f"Manual hole center picked: x={world_x:.6f}, y={world_y:.6f}"
+    )
+
+
+def _add_manual_hole_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    try:
+        x = float(dpg.get_value(MANUAL_HOLE_X_TAG))
+        y = float(dpg.get_value(MANUAL_HOLE_Y_TAG))
+        diameter = float(dpg.get_value(MANUAL_HOLE_DIAMETER_TAG))
+    except (TypeError, ValueError):
+        _set_status("Manual hole X, Y and Diameter mm must be numbers.")
+        return
+
+    if diameter <= 0:
+        _set_status("Manual hole Diameter mm must be greater than 0.")
+        return
+
+    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
+    group_id = None
+    if target_group_id:
+        group = next(
+            (
+                item
+                for item in state["hole_groups"]
+                if str(item.get("id", "")) == target_group_id
+            ),
+            None,
+        )
+        if group is None:
+            _set_status(f"Hole group not found: {target_group_id}")
+            return
+
+        group_id = target_group_id
+
+    max_id = 0
+    for hole in state["holes"]:
+        try:
+            max_id = max(max_id, int(hole.get("id", 0)))
+        except (TypeError, ValueError):
+            continue
+
+    new_hole_id = max_id + 1
+    state["holes"].append(
+        {
+            "id": new_hole_id,
+            "accepted": True,
+            "enabled": True,
+            "reject_reason": "",
+            "center_x": x,
+            "center_y": y,
+            "radius": diameter / 2.0,
+            "diameter": diameter,
+            "group_id": group_id,
+            "source": "manual",
+        }
+    )
+
+    if dpg.does_item_exist(MOVE_HOLE_ID_TAG):
+        dpg.set_value(MOVE_HOLE_ID_TAG, new_hole_id)
+
+    state["manual_hole_center_world"] = None
+    state["pick_manual_hole_center"] = False
+    state["suppress_brush_until_mouse_release"] = False
+    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
+        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
+
+    _refresh_hole_views()
+    _set_status(f"Manual hole {new_hole_id} added.")
+
+
 def _apply_group_diameter_callback(
     _sender=None,
     _app_data=None,
@@ -1304,6 +1452,11 @@ def _clear_loaded_result_state() -> None:
     state["holes"] = []
     state["hole_groups"] = []
     state["visible_hole_group_ids"] = {}
+    state["pick_manual_hole_center"] = False
+    state["manual_hole_center_world"] = None
+    state["suppress_brush_until_mouse_release"] = False
+    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
+        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
     state["mixed_contour_elements"] = []
     state["mixed_contour_file"] = ""
     state["mask_edits"] = []
@@ -1480,6 +1633,19 @@ def _update_pan_from_mouse() -> None:
 
 
 def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if state["pick_manual_hole_center"]:
+        if _warn_preview_grid_params_not_loaded():
+            return
+
+        coords = _mouse_to_world()
+        if coords is None:
+            _set_status("Pick hole center: click inside preview image.")
+            return
+
+        *_unused, world_x, world_y = coords
+        _finish_manual_hole_center_pick(world_x, world_y)
+        return
+
     if state["mode"] == "mask_brush":
         return
 
@@ -2374,6 +2540,11 @@ def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None
     state["holes"] = []
     state["hole_groups"] = []
     state["visible_hole_group_ids"] = {}
+    state["pick_manual_hole_center"] = False
+    state["manual_hole_center_world"] = None
+    state["suppress_brush_until_mouse_release"] = False
+    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
+        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
     _update_holes_stats()
     _update_hole_groups_display()
     _update_hole_group_target_combo()
@@ -2835,6 +3006,37 @@ def run() -> None:
                 dpg.add_button(
                     label="Reject selected hole",
                     callback=_reject_selected_hole_callback,
+                    width=-1,
+                )
+                dpg.add_text("Manual add hole")
+                dpg.add_checkbox(
+                    label="Pick hole center from preview",
+                    tag=MANUAL_HOLE_PICK_TAG,
+                    default_value=False,
+                    callback=_manual_hole_pick_callback,
+                )
+                dpg.add_text("X")
+                dpg.add_input_float(
+                    tag=MANUAL_HOLE_X_TAG,
+                    default_value=0.0,
+                    width=-1,
+                )
+                dpg.add_text("Y")
+                dpg.add_input_float(
+                    tag=MANUAL_HOLE_Y_TAG,
+                    default_value=0.0,
+                    width=-1,
+                )
+                dpg.add_text("Diameter mm")
+                dpg.add_input_float(
+                    tag=MANUAL_HOLE_DIAMETER_TAG,
+                    default_value=6.0,
+                    min_value=0.001,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label="Add manual hole",
+                    callback=_add_manual_hole_callback,
                     width=-1,
                 )
                 dpg.add_text("Edit hole group")
