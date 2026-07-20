@@ -51,6 +51,9 @@ class RefinedLine:
     points_after_contour_distance_filter: int
     contour_start_index: int
     contour_end_index: int
+    endpoint_mode: str
+    endpoint_t_start: float | None
+    endpoint_t_end: float | None
 
 
 @dataclass
@@ -92,6 +95,9 @@ class SegmentDiagnostic:
     max_distance_to_contour_mm: float | None
     max_point_contour_distance_mm: float
     points_after_contour_distance_filter: int
+    endpoint_mode: str
+    endpoint_t_start: float | None
+    endpoint_t_end: float | None
 
 
 @dataclass
@@ -392,6 +398,49 @@ def _project_point_to_line(
     return line_point + np.dot(point - line_point, direction) * direction
 
 
+def _line_endpoint_points(
+    mode: str,
+    start: np.ndarray,
+    end: np.ndarray,
+    fit_points: np.ndarray,
+    line_point: np.ndarray,
+    direction: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float | None, float | None]:
+    if mode == "contour_projection":
+        t_start = float(np.dot(start - line_point, direction))
+        t_end = float(np.dot(end - line_point, direction))
+        return (
+            line_point + t_start * direction,
+            line_point + t_end * direction,
+            t_start,
+            t_end,
+        )
+
+    if mode == "fit_points_range":
+        if len(fit_points) == 0:
+            return (
+                line_point.copy(),
+                line_point.copy(),
+                None,
+                None,
+            )
+
+        t_values = (fit_points - line_point) @ direction
+        t_start = float(np.percentile(t_values, 5.0))
+        t_end = float(np.percentile(t_values, 95.0))
+        if t_end < t_start:
+            t_start, t_end = t_end, t_start
+
+        return (
+            line_point + t_start * direction,
+            line_point + t_end * direction,
+            t_start,
+            t_end,
+        )
+
+    raise ValueError(f"unsupported endpoint_mode: {mode}")
+
+
 def _line_errors(
     points: np.ndarray,
     line_point: np.ndarray,
@@ -677,7 +726,13 @@ def approximate_lines(
     debug_line_id: int | None = None,
     debug_output_dir: str | Path | None = None,
     debug_base_name: str | None = None,
+    endpoint_mode: str = "contour_projection",
 ) -> LineApproximationResult:
+    if endpoint_mode not in {"contour_projection", "fit_points_range"}:
+        raise ValueError(
+            "endpoint_mode must be 'contour_projection' or 'fit_points_range'"
+        )
+
     simplified = simplify_contour_points(contour_points, line_simplify_mm)
     if len(simplified) < 2:
         return LineApproximationResult(
@@ -808,6 +863,8 @@ def approximate_lines(
         mean_distance_to_contour_mm: float | None,
         max_distance_to_contour_mm: float | None,
         points_after_contour_distance_filter: int,
+        endpoint_t_start: float | None = None,
+        endpoint_t_end: float | None = None,
     ) -> None:
         rejected_by_reason[reject_reason] = rejected_by_reason.get(reject_reason, 0) + 1
         rejected_segments.append(
@@ -849,6 +906,9 @@ def approximate_lines(
                 max_distance_to_contour_mm=max_distance_to_contour_mm,
                 max_point_contour_distance_mm=float(max_point_contour_distance_mm),
                 points_after_contour_distance_filter=points_after_contour_distance_filter,
+                endpoint_mode=endpoint_mode,
+                endpoint_t_start=endpoint_t_start,
+                endpoint_t_end=endpoint_t_end,
             )
         )
 
@@ -1065,8 +1125,19 @@ def approximate_lines(
             continue
 
         debug_stages["after_robust_trim"] = trimmed_points
-        refined_start = _project_point_to_line(start, line_point, direction)
-        refined_end = _project_point_to_line(end, line_point, direction)
+        (
+            refined_start,
+            refined_end,
+            endpoint_t_start,
+            endpoint_t_end,
+        ) = _line_endpoint_points(
+            endpoint_mode,
+            start,
+            end,
+            trimmed_points,
+            line_point,
+            direction,
+        )
         refined_length = float(np.linalg.norm(refined_end - refined_start))
 
         points_after_trim = int(len(trimmed_points))
@@ -1080,7 +1151,9 @@ def approximate_lines(
         max_distance_to_contour = float(contour_line_errors.max())
 
         reject_reason = ""
-        if refined_length < min_line_length_mm:
+        if refined_length <= 1e-9:
+            reject_reason = "invalid_endpoint_range"
+        elif refined_length < min_line_length_mm:
             reject_reason = "too_short"
         elif angle_diff > max_line_angle_diff_deg:
             reject_reason = "angle_diff_too_high"
@@ -1142,6 +1215,8 @@ def approximate_lines(
                 mean_distance_to_contour_mm=mean_distance_to_contour,
                 max_distance_to_contour_mm=max_distance_to_contour,
                 points_after_contour_distance_filter=points_after_contour_distance_filter,
+                endpoint_t_start=endpoint_t_start,
+                endpoint_t_end=endpoint_t_end,
             )
             continue
 
@@ -1202,6 +1277,9 @@ def approximate_lines(
                 points_after_contour_distance_filter=points_after_contour_distance_filter,
                 contour_start_index=contour_start_index,
                 contour_end_index=contour_end_index,
+                endpoint_mode=endpoint_mode,
+                endpoint_t_start=endpoint_t_start,
+                endpoint_t_end=endpoint_t_end,
             )
         )
 
@@ -1258,6 +1336,9 @@ def _line_to_json(line: RefinedLine) -> dict:
         ),
         "contour_start_index": line.contour_start_index,
         "contour_end_index": line.contour_end_index,
+        "endpoint_mode": line.endpoint_mode,
+        "endpoint_t_start": line.endpoint_t_start,
+        "endpoint_t_end": line.endpoint_t_end,
     }
 
 
@@ -1296,6 +1377,9 @@ def _segment_to_json(segment: SegmentDiagnostic) -> dict:
         "points_after_contour_distance_filter": (
             segment.points_after_contour_distance_filter
         ),
+        "endpoint_mode": segment.endpoint_mode,
+        "endpoint_t_start": segment.endpoint_t_start,
+        "endpoint_t_end": segment.endpoint_t_end,
     }
     if segment.mean_error_mm is not None:
         payload["mean_error_mm"] = segment.mean_error_mm
@@ -1743,6 +1827,7 @@ def run_line_approximation(
     mixed_contour_dxf_path: str | Path | None = None,
     mixed_with_holes_dxf_path: str | Path | None = None,
     mixed_dxf_holes: list[dict] | None = None,
+    endpoint_mode: str = "contour_projection",
 ) -> LineApproximationResult:
     contour_points = load_contour_csv(contour_csv_path)
     boundary_points = load_boundary_points(boundary_points_path)
@@ -1768,6 +1853,7 @@ def run_line_approximation(
         debug_line_id=debug_line_id,
         debug_output_dir=debug_output_dir,
         debug_base_name=debug_base_name,
+        endpoint_mode=endpoint_mode,
     )
     save_refined_lines_json(result, output_json_path)
     save_refined_lines_dxf(

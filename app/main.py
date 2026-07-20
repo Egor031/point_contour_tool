@@ -389,6 +389,15 @@ def main() -> None:
         help="Percent trimmed from each segment end before line fitting. Default: 10.0",
     )
     parser.add_argument(
+        "--line-endpoint-mode",
+        choices=("contour_projection", "fit_points_range"),
+        default="contour_projection",
+        help=(
+            "How refined line endpoints are computed. "
+            "Default: contour_projection"
+        ),
+    )
+    parser.add_argument(
         "--line-window-mm",
         type=float,
         default=30.0,
@@ -533,6 +542,7 @@ def main() -> None:
                 mixed_with_holes_dxf_path if args.mixed_dxf else None
             ),
             mixed_dxf_holes=mixed_dxf_holes,
+            endpoint_mode=args.line_endpoint_mode,
         )
 
         print(f"Refined lines JSON: {refined_lines_json_path}")
