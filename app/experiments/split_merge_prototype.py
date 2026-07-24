@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Real
 import operator
 
 import numpy as np
@@ -19,6 +20,18 @@ class SegmentStatistics:
     mean_squared_error_mm2: float
     rms_error_mm: float
     max_error_mm: float
+
+
+@dataclass(frozen=True)
+class SplitCandidate:
+    segment_start_index: int
+    segment_end_index: int
+    split_index: int
+    split_point: tuple[float, float]
+    distance_to_line_mm: float
+    arc_distance_from_start_mm: float
+    arc_distance_to_end_mm: float
+    eligible_points_count: int
 
 
 def _integer_index(value: int, name: str) -> int:
@@ -63,6 +76,20 @@ def _validate_endpoint(point: np.ndarray, name: str) -> np.ndarray:
     if not np.isfinite(point_array).all():
         raise ValueError(f"{name} coordinates must be finite")
     return point_array
+
+
+def _validate_endpoint_arc_length(value: float) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("min_endpoint_arc_length_mm must be a real number")
+    if not isinstance(value, Real):
+        raise TypeError("min_endpoint_arc_length_mm must be a real number")
+
+    value_float = float(value)
+    if not np.isfinite(value_float):
+        raise ValueError("min_endpoint_arc_length_mm must be finite")
+    if value_float < 0.0:
+        raise ValueError("min_endpoint_arc_length_mm must be non-negative")
+    return value_float
 
 
 def cyclic_indices(
@@ -138,6 +165,78 @@ def point_to_line_distances(
         direction[0] * relative[:, 1] - direction[1] * relative[:, 0]
     )
     return cross_magnitudes / direction_length
+
+
+def find_split_candidate(
+    contour: np.ndarray,
+    start_index: int,
+    end_index: int,
+    min_endpoint_arc_length_mm: float = 0.0,
+) -> SplitCandidate | None:
+    """Find the largest infinite-line deviation inside one cyclic segment."""
+    contour_array = _validate_contour(contour)
+    endpoint_margin = _validate_endpoint_arc_length(
+        min_endpoint_arc_length_mm
+    )
+    indices = cyclic_indices(len(contour_array), start_index, end_index)
+    if indices[0] == indices[-1]:
+        raise ValueError("a contour segment must have different endpoint indices")
+
+    segment_points = contour_array[indices]
+    segment_start = segment_points[0]
+    segment_end = segment_points[-1]
+    if float(np.linalg.norm(segment_end - segment_start)) == 0.0:
+        raise ValueError(
+            "segment endpoints define a degenerate chord with identical coordinates"
+        )
+
+    if len(segment_points) <= 2:
+        return None
+
+    step_lengths = np.linalg.norm(np.diff(segment_points, axis=0), axis=1)
+    cumulative_arc_lengths = np.concatenate(
+        (np.array([0.0], dtype=np.float64), np.cumsum(step_lengths))
+    )
+    total_arc_length = float(cumulative_arc_lengths[-1])
+    internal_arc_from_start = cumulative_arc_lengths[1:-1]
+    internal_arc_to_end = total_arc_length - internal_arc_from_start
+    eligible_mask = (
+        (internal_arc_from_start >= endpoint_margin)
+        & (internal_arc_to_end >= endpoint_margin)
+    )
+
+    eligible_positions = np.flatnonzero(eligible_mask)
+    if len(eligible_positions) == 0:
+        return None
+
+    internal_points = segment_points[1:-1]
+    eligible_points = internal_points[eligible_mask]
+    distances = point_to_line_distances(
+        eligible_points,
+        segment_start,
+        segment_end,
+    )
+    selected_eligible_position = int(np.argmax(distances))
+    selected_internal_position = int(
+        eligible_positions[selected_eligible_position]
+    )
+    selected_segment_position = selected_internal_position + 1
+    selected_point = eligible_points[selected_eligible_position]
+
+    return SplitCandidate(
+        segment_start_index=indices[0],
+        segment_end_index=indices[-1],
+        split_index=indices[selected_segment_position],
+        split_point=(float(selected_point[0]), float(selected_point[1])),
+        distance_to_line_mm=float(distances[selected_eligible_position]),
+        arc_distance_from_start_mm=float(
+            internal_arc_from_start[selected_internal_position]
+        ),
+        arc_distance_to_end_mm=float(
+            internal_arc_to_end[selected_internal_position]
+        ),
+        eligible_points_count=len(eligible_points),
+    )
 
 
 def compute_segment_statistics(

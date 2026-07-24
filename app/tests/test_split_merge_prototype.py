@@ -7,6 +7,7 @@ from experiments.split_merge_prototype import (
     compute_segment_statistics,
     cyclic_indices,
     cyclic_segment_points,
+    find_split_candidate,
     point_to_line_distances,
     point_to_segment_distances,
 )
@@ -97,6 +98,212 @@ class TestPointDistances(unittest.TestCase):
         endpoint = np.array([0.0, 0.0], dtype=np.float64)
         with self.assertRaisesRegex(ValueError, "non-degenerate"):
             point_to_line_distances(points, endpoint, endpoint)
+
+
+class TestFindSplitCandidate(unittest.TestCase):
+    def test_obvious_corner(self):
+        contour = np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 2.0],
+                [3.0, 0.0],
+                [4.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        candidate = find_split_candidate(contour, 0, 4)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(2, candidate.split_index)
+        self.assertEqual((2.0, 2.0), candidate.split_point)
+        self.assertAlmostEqual(2.0, candidate.distance_to_line_mm)
+        self.assertAlmostEqual(
+            1.0 + math.sqrt(5.0),
+            candidate.arc_distance_from_start_mm,
+        )
+        self.assertAlmostEqual(
+            1.0 + math.sqrt(5.0),
+            candidate.arc_distance_to_end_mm,
+        )
+        self.assertEqual(3, candidate.eligible_points_count)
+
+    def test_perfect_line_returns_first_internal_point(self):
+        contour = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+            dtype=np.float64,
+        )
+        candidate = find_split_candidate(contour, 0, 3)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(1, candidate.split_index)
+        self.assertAlmostEqual(0.0, candidate.distance_to_line_mm)
+        self.assertEqual(2, candidate.eligible_points_count)
+
+    def test_endpoint_filter_uses_arc_length_mm(self):
+        contour = np.array(
+            [[0.0, 0.0], [0.5, 1.0], [2.0, 0.5], [4.0, 0.0]],
+            dtype=np.float64,
+        )
+
+        unfiltered = find_split_candidate(
+            contour,
+            0,
+            3,
+            min_endpoint_arc_length_mm=0.0,
+        )
+        filtered = find_split_candidate(
+            contour,
+            0,
+            3,
+            min_endpoint_arc_length_mm=1.5,
+        )
+
+        self.assertIsNotNone(unfiltered)
+        self.assertIsNotNone(filtered)
+        self.assertEqual(1, unfiltered.split_index)
+        self.assertEqual(2, filtered.split_index)
+        self.assertEqual(2, unfiltered.eligible_points_count)
+        self.assertEqual(1, filtered.eligible_points_count)
+
+    def test_endpoint_filter_can_exclude_all_points(self):
+        contour = np.array(
+            [[0.0, 0.0], [0.5, 1.0], [2.0, 0.5], [4.0, 0.0]],
+            dtype=np.float64,
+        )
+        self.assertIsNone(
+            find_split_candidate(
+                contour,
+                0,
+                3,
+                min_endpoint_arc_length_mm=3.0,
+            )
+        )
+
+    def test_segment_without_internal_points(self):
+        contour = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            dtype=np.float64,
+        )
+        self.assertIsNone(find_split_candidate(contour, 0, 1))
+
+    def test_wrapped_segment_preserves_source_index_and_arc_lengths(self):
+        contour = np.array(
+            [
+                [1.0, 2.0],
+                [2.0, 0.0],
+                [100.0, 100.0],
+                [-1.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        candidate = find_split_candidate(contour, 3, 1)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(0, candidate.split_index)
+        self.assertEqual((1.0, 2.0), candidate.split_point)
+        self.assertAlmostEqual(2.0, candidate.distance_to_line_mm)
+        self.assertAlmostEqual(
+            1.0 + math.sqrt(5.0),
+            candidate.arc_distance_from_start_mm,
+        )
+        self.assertAlmostEqual(
+            math.sqrt(5.0),
+            candidate.arc_distance_to_end_mm,
+        )
+        self.assertEqual(2, candidate.eligible_points_count)
+
+    def test_equal_maxima_select_first_in_traversal_order(self):
+        contour = np.array(
+            [[0.0, 0.0], [1.0, 1.0], [2.0, -1.0], [3.0, 0.0]],
+            dtype=np.float64,
+        )
+        candidate = find_split_candidate(contour, 0, 3)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(1, candidate.split_index)
+        self.assertEqual((1.0, 1.0), candidate.split_point)
+
+    def test_distance_is_to_infinite_line(self):
+        contour = np.array(
+            [[0.0, 0.0], [2.0, 1.0], [1.0, 0.0]],
+            dtype=np.float64,
+        )
+        candidate = find_split_candidate(contour, 0, 2)
+
+        self.assertIsNotNone(candidate)
+        self.assertAlmostEqual(1.0, candidate.distance_to_line_mm)
+        self.assertNotAlmostEqual(
+            math.sqrt(2.0),
+            candidate.distance_to_line_mm,
+        )
+
+    def test_reversed_geometry_selects_same_point(self):
+        contour = np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 2.0],
+                [3.0, 0.0],
+                [4.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        forward = find_split_candidate(contour, 0, 4)
+        reverse = find_split_candidate(contour[::-1].copy(), 0, 4)
+
+        self.assertIsNotNone(forward)
+        self.assertIsNotNone(reverse)
+        self.assertEqual(forward.split_point, reverse.split_point)
+        self.assertAlmostEqual(
+            forward.distance_to_line_mm,
+            reverse.distance_to_line_mm,
+        )
+        self.assertAlmostEqual(
+            forward.arc_distance_from_start_mm,
+            reverse.arc_distance_to_end_mm,
+        )
+        self.assertAlmostEqual(
+            forward.arc_distance_to_end_mm,
+            reverse.arc_distance_from_start_mm,
+        )
+
+    def test_degenerate_chord_is_rejected(self):
+        contour = np.array(
+            [[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]],
+            dtype=np.float64,
+        )
+        with self.assertRaisesRegex(ValueError, "degenerate chord"):
+            find_split_candidate(contour, 0, 2)
+
+    def test_equal_endpoint_indices_are_rejected(self):
+        contour = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+        with self.assertRaisesRegex(ValueError, "different endpoint indices"):
+            find_split_candidate(contour, 0, 0)
+
+    def test_invalid_endpoint_margin_is_rejected(self):
+        contour = np.array(
+            [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]],
+            dtype=np.float64,
+        )
+        for value in (-1.0, np.nan, np.inf, -np.inf):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    find_split_candidate(
+                        contour,
+                        0,
+                        2,
+                        min_endpoint_arc_length_mm=value,
+                    )
+
+        with self.assertRaises(TypeError):
+            find_split_candidate(
+                contour,
+                0,
+                2,
+                min_endpoint_arc_length_mm=True,
+            )
 
 
 class TestSegmentStatistics(unittest.TestCase):
