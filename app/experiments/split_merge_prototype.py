@@ -34,6 +34,60 @@ class SplitCandidate:
     eligible_points_count: int
 
 
+@dataclass(frozen=True)
+class SplitEvaluation:
+    segment_start_index: int
+    segment_end_index: int
+    split_index: int
+    parent_statistics: SegmentStatistics
+    left_statistics: SegmentStatistics
+    right_statistics: SegmentStatistics
+    parent_sse_mm2: float
+    post_split_sse_mm2: float
+    post_split_mse_mm2: float
+    post_split_rms_mm: float
+    sse_reduction_mm2: float
+    sse_reduction_fraction: float | None
+    post_split_max_error_mm: float
+    max_error_reduction_mm: float
+
+
+@dataclass(frozen=True)
+class SplitDecisionPolicy:
+    min_child_arc_length_mm: float
+    parent_rms_tolerance_mm: float
+    min_rms_reduction_fraction: float
+    corner_penalty_rms_mm: float
+
+    def __post_init__(self) -> None:
+        parameter_bounds = (
+            ("min_child_arc_length_mm", None),
+            ("parent_rms_tolerance_mm", None),
+            ("min_rms_reduction_fraction", 1.0),
+            ("corner_penalty_rms_mm", None),
+        )
+        for name, maximum in parameter_bounds:
+            value = _validate_policy_parameter(
+                getattr(self, name),
+                name,
+                maximum,
+            )
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class SplitDecision:
+    accepted: bool
+    reason: str
+    evaluation: SplitEvaluation
+    parent_rms_mm: float
+    post_split_rms_mm: float
+    rms_reduction_mm: float
+    rms_reduction_fraction: float | None
+    corner_penalty_rms_mm: float
+    net_gain_mm: float
+
+
 def _integer_index(value: int, name: str) -> int:
     if isinstance(value, (bool, np.bool_)):
         raise TypeError(f"{name} must be an integer")
@@ -41,6 +95,26 @@ def _integer_index(value: int, name: str) -> int:
         return operator.index(value)
     except TypeError as exc:
         raise TypeError(f"{name} must be an integer") from exc
+
+
+def _validate_policy_parameter(
+    value: float,
+    name: str,
+    maximum: float | None,
+) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be a real number")
+    if not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+
+    value_float = float(value)
+    if not np.isfinite(value_float):
+        raise ValueError(f"{name} must be finite")
+    if value_float < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    if maximum is not None and value_float > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
+    return value_float
 
 
 def _validate_contour(contour: np.ndarray) -> np.ndarray:
@@ -283,4 +357,147 @@ def compute_segment_statistics(
         mean_squared_error_mm2=mean_squared_error,
         rms_error_mm=rms_error,
         max_error_mm=max_error,
+    )
+
+
+def evaluate_split(
+    contour: np.ndarray,
+    start_index: int,
+    end_index: int,
+    split_index: int,
+) -> SplitEvaluation:
+    """Measure the geometric error before and after one proposed split."""
+    contour_array = _validate_contour(contour)
+    segment_indices = cyclic_indices(
+        len(contour_array),
+        start_index,
+        end_index,
+    )
+    if segment_indices[0] == segment_indices[-1]:
+        raise ValueError("a contour segment must have different endpoint indices")
+
+    split_index = _integer_index(split_index, "split_index")
+    cyclic_indices(len(contour_array), split_index, split_index)
+    if split_index not in segment_indices[1:-1]:
+        raise ValueError(
+            "split_index must be an internal point of the cyclic segment"
+        )
+
+    parent = compute_segment_statistics(
+        contour_array,
+        segment_indices[0],
+        segment_indices[-1],
+    )
+    left = compute_segment_statistics(
+        contour_array,
+        segment_indices[0],
+        split_index,
+    )
+    right = compute_segment_statistics(
+        contour_array,
+        split_index,
+        segment_indices[-1],
+    )
+
+    parent_sse = (
+        parent.mean_squared_error_mm2 * parent.internal_points_count
+    )
+    left_sse = left.mean_squared_error_mm2 * left.internal_points_count
+    right_sse = right.mean_squared_error_mm2 * right.internal_points_count
+    post_split_sse = left_sse + right_sse
+    post_split_mse = post_split_sse / parent.internal_points_count
+    post_split_rms = float(np.sqrt(post_split_mse))
+
+    sse_reduction = parent_sse - post_split_sse
+    sse_reduction_fraction = (
+        None if parent_sse == 0.0 else sse_reduction / parent_sse
+    )
+    post_split_max_error = max(left.max_error_mm, right.max_error_mm)
+    max_error_reduction = parent.max_error_mm - post_split_max_error
+
+    return SplitEvaluation(
+        segment_start_index=segment_indices[0],
+        segment_end_index=segment_indices[-1],
+        split_index=split_index,
+        parent_statistics=parent,
+        left_statistics=left,
+        right_statistics=right,
+        parent_sse_mm2=float(parent_sse),
+        post_split_sse_mm2=float(post_split_sse),
+        post_split_mse_mm2=float(post_split_mse),
+        post_split_rms_mm=post_split_rms,
+        sse_reduction_mm2=float(sse_reduction),
+        sse_reduction_fraction=(
+            None
+            if sse_reduction_fraction is None
+            else float(sse_reduction_fraction)
+        ),
+        post_split_max_error_mm=float(post_split_max_error),
+        max_error_reduction_mm=float(max_error_reduction),
+    )
+
+
+def decide_split(
+    evaluation: SplitEvaluation,
+    policy: SplitDecisionPolicy,
+) -> SplitDecision:
+    """Apply an explainable local split policy to an existing evaluation."""
+    if not isinstance(evaluation, SplitEvaluation):
+        raise TypeError("evaluation must be a SplitEvaluation")
+    if not isinstance(policy, SplitDecisionPolicy):
+        raise TypeError("policy must be a SplitDecisionPolicy")
+
+    parent_rms = evaluation.parent_statistics.rms_error_mm
+    post_split_rms = evaluation.post_split_rms_mm
+    rms_reduction = parent_rms - post_split_rms
+    rms_reduction_fraction = (
+        None if parent_rms == 0.0 else rms_reduction / parent_rms
+    )
+    net_gain = rms_reduction - policy.corner_penalty_rms_mm
+
+    if (
+        evaluation.left_statistics.arc_length_mm
+        < policy.min_child_arc_length_mm
+    ):
+        accepted = False
+        reason = "left_child_too_short"
+    elif (
+        evaluation.right_statistics.arc_length_mm
+        < policy.min_child_arc_length_mm
+    ):
+        accepted = False
+        reason = "right_child_too_short"
+    elif parent_rms <= policy.parent_rms_tolerance_mm:
+        accepted = False
+        reason = "parent_within_tolerance"
+    elif rms_reduction <= 0.0:
+        accepted = False
+        reason = "no_rms_improvement"
+    elif (
+        rms_reduction_fraction is not None
+        and rms_reduction_fraction < policy.min_rms_reduction_fraction
+    ):
+        accepted = False
+        reason = "relative_improvement_too_small"
+    elif net_gain <= 0.0:
+        accepted = False
+        reason = "corner_penalty_not_overcome"
+    else:
+        accepted = True
+        reason = "accepted"
+
+    return SplitDecision(
+        accepted=accepted,
+        reason=reason,
+        evaluation=evaluation,
+        parent_rms_mm=float(parent_rms),
+        post_split_rms_mm=float(post_split_rms),
+        rms_reduction_mm=float(rms_reduction),
+        rms_reduction_fraction=(
+            None
+            if rms_reduction_fraction is None
+            else float(rms_reduction_fraction)
+        ),
+        corner_penalty_rms_mm=policy.corner_penalty_rms_mm,
+        net_gain_mm=float(net_gain),
     )
