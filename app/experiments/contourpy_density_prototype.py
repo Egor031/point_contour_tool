@@ -59,7 +59,35 @@ class SyntheticRotatedRectangleField:
     angle_degrees: float
 
 
-SyntheticField = SyntheticRectangleField | SyntheticRotatedRectangleField
+@dataclass(frozen=True)
+class SyntheticPointDensityRotatedRectangleField:
+    density: np.ndarray
+    points_xy_mm: np.ndarray
+
+    x_coordinates_mm: np.ndarray
+    y_coordinates_mm: np.ndarray
+
+    min_x_mm: float
+    min_y_mm: float
+    cell_size_mm: float
+    threshold: float
+
+    center_x_mm: float
+    center_y_mm: float
+    rectangle_width_mm: float
+    rectangle_height_mm: float
+    angle_degrees: float
+
+    point_spacing_mm: float
+    point_offset_x_mm: float
+    point_offset_y_mm: float
+
+
+RotatedRectangleField = (
+    SyntheticRotatedRectangleField
+    | SyntheticPointDensityRotatedRectangleField
+)
+SyntheticField = SyntheticRectangleField | RotatedRectangleField
 
 
 @dataclass(frozen=True)
@@ -119,6 +147,17 @@ class RotatedRectangleContourComparison:
     contourpy_metrics: RotatedRectangleContourMetrics
 
 
+@dataclass(frozen=True)
+class PointDensityRotatedRectangleComparison:
+    field: SyntheticPointDensityRotatedRectangleField
+
+    mask_contour: np.ndarray
+    contourpy_contour: np.ndarray
+
+    mask_metrics: RotatedRectangleContourMetrics
+    contourpy_metrics: RotatedRectangleContourMetrics
+
+
 def _finite_float(value: float, name: str) -> float:
     value_float = float(value)
     if not np.isfinite(value_float):
@@ -135,6 +174,64 @@ def _positive_integer(value: int, name: str) -> int:
     if value_int <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value_int
+
+
+def accumulate_points_to_density(
+    points_xy_mm: np.ndarray,
+    *,
+    min_x_mm: float,
+    min_y_mm: float,
+    width_cells: int,
+    height_cells: int,
+    cell_size_mm: float,
+) -> np.ndarray:
+    """Accumulate finite XY points into project-compatible uint32 cells."""
+    points = np.asarray(points_xy_mm, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points_xy_mm must have shape (N, 2)")
+    if not np.isfinite(points).all():
+        raise ValueError("point coordinates must be finite")
+
+    width_cells = _positive_integer(width_cells, "width_cells")
+    height_cells = _positive_integer(height_cells, "height_cells")
+    min_x_mm = _finite_float(min_x_mm, "min_x_mm")
+    min_y_mm = _finite_float(min_y_mm, "min_y_mm")
+    cell_size_mm = _finite_float(cell_size_mm, "cell_size_mm")
+    if cell_size_mm <= 0.0:
+        raise ValueError("cell_size_mm must be greater than zero")
+
+    field_max_x_mm = min_x_mm + width_cells * cell_size_mm
+    field_max_y_mm = min_y_mm + height_cells * cell_size_mm
+    outside_grid = (
+        (points[:, 0] < min_x_mm)
+        | (points[:, 0] >= field_max_x_mm)
+        | (points[:, 1] < min_y_mm)
+        | (points[:, 1] >= field_max_y_mm)
+    )
+    if np.any(outside_grid):
+        raise ValueError("all points must lie inside the density grid")
+
+    ix = np.floor(
+        (points[:, 0] - min_x_mm) / cell_size_mm
+    ).astype(np.int64)
+    iy = np.floor(
+        (points[:, 1] - min_y_mm) / cell_size_mm
+    ).astype(np.int64)
+
+    if len(points) > 0:
+        linear_indices = iy * width_cells + ix
+        _cells, cell_counts = np.unique(
+            linear_indices, return_counts=True
+        )
+        if int(np.max(cell_counts)) > np.iinfo(np.uint32).max:
+            raise OverflowError("a density cell would overflow uint32")
+
+    density = np.zeros(
+        (height_cells, width_cells),
+        dtype=np.uint32,
+    )
+    np.add.at(density, (iy, ix), np.uint32(1))
+    return density
 
 
 def create_synthetic_rectangle_field(
@@ -391,6 +488,170 @@ def create_synthetic_rotated_rectangle_field(
     )
 
 
+def create_synthetic_point_density_rotated_rectangle_field(
+    *,
+    min_x_mm: float = 0.0,
+    min_y_mm: float = 0.0,
+    width_cells: int = 100,
+    height_cells: int = 80,
+    cell_size_mm: float = 1.0,
+    center_x_mm: float = 50.3,
+    center_y_mm: float = 40.7,
+    rectangle_width_mm: float = 46.2,
+    rectangle_height_mm: float = 28.6,
+    angle_degrees: float = 23.0,
+    point_spacing_mm: float = 0.25,
+    point_offset_x_mm: float = 0.13,
+    point_offset_y_mm: float = 0.07,
+    threshold: float = 8.0,
+) -> SyntheticPointDensityRotatedRectangleField:
+    """Create raw integer density from a deterministic world XY lattice."""
+    width_cells = _positive_integer(width_cells, "width_cells")
+    height_cells = _positive_integer(height_cells, "height_cells")
+
+    min_x_mm = _finite_float(min_x_mm, "min_x_mm")
+    min_y_mm = _finite_float(min_y_mm, "min_y_mm")
+    cell_size_mm = _finite_float(cell_size_mm, "cell_size_mm")
+    center_x_mm = _finite_float(center_x_mm, "center_x_mm")
+    center_y_mm = _finite_float(center_y_mm, "center_y_mm")
+    rectangle_width_mm = _finite_float(
+        rectangle_width_mm, "rectangle_width_mm"
+    )
+    rectangle_height_mm = _finite_float(
+        rectangle_height_mm, "rectangle_height_mm"
+    )
+    angle_degrees = _finite_float(angle_degrees, "angle_degrees")
+    point_spacing_mm = _finite_float(
+        point_spacing_mm, "point_spacing_mm"
+    )
+    point_offset_x_mm = _finite_float(
+        point_offset_x_mm, "point_offset_x_mm"
+    )
+    point_offset_y_mm = _finite_float(
+        point_offset_y_mm, "point_offset_y_mm"
+    )
+    threshold = _finite_float(threshold, "threshold")
+
+    if cell_size_mm <= 0.0:
+        raise ValueError("cell_size_mm must be greater than zero")
+    if rectangle_width_mm <= 0.0 or rectangle_height_mm <= 0.0:
+        raise ValueError("rectangle dimensions must be greater than zero")
+    if point_spacing_mm <= 0.0:
+        raise ValueError("point_spacing_mm must be greater than zero")
+    if not 0.0 <= point_offset_x_mm < point_spacing_mm:
+        raise ValueError(
+            "point_offset_x_mm must be in [0, point_spacing_mm)"
+        )
+    if not 0.0 <= point_offset_y_mm < point_spacing_mm:
+        raise ValueError(
+            "point_offset_y_mm must be in [0, point_spacing_mm)"
+        )
+
+    angle_remainder = float(np.mod(angle_degrees, 45.0))
+    if np.isclose(angle_remainder, 0.0, atol=1e-12) or np.isclose(
+        angle_remainder, 45.0, atol=1e-12
+    ):
+        raise ValueError("angle_degrees must not be a multiple of 45 degrees")
+
+    angle_radians = np.deg2rad(angle_degrees)
+    cosine = float(np.cos(angle_radians))
+    sine = float(np.sin(angle_radians))
+    half_width = rectangle_width_mm / 2.0
+    half_height = rectangle_height_mm / 2.0
+    extent_x = abs(cosine) * half_width + abs(sine) * half_height
+    extent_y = abs(sine) * half_width + abs(cosine) * half_height
+
+    field_max_x_mm = min_x_mm + width_cells * cell_size_mm
+    field_max_y_mm = min_y_mm + height_cells * cell_size_mm
+    margin = 2.0 * cell_size_mm
+    if not (
+        center_x_mm - extent_x > min_x_mm + margin
+        and center_x_mm + extent_x < field_max_x_mm - margin
+        and center_y_mm - extent_y > min_y_mm + margin
+        and center_y_mm + extent_y < field_max_y_mm - margin
+    ):
+        raise ValueError(
+            "rotated rectangle must lie inside the field with margin"
+        )
+
+    x_points = np.arange(
+        min_x_mm + point_offset_x_mm,
+        field_max_x_mm,
+        point_spacing_mm,
+        dtype=np.float64,
+    )
+    y_points = np.arange(
+        min_y_mm + point_offset_y_mm,
+        field_max_y_mm,
+        point_spacing_mm,
+        dtype=np.float64,
+    )
+    x_grid, y_grid = np.meshgrid(x_points, y_points)
+
+    translated_x = x_grid - center_x_mm
+    translated_y = y_grid - center_y_mm
+    local_x = cosine * translated_x + sine * translated_y
+    local_y = -sine * translated_x + cosine * translated_y
+    coordinate_scale = max(
+        1.0,
+        abs(center_x_mm),
+        abs(center_y_mm),
+        rectangle_width_mm,
+        rectangle_height_mm,
+    )
+    tolerance_mm = (
+        16.0 * np.finfo(np.float64).eps * coordinate_scale
+    )
+    inside_rectangle = (
+        (np.abs(local_x) <= half_width + tolerance_mm)
+        & (np.abs(local_y) <= half_height + tolerance_mm)
+    )
+    points_xy_mm = np.column_stack(
+        (x_grid[inside_rectangle], y_grid[inside_rectangle])
+    ).astype(np.float64, copy=False)
+    if len(points_xy_mm) == 0:
+        raise ValueError("the rotated rectangle contains no lattice points")
+
+    density = accumulate_points_to_density(
+        points_xy_mm,
+        min_x_mm=min_x_mm,
+        min_y_mm=min_y_mm,
+        width_cells=width_cells,
+        height_cells=height_cells,
+        cell_size_mm=cell_size_mm,
+    )
+    if not 0.0 < threshold < int(np.max(density)):
+        raise ValueError(
+            "threshold must be positive and below the maximum cell count"
+        )
+
+    x_coordinates_mm = min_x_mm + (
+        np.arange(width_cells, dtype=np.float64) + 0.5
+    ) * cell_size_mm
+    y_coordinates_mm = min_y_mm + (
+        np.arange(height_cells, dtype=np.float64) + 0.5
+    ) * cell_size_mm
+
+    return SyntheticPointDensityRotatedRectangleField(
+        density=density,
+        points_xy_mm=points_xy_mm,
+        x_coordinates_mm=x_coordinates_mm,
+        y_coordinates_mm=y_coordinates_mm,
+        min_x_mm=min_x_mm,
+        min_y_mm=min_y_mm,
+        cell_size_mm=cell_size_mm,
+        threshold=threshold,
+        center_x_mm=center_x_mm,
+        center_y_mm=center_y_mm,
+        rectangle_width_mm=rectangle_width_mm,
+        rectangle_height_mm=rectangle_height_mm,
+        angle_degrees=angle_degrees,
+        point_spacing_mm=point_spacing_mm,
+        point_offset_x_mm=point_offset_x_mm,
+        point_offset_y_mm=point_offset_y_mm,
+    )
+
+
 def signed_ring_area(points: np.ndarray) -> float:
     """Return the signed shoelace area of an ordered ring."""
     points_array = np.asarray(points, dtype=np.float64)
@@ -439,7 +700,7 @@ def normalize_external_ring(points: np.ndarray) -> np.ndarray:
 
 
 def rotated_rectangle_vertices(
-    field: SyntheticRotatedRectangleField,
+    field: RotatedRectangleField,
 ) -> np.ndarray:
     """Return the four exact rectangle vertices in counter-clockwise order."""
     half_width = field.rectangle_width_mm / 2.0
@@ -497,7 +758,7 @@ def extract_contourpy_external_contour(
     generator = contourpy.contour_generator(
         x=field.x_coordinates_mm,
         y=field.y_coordinates_mm,
-        z=field.density,
+        z=np.asarray(field.density, dtype=np.float64),
     )
     lines = generator.lines(field.threshold)
 
@@ -608,7 +869,7 @@ def compute_rectangle_contour_metrics(
 
 def compute_rotated_rectangle_contour_metrics(
     contour: np.ndarray,
-    field: SyntheticRotatedRectangleField,
+    field: RotatedRectangleField,
     *,
     corner_exclusion_mm: float | None = None,
 ) -> RotatedRectangleContourMetrics:
@@ -768,6 +1029,28 @@ def run_rotated_rectangle_comparison(
     )
 
 
+def run_point_density_rotated_rectangle_comparison(
+) -> PointDensityRotatedRectangleComparison:
+    """Compare both extractors on raw counts from deterministic XY points."""
+    field = create_synthetic_point_density_rotated_rectangle_field()
+    mask_contour = extract_mask_external_contour(field)
+    contourpy_contour = extract_contourpy_external_contour(field)
+    mask_metrics = compute_rotated_rectangle_contour_metrics(
+        mask_contour, field
+    )
+    contourpy_metrics = compute_rotated_rectangle_contour_metrics(
+        contourpy_contour, field
+    )
+
+    return PointDensityRotatedRectangleComparison(
+        field=field,
+        mask_contour=mask_contour,
+        contourpy_contour=contourpy_contour,
+        mask_metrics=mask_metrics,
+        contourpy_metrics=contourpy_metrics,
+    )
+
+
 def _print_metrics(name: str, metrics: RectangleContourMetrics) -> None:
     print(f"{name}:")
     print(f"  points: {metrics.point_count}")
@@ -877,4 +1160,98 @@ if __name__ == "__main__":
     print(
         "  mean angle error: "
         f"{angle_error_improvement:.6f} deg"
+    )
+
+    point_comparison = run_point_density_rotated_rectangle_comparison()
+    point_field = point_comparison.field
+    positive_counts = point_field.density[point_field.density > 0]
+    nonzero_cells = int(np.count_nonzero(point_field.density))
+    maximum_cell_count = int(np.max(point_field.density))
+    median_positive_count = float(np.median(positive_counts))
+
+    print()
+    print("Point-generated density rotated rectangle comparison")
+    print(f"  angle: {point_field.angle_degrees:.6f} deg")
+    print(f"  generated points: {len(point_field.points_xy_mm)}")
+    print(f"  density dtype: {point_field.density.dtype}")
+    print(f"  nonzero cells: {nonzero_cells}")
+    print(f"  maximum cell count: {maximum_cell_count}")
+    print(f"  median positive cell count: {median_positive_count:.6f}")
+    print(f"  threshold: {point_field.threshold:.6f}")
+    print()
+    _print_rotated_metrics(
+        "Mask contour", point_comparison.mask_metrics
+    )
+    print()
+    _print_rotated_metrics(
+        "ContourPy contour", point_comparison.contourpy_metrics
+    )
+
+    point_mask_metrics = point_comparison.mask_metrics
+    point_contourpy_metrics = point_comparison.contourpy_metrics
+    point_boundary_improvement = (
+        point_mask_metrics.rms_boundary_error_mm
+        - point_contourpy_metrics.rms_boundary_error_mm
+    )
+    point_fitted_improvement = (
+        point_mask_metrics.mean_fitted_side_rms_mm
+        - point_contourpy_metrics.mean_fitted_side_rms_mm
+    )
+    point_angle_improvement = (
+        point_mask_metrics.mean_side_angle_error_deg
+        - point_contourpy_metrics.mean_side_angle_error_deg
+    )
+    point_area_improvement = (
+        point_mask_metrics.area_error_mm2
+        - point_contourpy_metrics.area_error_mm2
+    )
+
+    print()
+    print("ContourPy improvements:")
+    print(f"  boundary RMS: {point_boundary_improvement:.6f} mm")
+    print(f"  fitted-side RMS: {point_fitted_improvement:.6f} mm")
+    print(f"  mean angle error: {point_angle_improvement:.6f} deg")
+    print(f"  area error: {point_area_improvement:.6f} mm^2")
+
+    floating_tolerance = 1e-12
+    print()
+    print("Experimental verdict:")
+    print(
+        "  boundary RMS improved: "
+        + (
+            "yes"
+            if point_contourpy_metrics.rms_boundary_error_mm
+            < point_mask_metrics.rms_boundary_error_mm
+            else "no"
+        )
+    )
+    print(
+        "  fitted-side RMS improved: "
+        + (
+            "yes"
+            if point_contourpy_metrics.mean_fitted_side_rms_mm
+            < point_mask_metrics.mean_fitted_side_rms_mm
+            else "no"
+        )
+    )
+    print(
+        "  mean angle error not worse: "
+        + (
+            "yes"
+            if point_contourpy_metrics.mean_side_angle_error_deg
+            <= (
+                point_mask_metrics.mean_side_angle_error_deg
+                + floating_tolerance
+            )
+            else "no"
+        )
+    )
+    print(
+        "  area error not worse: "
+        + (
+            "yes"
+            if point_contourpy_metrics.area_error_mm2
+            <= point_mask_metrics.area_error_mm2 + floating_tolerance
+            else "no"
+        )
     )

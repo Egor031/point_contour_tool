@@ -6,12 +6,16 @@ import numpy as np
 from experiments.contourpy_density_prototype import (
     RectangleContourMetrics,
     RotatedRectangleContourMetrics,
+    SyntheticPointDensityRotatedRectangleField,
+    accumulate_points_to_density,
+    compute_rotated_rectangle_contour_metrics,
+    create_synthetic_point_density_rotated_rectangle_field,
     create_synthetic_rectangle_field,
     create_synthetic_rotated_rectangle_field,
-    compute_rotated_rectangle_contour_metrics,
     extract_contourpy_external_contour,
     extract_mask_external_contour,
     normalize_external_ring,
+    run_point_density_rotated_rectangle_comparison,
     run_rectangle_comparison,
     run_rotated_rectangle_comparison,
     rotated_rectangle_vertices,
@@ -418,6 +422,274 @@ class TestRotatedRectangleDensityPrototype(unittest.TestCase):
                     self.assertEqual(first_value, second_value)
                 else:
                     self.assertAlmostEqual(first_value, second_value)
+
+
+class TestPointDensityRotatedRectanglePrototype(unittest.TestCase):
+    def _assert_contour_contract(self, contour):
+        self.assertEqual(2, contour.ndim)
+        self.assertEqual(2, contour.shape[1])
+        self.assertEqual(np.dtype(np.float64), contour.dtype)
+        self.assertTrue(np.isfinite(contour).all())
+        self.assertFalse(np.allclose(contour[0], contour[-1]))
+        self.assertGreaterEqual(len(np.unique(contour, axis=0)), 3)
+        self.assertGreater(signed_ring_area(contour), 0.0)
+
+    def test_point_density_field_contract(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+
+        self.assertEqual((80, 100), field.density.shape)
+        self.assertEqual(np.dtype(np.uint32), field.density.dtype)
+        self.assertEqual(2, field.points_xy_mm.ndim)
+        self.assertEqual(2, field.points_xy_mm.shape[1])
+        self.assertEqual(np.dtype(np.float64), field.points_xy_mm.dtype)
+        self.assertEqual(
+            np.dtype(np.float64), field.x_coordinates_mm.dtype
+        )
+        self.assertEqual(
+            np.dtype(np.float64), field.y_coordinates_mm.dtype
+        )
+        self.assertTrue(np.isfinite(field.density).all())
+        self.assertTrue(np.isfinite(field.points_xy_mm).all())
+        self.assertTrue(np.isfinite(field.x_coordinates_mm).all())
+        self.assertTrue(np.isfinite(field.y_coordinates_mm).all())
+        self.assertGreater(len(field.points_xy_mm), 0)
+
+    def test_all_generated_points_lie_inside_grid(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+        field_max_x = (
+            field.min_x_mm
+            + field.density.shape[1] * field.cell_size_mm
+        )
+        field_max_y = (
+            field.min_y_mm
+            + field.density.shape[0] * field.cell_size_mm
+        )
+
+        self.assertTrue(
+            np.all(field.points_xy_mm[:, 0] >= field.min_x_mm)
+        )
+        self.assertTrue(
+            np.all(field.points_xy_mm[:, 0] < field_max_x)
+        )
+        self.assertTrue(
+            np.all(field.points_xy_mm[:, 1] >= field.min_y_mm)
+        )
+        self.assertTrue(
+            np.all(field.points_xy_mm[:, 1] < field_max_y)
+        )
+
+    def test_all_generated_points_lie_inside_rotated_rectangle(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+        translated = field.points_xy_mm - np.array(
+            [field.center_x_mm, field.center_y_mm],
+            dtype=np.float64,
+        )
+        angle_radians = np.deg2rad(field.angle_degrees)
+        cosine = float(np.cos(angle_radians))
+        sine = float(np.sin(angle_radians))
+        local_x = (
+            cosine * translated[:, 0] + sine * translated[:, 1]
+        )
+        local_y = (
+            -sine * translated[:, 0] + cosine * translated[:, 1]
+        )
+        tolerance = 1e-12
+
+        self.assertTrue(
+            np.all(
+                np.abs(local_x)
+                <= field.rectangle_width_mm / 2.0 + tolerance
+            )
+        )
+        self.assertTrue(
+            np.all(
+                np.abs(local_y)
+                <= field.rectangle_height_mm / 2.0 + tolerance
+            )
+        )
+
+    def test_point_generation_is_deterministic(self):
+        first = create_synthetic_point_density_rotated_rectangle_field()
+        second = create_synthetic_point_density_rotated_rectangle_field()
+
+        np.testing.assert_array_equal(
+            first.points_xy_mm, second.points_xy_mm
+        )
+        np.testing.assert_array_equal(first.density, second.density)
+        np.testing.assert_array_equal(
+            first.x_coordinates_mm, second.x_coordinates_mm
+        )
+        np.testing.assert_array_equal(
+            first.y_coordinates_mm, second.y_coordinates_mm
+        )
+        array_fields = {
+            "density",
+            "points_xy_mm",
+            "x_coordinates_mm",
+            "y_coordinates_mm",
+        }
+        for field_info in fields(
+            SyntheticPointDensityRotatedRectangleField
+        ):
+            if field_info.name not in array_fields:
+                self.assertEqual(
+                    getattr(first, field_info.name),
+                    getattr(second, field_info.name),
+                )
+
+    def test_density_sum_equals_generated_point_count(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+
+        self.assertEqual(
+            len(field.points_xy_mm),
+            int(np.sum(field.density, dtype=np.uint64)),
+        )
+
+    def test_threshold_is_inside_count_range(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+
+        self.assertGreater(field.threshold, 0.0)
+        self.assertLess(field.threshold, int(field.density.max()))
+
+    def test_outer_grid_corners_are_empty(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+
+        for row, column in (
+            (0, 0),
+            (0, -1),
+            (-1, 0),
+            (-1, -1),
+        ):
+            with self.subTest(row=row, column=column):
+                self.assertEqual(0, int(field.density[row, column]))
+
+    def test_accumulate_points_to_known_cells(self):
+        points = np.array(
+            [
+                [0.1, 0.1],
+                [0.9, 0.9],
+                [1.0, 0.2],
+                [1.2, 1.2],
+                [2.99, 1.99],
+            ],
+            dtype=np.float64,
+        )
+
+        density = accumulate_points_to_density(
+            points,
+            min_x_mm=0.0,
+            min_y_mm=0.0,
+            width_cells=3,
+            height_cells=2,
+            cell_size_mm=1.0,
+        )
+
+        expected = np.array(
+            [[2, 1, 0], [0, 1, 1]],
+            dtype=np.uint32,
+        )
+        np.testing.assert_array_equal(expected, density)
+
+    def test_accumulate_rejects_points_outside_grid(self):
+        points = np.array(
+            [[0.1, 0.1], [3.0, 0.5]],
+            dtype=np.float64,
+        )
+
+        with self.assertRaisesRegex(ValueError, "inside"):
+            accumulate_points_to_density(
+                points,
+                min_x_mm=0.0,
+                min_y_mm=0.0,
+                width_cells=3,
+                height_cells=2,
+                cell_size_mm=1.0,
+            )
+
+    def test_point_density_mask_contour_contract(self):
+        contour = extract_mask_external_contour(
+            create_synthetic_point_density_rotated_rectangle_field()
+        )
+
+        self._assert_contour_contract(contour)
+
+    def test_point_density_contourpy_contour_contract(self):
+        contour = extract_contourpy_external_contour(
+            create_synthetic_point_density_rotated_rectangle_field()
+        )
+
+        self._assert_contour_contract(contour)
+
+    def test_contourpy_extraction_preserves_integer_density(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+        density_before = field.density.copy()
+
+        extract_contourpy_external_contour(field)
+
+        self.assertEqual(np.dtype(np.uint32), field.density.dtype)
+        np.testing.assert_array_equal(density_before, field.density)
+
+    def test_point_density_metrics_are_finite_and_non_negative(self):
+        comparison = run_point_density_rotated_rectangle_comparison()
+
+        for metrics in (
+            comparison.mask_metrics,
+            comparison.contourpy_metrics,
+        ):
+            self.assertGreater(metrics.point_count, 0)
+            self.assertTrue(np.isfinite(metrics.signed_area_mm2))
+            self.assertGreater(metrics.signed_area_mm2, 0.0)
+            for metric_field in fields(RotatedRectangleContourMetrics):
+                if metric_field.name in ("point_count", "signed_area_mm2"):
+                    continue
+                value = getattr(metrics, metric_field.name)
+                self.assertTrue(
+                    np.isfinite(value),
+                    msg=f"{metric_field.name} is not finite",
+                )
+                self.assertGreaterEqual(
+                    value,
+                    0.0,
+                    msg=f"{metric_field.name} is negative",
+                )
+
+    def test_point_density_comparison_is_deterministic(self):
+        first = run_point_density_rotated_rectangle_comparison()
+        second = run_point_density_rotated_rectangle_comparison()
+
+        np.testing.assert_allclose(
+            first.mask_contour,
+            second.mask_contour,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            first.contourpy_contour,
+            second.contourpy_contour,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        for metrics_name in ("mask_metrics", "contourpy_metrics"):
+            first_metrics = getattr(first, metrics_name)
+            second_metrics = getattr(second, metrics_name)
+            for metric_field in fields(RotatedRectangleContourMetrics):
+                first_value = getattr(first_metrics, metric_field.name)
+                second_value = getattr(second_metrics, metric_field.name)
+                if isinstance(first_value, int):
+                    self.assertEqual(first_value, second_value)
+                else:
+                    self.assertAlmostEqual(first_value, second_value)
+
+    def test_both_point_density_methods_return_external_contour(self):
+        field = create_synthetic_point_density_rotated_rectangle_field()
+
+        mask_contour = extract_mask_external_contour(field)
+        contourpy_contour = extract_contourpy_external_contour(field)
+
+        self.assertIsInstance(mask_contour, np.ndarray)
+        self.assertIsInstance(contourpy_contour, np.ndarray)
+        self.assertGreater(len(mask_contour), 0)
+        self.assertGreater(len(contourpy_contour), 0)
 
 
 if __name__ == "__main__":
