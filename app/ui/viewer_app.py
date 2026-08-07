@@ -11,12 +11,23 @@ import numpy as np
 
 from app.core.coordinate_transform import CoordinateTransform
 from app.core.density_grid import DensityGrid
+from app.core.working_area import WorkingArea
 from app.services.coarse_processing import DensityProcessingResult
 from app.ui.density_workflow import (
     SUPPORTED_POINT_CLOUD_EXTENSIONS,
+    active_working_area_is_visible,
+    apply_working_area_state,
+    begin_rectangle_draft,
+    clear_polygon_draft_state,
+    clear_working_area_state,
+    enter_polygon_mode_state,
+    enter_rectangle_mode_state,
+    finish_rectangle_draft,
     grid_preview_params,
     reset_source_dependent_state,
+    update_rectangle_transient,
     validate_density_request,
+    working_area_draft_visibility,
 )
 from app.ui.density_worker import (
     DensityWorker,
@@ -53,6 +64,7 @@ SHOW_MIXED_CONTOUR_GAPS_TAG = "show_mixed_contour_gaps"
 STATUS_TAG = "status_text"
 COORDS_TAG = "coords_text"
 ROI_STATUS_TAG = "roi_status_text"
+WORKING_AREA_INFO_TAG = "working_area_info_text"
 ROI_OUTPUT_TAG = "roi_output_text"
 POLYGON_COUNT_TAG = "polygon_count_text"
 POLYGON_LAST_TAG = "polygon_last_text"
@@ -125,6 +137,7 @@ state = {
     "pan_y": 0.0,
     "last_pan_mouse": None,
     "roi_first_world": None,
+    "roi_current_world": None,
     "rectangle_roi": None,
     "polygon_finished": False,
     "selection_applied": False,
@@ -133,6 +146,8 @@ state = {
     "selection_polygon_points": [],
     "mode": "rectangle",
     "polygon_points": [],
+    "active_working_area": None,
+    "working_area_density_session": None,
     "mask_edits": [],
     "last_brush_image": None,
     "last_brush_world": None,
@@ -278,6 +293,40 @@ def _update_density_session_info() -> None:
     )
 
 
+def get_active_working_area() -> WorkingArea | None:
+    working_area = state.get("active_working_area")
+    density_result = state.get("density_result")
+    if not isinstance(working_area, WorkingArea) or density_result is None:
+        return None
+    if state.get("working_area_density_session") is not density_result:
+        return None
+    return working_area
+
+
+def _update_working_area_info() -> None:
+    if not dpg.does_item_exist(WORKING_AREA_INFO_TAG):
+        return
+
+    working_area = get_active_working_area()
+    if working_area is None:
+        dpg.set_value(WORKING_AREA_INFO_TAG, "Working area: not selected")
+        return
+
+    if working_area.kind == "rectangle":
+        assert working_area.rectangle_bounds is not None
+        min_x, min_y, max_x, max_y = working_area.rectangle_bounds
+        dpg.set_value(
+            WORKING_AREA_INFO_TAG,
+            "Working area: Rectangle | "
+            f"{max_x - min_x:.3f} x {max_y - min_y:.3f} mm",
+        )
+    else:
+        dpg.set_value(
+            WORKING_AREA_INFO_TAG,
+            f"Working area: Polygon | vertices: {len(working_area.polygon_points)}",
+        )
+
+
 def _set_grid_parameter_values(grid: DensityGrid) -> None:
     grid_min_x, grid_min_y, cell_size, grid_width, grid_height = (
         grid_preview_params(grid)
@@ -335,6 +384,7 @@ def _clear_source_dependent_ui_state() -> None:
     _update_mask_edits_count()
     _update_last_brush_debug()
     _update_demo_summary_info()
+    _update_working_area_info()
 
 
 def _show_density_result(
@@ -764,7 +814,9 @@ def _redraw_selection_overlay() -> None:
     if dpg.does_item_exist(SELECTION_LAYER_TAG):
         dpg.delete_item(SELECTION_LAYER_TAG)
 
-    if not state["selection_applied"] or not dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+    if not active_working_area_is_visible(state) or not dpg.does_item_exist(
+        SELECTION_TEXTURE_TAG
+    ):
         return
 
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=SELECTION_LAYER_TAG)
@@ -799,17 +851,6 @@ def _world_to_drawlist(world_x: float, world_y: float) -> tuple[float, float] | 
     return image_to_drawlist(*transform.world_to_preview(world_x, world_y))
 
 
-def _world_to_preview_pixel(
-    world_x: float,
-    world_y: float,
-) -> tuple[float, float] | None:
-    transform = _get_coordinate_transform()
-    if transform is None:
-        return None
-
-    return transform.world_to_preview(world_x, world_y)
-
-
 def _update_polygon_points_text() -> None:
     points = state["polygon_points"]
     dpg.set_value(POLYGON_COUNT_TAG, f"Polygon points count: {len(points)}")
@@ -830,8 +871,8 @@ def _update_polygon_points_text() -> None:
 
 
 def _undo_last_polygon_point() -> bool:
-    if state["selection_applied"]:
-        dpg.set_value(ROI_STATUS_TAG, "Edit selection first.")
+    if state["selection_applied"] and not state["editing_overlay_visible"]:
+        dpg.set_value(ROI_STATUS_TAG, "Select Polygon ROI mode first.")
         return False
 
     points = state["polygon_points"]
@@ -862,16 +903,28 @@ def _redraw_polygon_overlay() -> None:
     if dpg.does_item_exist(POLYGON_LAYER_TAG):
         dpg.delete_item(POLYGON_LAYER_TAG)
 
-    if not state["editing_overlay_visible"]:
-        return
-
     if not _display_layer_enabled(SHOW_ROI_OVERLAY_TAG):
         return
 
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=POLYGON_LAYER_TAG)
 
+    active_working_area = state.get("active_working_area")
+    if active_working_area_is_visible(state) and isinstance(
+        active_working_area, WorkingArea
+    ):
+        _draw_working_area_boundary(
+            active_working_area,
+            POLYGON_LAYER_TAG,
+            color=(90, 255, 150, 245),
+            thickness=3,
+        )
+
+    if not state["editing_overlay_visible"]:
+        return
+
+    show_rectangle_draft, show_polygon_draft = working_area_draft_visibility(state)
     rectangle_roi = state["rectangle_roi"]
-    if rectangle_roi is not None:
+    if show_rectangle_draft and rectangle_roi is not None:
         min_x, min_y, max_x, max_y = rectangle_roi
         pixel_a = _world_to_drawlist(min_x, min_y)
         pixel_b = _world_to_drawlist(max_x, max_y)
@@ -886,8 +939,32 @@ def _redraw_polygon_overlay() -> None:
                 parent=POLYGON_LAYER_TAG,
             )
 
+    transient_anchor = state.get("roi_first_world")
+    transient_current = state.get("roi_current_world")
+    if show_rectangle_draft and transient_anchor is not None:
+        anchor_point = _world_to_drawlist(*transient_anchor)
+        current_point = _world_to_drawlist(*(transient_current or transient_anchor))
+        if anchor_point is not None and current_point is not None:
+            ax, ay = anchor_point
+            cx, cy = current_point
+            dpg.draw_rectangle(
+                (min(ax, cx), min(ay, cy)),
+                (max(ax, cx), max(ay, cy)),
+                color=(80, 220, 255, 230),
+                thickness=2,
+                parent=POLYGON_LAYER_TAG,
+            )
+            dpg.draw_circle(
+                anchor_point,
+                4,
+                color=(255, 255, 255, 255),
+                fill=(80, 220, 255, 230),
+                parent=POLYGON_LAYER_TAG,
+            )
+
     pixel_points = []
-    for world_x, world_y in state["polygon_points"]:
+    visible_polygon_points = state["polygon_points"] if show_polygon_draft else []
+    for world_x, world_y in visible_polygon_points:
         pixel_point = _world_to_drawlist(world_x, world_y)
         if pixel_point is not None:
             pixel_points.append(pixel_point)
@@ -925,6 +1002,48 @@ def _redraw_polygon_overlay() -> None:
             color=(255, 255, 255, 255),
             size=14,
             parent=POLYGON_LAYER_TAG,
+        )
+
+
+def _draw_working_area_boundary(
+    working_area: WorkingArea,
+    layer_tag: str,
+    *,
+    color: tuple[int, int, int, int],
+    thickness: int,
+) -> None:
+    if working_area.kind == "rectangle":
+        assert working_area.rectangle_bounds is not None
+        min_x, min_y, max_x, max_y = working_area.rectangle_bounds
+        point_a = _world_to_drawlist(min_x, min_y)
+        point_b = _world_to_drawlist(max_x, max_y)
+        if point_a is None or point_b is None:
+            return
+        ax, ay = point_a
+        bx, by = point_b
+        dpg.draw_rectangle(
+            (min(ax, bx), min(ay, by)),
+            (max(ax, bx), max(ay, by)),
+            color=color,
+            thickness=thickness,
+            parent=layer_tag,
+        )
+        return
+
+    draw_points = [
+        point
+        for world_point in working_area.polygon_points
+        if (point := _world_to_drawlist(*world_point)) is not None
+    ]
+    if len(draw_points) != len(working_area.polygon_points):
+        return
+    for point_a, point_b in zip(draw_points, draw_points[1:] + draw_points[:1]):
+        dpg.draw_line(
+            point_a,
+            point_b,
+            color=color,
+            thickness=thickness,
+            parent=layer_tag,
         )
 
 
@@ -1296,6 +1415,8 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
         return
 
     _pixel_x, _pixel_y, _grid_x, _grid_y, world_x, world_y = coords
+    if update_rectangle_transient(state, (world_x, world_y)):
+        _redraw_polygon_overlay()
     dpg.set_value(
         COORDS_TAG,
         f"World X: {world_x:.6f} | World Y: {world_y:.6f}",
@@ -1940,7 +2061,6 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
     if state["mode"] == "polygon":
         state["polygon_points"].append((world_x, world_y))
         state["polygon_finished"] = False
-        state["selection_applied"] = False
         state["editing_overlay_visible"] = True
         dpg.set_value(
             ROI_STATUS_TAG,
@@ -1951,26 +2071,19 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
         _redraw_preview()
         return
 
-    first_world = state["roi_first_world"]
-
-    if first_world is None:
-        state["roi_first_world"] = (world_x, world_y)
+    if state["roi_first_world"] is None:
+        begin_rectangle_draft(state, (world_x, world_y))
         dpg.set_value(
             ROI_STATUS_TAG,
             f"ROI first corner: x={world_x:.6f}, y={world_y:.6f}",
         )
         dpg.set_value(ROI_OUTPUT_TAG, "")
+        _redraw_polygon_overlay()
         return
 
-    first_x, first_y = first_world
-    min_x = min(first_x, world_x)
-    min_y = min(first_y, world_y)
-    max_x = max(first_x, world_x)
-    max_y = max(first_y, world_y)
-
-    state["roi_first_world"] = None
-    state["rectangle_roi"] = (min_x, min_y, max_x, max_y)
-    state["selection_applied"] = False
+    rectangle_roi = finish_rectangle_draft(state, (world_x, world_y))
+    assert rectangle_roi is not None
+    min_x, min_y, max_x, max_y = rectangle_roi
     state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "ROI rectangle ready.")
     dpg.set_value(
@@ -2021,28 +2134,30 @@ def _reset_view_callback(_sender=None, _app_data=None, _user_data=None) -> None:
 
 
 def _reset_roi_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["roi_first_world"] = None
-    state["mode"] = "rectangle"
+    enter_rectangle_mode_state(state)
     state["brush_cursor_image"] = None
-    state["editing_overlay_visible"] = True
     _redraw_brush_cursor_overlay()
+    _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
 
 
 def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["mode"] = "polygon"
-    state["roi_first_world"] = None
+    enter_polygon_mode_state(state)
     state["brush_cursor_image"] = None
-    state["editing_overlay_visible"] = True
     _redraw_brush_cursor_overlay()
+    _update_polygon_points_text()
+    _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI mode: click image points.")
 
 
 def _mask_brush_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["mode"] = "mask_brush"
     state["roi_first_world"] = None
+    state["roi_current_world"] = None
+    state["editing_overlay_visible"] = False
     state["last_brush_image"] = None
     _update_brush_cursor_from_mouse()
+    _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Mask brush mode: hold left mouse button.")
 
 
@@ -2073,7 +2188,6 @@ def _finish_polygon() -> bool:
         f"{_format_cli_float(x)},{_format_cli_float(y)}" for x, y in points
     )
     state["polygon_finished"] = True
-    state["selection_applied"] = False
     state["editing_overlay_visible"] = True
     dpg.set_value(ROI_STATUS_TAG, "Polygon ROI ready.")
     dpg.set_value(POLYGON_OUTPUT_TAG, f'--roi-poly "{points_text}"')
@@ -2081,10 +2195,7 @@ def _finish_polygon() -> bool:
 
 
 def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["polygon_points"] = []
-    state["polygon_finished"] = False
-    state["selection_applied"] = False
-    state["editing_overlay_visible"] = True
+    clear_polygon_draft_state(state)
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
     _update_polygon_points_text()
     _redraw_preview()
@@ -2110,58 +2221,39 @@ def _key_press_callback(_sender=None, app_data=None, _user_data=None) -> None:
         _undo_last_brush_stroke()
 
 
-def _clamp_pixel(value: float, upper_limit: int) -> int:
-    return max(0, min(upper_limit - 1, int(round(value))))
+def _working_area_from_draft() -> WorkingArea | None:
+    if state["mode"] == "polygon":
+        if state["polygon_finished"]:
+            return WorkingArea.from_polygon(state["polygon_points"])
+        return None
+
+    if state["mode"] == "rectangle":
+        rectangle_roi = state["rectangle_roi"]
+        if rectangle_roi is not None:
+            return WorkingArea.from_rectangle_bounds(rectangle_roi)
+
+    return None
 
 
-def _build_selection_inside_mask() -> np.ndarray | None:
+def _build_selection_inside_mask(working_area: WorkingArea) -> np.ndarray | None:
     image_width = int(state["image_width"])
     image_height = int(state["image_height"])
     if image_width <= 0 or image_height <= 0:
         return None
 
-    inside = np.zeros((image_height, image_width), dtype=np.uint8)
+    density_result = state.get("density_result")
+    if not isinstance(density_result, DensityProcessingResult):
+        return None
 
-    if state["polygon_finished"] and len(state["polygon_points"]) >= 3:
-        points_pixels = []
-        for world_x, world_y in state["polygon_points"]:
-            pixel = _world_to_preview_pixel(world_x, world_y)
-            if pixel is None:
-                return None
-            pixel_x, pixel_y = pixel
-            points_pixels.append(
-                [
-                    _clamp_pixel(pixel_x, image_width),
-                    _clamp_pixel(pixel_y, image_height),
-                ]
-            )
-
-        polygon = np.array(points_pixels, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(inside, [polygon], 1)
-        state["selection_kind"] = "polygon"
-        state["selection_polygon_points"] = list(state["polygon_points"])
-        return inside
-
-    rectangle_roi = state["rectangle_roi"]
-    if rectangle_roi is not None:
-        min_x, min_y, max_x, max_y = rectangle_roi
-        pixel_a = _world_to_preview_pixel(min_x, min_y)
-        pixel_b = _world_to_preview_pixel(max_x, max_y)
-        if pixel_a is None or pixel_b is None:
-            return None
-
-        ax, ay = pixel_a
-        bx, by = pixel_b
-        left = _clamp_pixel(min(ax, bx), image_width)
-        right = _clamp_pixel(max(ax, bx), image_width)
-        top = _clamp_pixel(min(ay, by), image_height)
-        bottom = _clamp_pixel(max(ay, by), image_height)
-        inside[top : bottom + 1, left : right + 1] = 1
-        state["selection_kind"] = "rectangle"
-        state["selection_polygon_points"] = []
-        return inside
-
-    return None
+    grid_mask = working_area.to_grid_mask(density_result.grid).astype(np.uint8)
+    preview_mask = np.flipud(grid_mask)
+    if preview_mask.shape != (image_height, image_width):
+        preview_mask = cv2.resize(
+            preview_mask,
+            (image_width, image_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return preview_mask
 
 
 def _update_selection_texture(inside_mask: np.ndarray) -> None:
@@ -2170,9 +2262,9 @@ def _update_selection_texture(inside_mask: np.ndarray) -> None:
     overlay[..., 3] = 0.62
     overlay[inside_mask > 0, 3] = 0.0
 
+    if dpg.does_item_exist(SELECTION_LAYER_TAG):
+        dpg.delete_item(SELECTION_LAYER_TAG)
     if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
-        state["selection_applied"] = False
-        _redraw_preview()
         dpg.delete_item(SELECTION_TEXTURE_TAG)
 
     with dpg.texture_registry():
@@ -2184,43 +2276,63 @@ def _update_selection_texture(inside_mask: np.ndarray) -> None:
         )
 
 
+def _report_working_area_apply_error(message: str) -> None:
+    if isinstance(state.get("active_working_area"), WorkingArea):
+        state["editing_overlay_visible"] = False
+        message += " Previous active Working Area restored; select a mode to continue."
+        _redraw_preview()
+    dpg.set_value(ROI_STATUS_TAG, message)
+
+
 def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    if (
-        state["rectangle_roi"] is None
-        and not state["polygon_finished"]
-        and len(state["polygon_points"]) > 0
-    ):
-        if not _finish_polygon():
+    density_result = state.get("density_result")
+    if not isinstance(density_result, DensityProcessingResult):
+        _report_working_area_apply_error(
+            "Build a density map before applying Working Area."
+        )
+        return
+
+    if state["mode"] == "polygon" and not state["polygon_finished"]:
+        if not state["polygon_points"] or not _finish_polygon():
+            _report_working_area_apply_error(
+                "Polygon Working Area needs at least 3 valid points."
+            )
             return
 
-    inside_mask = _build_selection_inside_mask()
+    if state["mode"] == "rectangle" and state["roi_first_world"] is not None:
+        _report_working_area_apply_error(
+            "Rectangle Working Area needs a second corner."
+        )
+        return
+
+    try:
+        working_area = _working_area_from_draft()
+    except ValueError as exc:
+        _report_working_area_apply_error(f"Invalid Working Area: {exc}")
+        return
+
+    if working_area is None:
+        _report_working_area_apply_error(
+            f"No finished {state['mode']} draft to apply."
+        )
+        return
+
+    inside_mask = _build_selection_inside_mask(working_area)
     if inside_mask is None:
-        dpg.set_value(ROI_STATUS_TAG, "No rectangle or finished polygon ROI to apply.")
+        _report_working_area_apply_error(
+            "Could not map Working Area to the current grid."
+        )
         return
 
     _update_selection_texture(inside_mask)
-    state["selection_applied"] = True
-    state["editing_overlay_visible"] = False
+    apply_working_area_state(state, working_area, density_result)
+    _update_working_area_info()
     _redraw_preview()
-    dpg.set_value(ROI_STATUS_TAG, "Selection applied.")
-
-
-def _edit_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["selection_applied"] = False
-    state["editing_overlay_visible"] = True
-    _redraw_preview()
-    dpg.set_value(ROI_STATUS_TAG, "Selection edit mode.")
+    dpg.set_value(ROI_STATUS_TAG, "Working Area applied.")
 
 
 def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    state["roi_first_world"] = None
-    state["rectangle_roi"] = None
-    state["polygon_points"] = []
-    state["polygon_finished"] = False
-    state["selection_applied"] = False
-    state["editing_overlay_visible"] = True
-    state["selection_kind"] = None
-    state["selection_polygon_points"] = []
+    clear_working_area_state(state)
 
     dpg.set_value(ROI_OUTPUT_TAG, "")
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
@@ -2230,7 +2342,8 @@ def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
     if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
         dpg.delete_item(SELECTION_TEXTURE_TAG)
 
-    dpg.set_value(ROI_STATUS_TAG, "Selection cleared.")
+    _update_working_area_info()
+    dpg.set_value(ROI_STATUS_TAG, "Working Area cleared.")
 
 
 def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -2427,6 +2540,7 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     state["pan_y"] = 0.0
     state["last_pan_mouse"] = None
     state["roi_first_world"] = None
+    state["roi_current_world"] = None
     state["rectangle_roi"] = None
     state["polygon_finished"] = False
     state["selection_applied"] = False
@@ -2434,6 +2548,8 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     state["selection_kind"] = None
     state["selection_polygon_points"] = []
     state["polygon_points"] = []
+    state["active_working_area"] = None
+    state["working_area_density_session"] = None
     state["last_brush_image"] = None
     state["last_brush_world"] = None
     state["brush_cursor_image"] = None
@@ -2454,6 +2570,7 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     _update_polygon_points_text()
     _update_mask_edits_count()
     _update_last_brush_debug()
+    _update_working_area_info()
     _redraw_preview()
     if state["contour_points"]:
         _set_status("Preview changed. Loaded contour may belong to another result.")
@@ -3148,7 +3265,7 @@ def run() -> None:
                 height=-55,
             ):
                 dpg.add_text(
-                    "Open a density or mask preview PNG to view it here.",
+                    "Select a point cloud and build the density map.",
                     tag="image_hint",
                 )
 
@@ -3164,6 +3281,11 @@ def run() -> None:
                 )
                 dpg.push_container_stack(workspace_header)
                 dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
+                dpg.add_text(
+                    "Working area: not selected",
+                    tag=WORKING_AREA_INFO_TAG,
+                    wrap=320,
+                )
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
                 dpg.add_button(label="Mask brush", callback=_mask_brush_mode_callback)
@@ -3174,7 +3296,6 @@ def run() -> None:
                 )
                 dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
-                dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
                 dpg.pop_container_stack()
 

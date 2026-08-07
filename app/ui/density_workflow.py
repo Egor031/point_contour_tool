@@ -9,6 +9,7 @@ import numpy as np
 from app.core.density_parameters import normalize_cell_size
 from app.core.density_grid import DensityGrid
 from app.core.preview_export import density_to_image
+from app.core.working_area import WorkingArea
 
 
 DENSITY_PREVIEW_MAX_SIZE = 3000
@@ -69,10 +70,128 @@ def grid_preview_params(grid: DensityGrid) -> tuple[float, float, float, int, in
     return grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height
 
 
+def apply_working_area_state(
+    target: MutableMapping[str, Any],
+    working_area: WorkingArea,
+    density_session: object | None,
+) -> None:
+    target["active_working_area"] = working_area
+    target["working_area_density_session"] = density_session
+    target["selection_applied"] = True
+    target["selection_kind"] = working_area.kind
+    target["selection_polygon_points"] = list(working_area.polygon_points)
+    target["editing_overlay_visible"] = False
+
+
+def enter_rectangle_mode_state(target: MutableMapping[str, Any]) -> None:
+    target["mode"] = "rectangle"
+    target["roi_first_world"] = None
+    target["roi_current_world"] = None
+    target["editing_overlay_visible"] = True
+
+
+def enter_polygon_mode_state(target: MutableMapping[str, Any]) -> None:
+    target["mode"] = "polygon"
+    target["roi_first_world"] = None
+    target["roi_current_world"] = None
+    target["editing_overlay_visible"] = True
+
+    if target.get("polygon_points"):
+        return
+
+    working_area = target.get("active_working_area")
+    if isinstance(working_area, WorkingArea) and working_area.kind == "polygon":
+        target["polygon_points"] = list(working_area.polygon_points)
+        target["polygon_finished"] = True
+
+
+def begin_rectangle_draft(
+    target: MutableMapping[str, Any],
+    anchor: tuple[float, float],
+) -> None:
+    target["editing_overlay_visible"] = True
+    target["rectangle_roi"] = None
+    target["roi_first_world"] = anchor
+    target["roi_current_world"] = anchor
+
+
+def update_rectangle_transient(
+    target: MutableMapping[str, Any],
+    current: tuple[float, float],
+) -> bool:
+    if target.get("mode") != "rectangle" or target.get("roi_first_world") is None:
+        return False
+    target["roi_current_world"] = current
+    return True
+
+
+def finish_rectangle_draft(
+    target: MutableMapping[str, Any],
+    second_point: tuple[float, float],
+) -> tuple[float, float, float, float] | None:
+    anchor = target.get("roi_first_world")
+    if anchor is None:
+        return None
+
+    first_x, first_y = anchor
+    second_x, second_y = second_point
+    bounds = (
+        min(first_x, second_x),
+        min(first_y, second_y),
+        max(first_x, second_x),
+        max(first_y, second_y),
+    )
+    target["rectangle_roi"] = bounds
+    target["roi_first_world"] = None
+    target["roi_current_world"] = None
+    return bounds
+
+
+def clear_polygon_draft_state(target: MutableMapping[str, Any]) -> None:
+    target["polygon_points"] = []
+    target["polygon_finished"] = False
+
+
+def active_working_area_is_visible(target: MutableMapping[str, Any]) -> bool:
+    return (
+        isinstance(target.get("active_working_area"), WorkingArea)
+        and not bool(target.get("editing_overlay_visible"))
+    )
+
+
+def working_area_draft_visibility(
+    target: MutableMapping[str, Any],
+) -> tuple[bool, bool]:
+    if not bool(target.get("editing_overlay_visible")):
+        return False, False
+    mode = target.get("mode")
+    return mode == "rectangle", mode == "polygon"
+
+
+def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
+    target.update(
+        {
+            "roi_first_world": None,
+            "roi_current_world": None,
+            "rectangle_roi": None,
+            "polygon_finished": False,
+            "selection_applied": False,
+            "editing_overlay_visible": False,
+            "selection_kind": None,
+            "selection_polygon_points": [],
+            "mode": "rectangle",
+            "polygon_points": [],
+            "active_working_area": None,
+            "working_area_density_session": None,
+        }
+    )
+
+
 def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
     target.update(
         {
             "roi_first_world": None,
+            "roi_current_world": None,
             "rectangle_roi": None,
             "polygon_finished": False,
             "selection_applied": False,
@@ -81,6 +200,8 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
             "selection_polygon_points": [],
             "mode": "rectangle",
             "polygon_points": [],
+            "active_working_area": None,
+            "working_area_density_session": None,
             "mask_edits": [],
             "last_brush_image": None,
             "last_brush_world": None,
