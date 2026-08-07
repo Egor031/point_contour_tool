@@ -272,11 +272,9 @@ def _update_density_session_info() -> None:
     cache_status = "cache" if result.density_from_cache else "calculated"
     dpg.set_value(
         DENSITY_SESSION_INFO_TAG,
-        f"File: {result.source_path.name}\n"
-        f"Points: {result.stats.point_count:,}\n"
-        f"Cell: {result.grid.cell_size:g} mm\n"
-        f"Grid: {result.grid.width} × {result.grid.height}\n"
-        f"Source: {cache_status}",
+        f"{result.source_path.name} | {result.stats.point_count:,} pts | "
+        f"cell {result.grid.cell_size:g} mm | "
+        f"grid {result.grid.width} x {result.grid.height} | {cache_status}",
     )
 
 
@@ -314,7 +312,7 @@ def _clear_source_dependent_ui_state() -> None:
     if dpg.does_item_exist(COORDS_TAG):
         dpg.set_value(
             COORDS_TAG,
-            "pixel_x=- pixel_y=- | grid_x=- grid_y=- | world_x=- world_y=-",
+            "World X: - | World Y: -",
         )
     if dpg.does_item_exist(DEBUG_COORDS_TAG):
         dpg.set_value(
@@ -1294,25 +1292,13 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
 
     coords = _mouse_to_world()
     if coords is None:
-        dpg.set_value(
-            COORDS_TAG,
-            "pixel_x=- pixel_y=- | grid_x=- grid_y=- | world_x=- world_y=-",
-        )
+        dpg.set_value(COORDS_TAG, "World X: - | World Y: -")
         return
 
-    pixel_x, pixel_y, grid_x, grid_y, world_x, world_y = coords
+    _pixel_x, _pixel_y, _grid_x, _grid_y, world_x, world_y = coords
     dpg.set_value(
         COORDS_TAG,
-        "pixel_x={:.1f} pixel_y={:.1f} | "
-        "grid_x={:.2f} grid_y={:.2f} | "
-        "world_x={:.6f} world_y={:.6f}".format(
-            pixel_x,
-            pixel_y,
-            grid_x,
-            grid_y,
-            world_x,
-            world_y,
-        ),
+        f"World X: {world_x:.6f} | World Y: {world_y:.6f}",
     )
 
 
@@ -3113,105 +3099,43 @@ def run() -> None:
         dpg.add_key_press_handler(callback=_key_press_callback)
 
     with dpg.window(label="Point Contour Preview Viewer", tag="main_window"):
-        dpg.add_text("Preview viewer for density/mask PNG images.")
         with dpg.collapsing_header(label="Source point cloud", default_open=True):
-            dpg.add_text("File")
             with dpg.group(horizontal=True):
-                dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-110)
+                dpg.add_text("File")
+                dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-390)
                 dpg.add_button(
                     label="Select",
                     tag=DENSITY_SELECT_BUTTON_TAG,
                     callback=lambda: dpg.show_item(DENSITY_SOURCE_DIALOG_TAG),
                 )
-            dpg.add_input_float(
-                label="Cell size, mm",
-                tag=DENSITY_CELL_SIZE_TAG,
-                default_value=0.8,
-                min_value=0.0,
-                width=260,
-            )
-            dpg.add_button(
-                label="Build density map",
-                tag=DENSITY_BUILD_BUTTON_TAG,
-                callback=_build_density_callback,
-            )
-            dpg.add_text(
-                "Processing stage: idle",
-                tag=DENSITY_PROGRESS_STAGE_TAG,
-            )
-            dpg.add_progress_bar(
-                default_value=0.0,
-                overlay="Idle",
-                width=400,
-                tag=DENSITY_PROGRESS_BAR_TAG,
-            )
-            dpg.add_text("0 B / 0 B", tag=DENSITY_PROGRESS_BYTES_TAG)
+                dpg.add_text("Cell, mm")
+                dpg.add_input_float(
+                    tag=DENSITY_CELL_SIZE_TAG,
+                    default_value=0.8,
+                    min_value=0.0,
+                    width=110,
+                )
+                dpg.add_button(
+                    label="Build density map",
+                    tag=DENSITY_BUILD_BUTTON_TAG,
+                    callback=_build_density_callback,
+                )
+            with dpg.group(horizontal=True):
+                dpg.add_progress_bar(
+                    default_value=0.0,
+                    overlay="Idle",
+                    width=320,
+                    tag=DENSITY_PROGRESS_BAR_TAG,
+                )
+                dpg.add_text(
+                    "Processing stage: idle",
+                    tag=DENSITY_PROGRESS_STAGE_TAG,
+                )
+                dpg.add_text("0 B / 0 B", tag=DENSITY_PROGRESS_BYTES_TAG)
             dpg.add_text(
                 "Density map has not been built.",
                 tag=DENSITY_SESSION_INFO_TAG,
             )
-        dpg.add_separator()
-        dpg.add_text("Legacy viewer / prepared artifacts")
-        dpg.add_button(
-            label="Open PNG",
-            callback=lambda: dpg.show_item("open_png_dialog"),
-        )
-        dpg.add_button(
-            label="Load processing result",
-            callback=lambda: dpg.show_item("open_processing_result_dialog"),
-        )
-        dpg.add_button(
-            label="Load result by source file",
-            callback=lambda: dpg.show_item("open_source_result_dialog"),
-        )
-        dpg.add_button(
-            label="Load report.txt",
-            callback=lambda: dpg.show_item("open_report_dialog"),
-        )
-        dpg.add_button(
-            label="Load holes.json",
-            callback=lambda: dpg.show_item("open_holes_dialog"),
-        )
-        dpg.add_button(
-            label="Load contour CSV",
-            callback=lambda: dpg.show_item("open_contour_dialog"),
-        )
-        dpg.add_button(
-            label="Load mixed contour JSON",
-            callback=lambda: dpg.show_item("open_mixed_contour_dialog"),
-        )
-        dpg.add_text("Select a point cloud and build the density map.", tag=STATUS_TAG)
-        dpg.add_separator()
-
-        with dpg.group(horizontal=True):
-            dpg.add_input_float(label="grid_min_x", tag=PARAM_GRID_MIN_X, default_value=0.0)
-            dpg.add_input_float(label="grid_min_y", tag=PARAM_GRID_MIN_Y, default_value=0.0)
-            dpg.add_input_float(label="cell_size", tag=PARAM_CELL_SIZE, default_value=1.0)
-
-        with dpg.group(horizontal=True):
-            dpg.add_input_int(
-                label="original_grid_width",
-                tag=PARAM_GRID_WIDTH,
-                default_value=0,
-                min_value=0,
-            )
-            dpg.add_input_int(
-                label="original_grid_height",
-                tag=PARAM_GRID_HEIGHT,
-                default_value=0,
-                min_value=0,
-            )
-
-        dpg.add_text(
-            "pixel_x=- pixel_y=- | grid_x=- grid_y=- | world_x=- world_y=-",
-            tag=COORDS_TAG,
-        )
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Reset view", callback=_reset_view_callback)
-            dpg.add_button(label="Zoom in", callback=_zoom_in_callback)
-            dpg.add_button(label="Zoom out", callback=_zoom_out_callback)
-            dpg.add_text("Zoom: 100%", tag=ZOOM_TEXT_TAG)
-        dpg.add_separator()
 
         with dpg.group(horizontal=True):
             with dpg.child_window(
@@ -3221,14 +3145,24 @@ def run() -> None:
                 no_scrollbar=True,
                 no_scroll_with_mouse=True,
                 width=-370,
+                height=-55,
             ):
                 dpg.add_text(
                     "Open a density or mask preview PNG to view it here.",
                     tag="image_hint",
                 )
 
-            with dpg.child_window(tag="roi_side_panel", width=350, border=True):
-                dpg.add_text("ROI tools")
+            with dpg.child_window(
+                tag="roi_side_panel",
+                width=350,
+                height=-55,
+                border=True,
+            ):
+                workspace_header = dpg.add_collapsing_header(
+                    label="Workspace",
+                    default_open=True,
+                )
+                dpg.push_container_stack(workspace_header)
                 dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
@@ -3242,8 +3176,17 @@ def run() -> None:
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
                 dpg.add_button(label="Edit selection", callback=_edit_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
-                dpg.add_separator()
-                dpg.add_text("Display layers")
+                dpg.pop_container_stack()
+
+                display_header = dpg.add_collapsing_header(
+                    label="Display",
+                    default_open=True,
+                )
+                dpg.push_container_stack(display_header)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Reset view", callback=_reset_view_callback)
+                    dpg.add_button(label="Zoom in", callback=_zoom_in_callback)
+                    dpg.add_button(label="Zoom out", callback=_zoom_out_callback)
                 dpg.add_checkbox(
                     label="Show ROI overlay",
                     tag=SHOW_ROI_OVERLAY_TAG,
@@ -3312,6 +3255,13 @@ def run() -> None:
                     default_value=True,
                     callback=lambda: _redraw_preview(),
                 )
+                dpg.pop_container_stack()
+
+                holes_header = dpg.add_collapsing_header(
+                    label="Holes",
+                    default_open=False,
+                )
+                dpg.push_container_stack(holes_header)
                 dpg.add_text(
                     "holes total: 0\naccepted: 0\nrejected: 0\ngroups count: 0",
                     tag=HOLES_STATS_TAG,
@@ -3406,6 +3356,13 @@ def run() -> None:
                     label="Apply group diameter",
                     callback=_apply_group_diameter_callback,
                 )
+                dpg.pop_container_stack()
+
+                contour_header = dpg.add_collapsing_header(
+                    label="Contour",
+                    default_open=False,
+                )
+                dpg.push_container_stack(contour_header)
                 dpg.add_text(
                     "Contour file: -\nContour points count: 0",
                     tag=CONTOUR_INFO_TAG,
@@ -3415,13 +3372,17 @@ def run() -> None:
                     "Mixed contour file: -\nElements: 0\nLines: 0\nPolyline gaps: 0",
                     tag=MIXED_CONTOUR_INFO_TAG,
                 )
-                dpg.add_text("Demo summary file: -", tag=DEMO_SUMMARY_INFO_TAG)
                 dpg.add_button(
                     label="Clear mixed contour",
                     callback=_clear_mixed_contour_callback,
                 )
-                dpg.add_separator()
-                dpg.add_text("Mask edit brush")
+                dpg.pop_container_stack()
+
+                mask_header = dpg.add_collapsing_header(
+                    label="Mask editing",
+                    default_open=False,
+                )
+                dpg.push_container_stack(mask_header)
                 dpg.add_text("Brush mode")
                 dpg.add_combo(
                     ["Remove from mask", "Add to mask"],
@@ -3455,7 +3416,77 @@ def run() -> None:
                     label="Save mask edits JSON",
                     callback=_save_mask_edits_callback,
                 )
+                dpg.pop_container_stack()
+
+                legacy_header = dpg.add_collapsing_header(
+                    label="Legacy / Debug",
+                    default_open=False,
+                )
+                dpg.push_container_stack(legacy_header)
+                dpg.add_text("Prepared artifacts")
+                dpg.add_button(
+                    label="Open PNG",
+                    callback=lambda: dpg.show_item("open_png_dialog"),
+                )
+                dpg.add_button(
+                    label="Load processing result",
+                    callback=lambda: dpg.show_item("open_processing_result_dialog"),
+                )
+                dpg.add_button(
+                    label="Load result by source file",
+                    callback=lambda: dpg.show_item("open_source_result_dialog"),
+                )
+                dpg.add_button(
+                    label="Load report.txt",
+                    callback=lambda: dpg.show_item("open_report_dialog"),
+                )
+                dpg.add_button(
+                    label="Load holes.json",
+                    callback=lambda: dpg.show_item("open_holes_dialog"),
+                )
+                dpg.add_button(
+                    label="Load contour CSV",
+                    callback=lambda: dpg.show_item("open_contour_dialog"),
+                )
+                dpg.add_button(
+                    label="Load mixed contour JSON",
+                    callback=lambda: dpg.show_item("open_mixed_contour_dialog"),
+                )
                 dpg.add_separator()
+                dpg.add_text("Legacy grid metadata")
+                dpg.add_input_float(
+                    label="grid_min_x",
+                    tag=PARAM_GRID_MIN_X,
+                    default_value=0.0,
+                    width=-1,
+                )
+                dpg.add_input_float(
+                    label="grid_min_y",
+                    tag=PARAM_GRID_MIN_Y,
+                    default_value=0.0,
+                    width=-1,
+                )
+                dpg.add_input_float(
+                    label="cell_size",
+                    tag=PARAM_CELL_SIZE,
+                    default_value=1.0,
+                    width=-1,
+                )
+                dpg.add_input_int(
+                    label="original_grid_width",
+                    tag=PARAM_GRID_WIDTH,
+                    default_value=0,
+                    min_value=0,
+                    width=-1,
+                )
+                dpg.add_input_int(
+                    label="original_grid_height",
+                    tag=PARAM_GRID_HEIGHT,
+                    default_value=0,
+                    min_value=0,
+                    width=-1,
+                )
+                dpg.add_text("Demo summary file: -", tag=DEMO_SUMMARY_INFO_TAG)
                 dpg.add_text("Coordinate debug")
                 dpg.add_text(
                     "mouse_screen_x=- mouse_screen_y=-\n"
@@ -3491,7 +3522,7 @@ def run() -> None:
                     with dpg.child_window(height=220, border=True):
                         dpg.add_text("Polygon points: none", tag=POLYGON_POINTS_TAG)
                 dpg.add_separator()
-                with dpg.tree_node(label="Command generator", default_open=True):
+                with dpg.tree_node(label="Command generator", default_open=False):
                     dpg.add_text("input_file_path")
                     dpg.add_input_text(
                         tag=CMD_INPUT_FILE_TAG,
@@ -3557,6 +3588,16 @@ def run() -> None:
                         label="Copy command to clipboard",
                         callback=_copy_command_callback,
                     )
+                dpg.pop_container_stack()
+
+        with dpg.group(horizontal=True):
+            dpg.add_text(
+                "Select a point cloud and build the density map.",
+                tag=STATUS_TAG,
+                wrap=430,
+            )
+            dpg.add_text("Zoom: 100%", tag=ZOOM_TEXT_TAG)
+            dpg.add_text("World X: - | World Y: -", tag=COORDS_TAG)
 
     dpg.create_viewport(title="Point Contour Preview Viewer", width=1200, height=850)
     dpg.setup_dearpygui()
