@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.core.density_parameters import normalize_cell_size
 from app.core.progress import ProgressCallback
 from app.core.xyz_reader import PointCloudStats, iter_xyz_points
 
@@ -15,6 +16,9 @@ class DensityGrid:
     cell_size: float
     min_x: float
     min_y: float
+
+    def __post_init__(self) -> None:
+        self.cell_size = normalize_cell_size(self.cell_size)
 
     @property
     def height(self) -> int:
@@ -31,6 +35,7 @@ def build_density_grid(
     cell_size: float,
     progress_callback: ProgressCallback | None = None,
 ) -> DensityGrid:
+    cell_size = normalize_cell_size(cell_size)
     if cell_size <= 0:
         raise ValueError("cell_size должен быть больше 0")
 

@@ -11,6 +11,10 @@ from typing import Any
 
 import numpy as np
 
+from app.core.density_parameters import (
+    CELL_SIZE_DECIMAL_PLACES,
+    normalize_cell_size,
+)
 from app.core.density_grid import DensityGrid
 from app.core.xyz_reader import PointCloudStats
 
@@ -51,7 +55,9 @@ def _cache_key(file_path: str | Path) -> str:
 
 
 def _cell_size_text(cell_size: float) -> str:
-    return format(float(cell_size), ".17g").replace(".", "_")
+    canonical_cell_size = normalize_cell_size(cell_size)
+    text = f"{canonical_cell_size:.{CELL_SIZE_DECIMAL_PLACES}f}"
+    return text.rstrip("0").rstrip(".").replace(".", "_")
 
 
 def stats_cache_path(file_path: str | Path, cache_dir: str | Path = "cache") -> Path:
@@ -199,6 +205,7 @@ def _expected_density_shape(
     stats: PointCloudStats,
     cell_size: float,
 ) -> tuple[int, int]:
+    cell_size = normalize_cell_size(cell_size)
     width = int(np.ceil(stats.width / cell_size)) + 1
     height = int(np.ceil(stats.height / cell_size)) + 1
     return height, width
@@ -209,13 +216,14 @@ def save_density_cache(
     file_path: str | Path,
     cache_dir: str | Path = "cache",
 ) -> None:
-    path = density_cache_path(file_path, grid.cell_size, cache_dir)
-    metadata_path = density_metadata_path(file_path, grid.cell_size, cache_dir)
+    cell_size = normalize_cell_size(grid.cell_size)
+    path = density_cache_path(file_path, cell_size, cache_dir)
+    metadata_path = density_metadata_path(file_path, cell_size, cache_dir)
     metadata = {
         "cache_version": CACHE_VERSION,
         "kind": "density",
         "source_signature": get_file_signature(file_path),
-        "cell_size": grid.cell_size,
+        "cell_size": cell_size,
         "grid": {
             "min_x": grid.min_x,
             "min_y": grid.min_y,
@@ -243,6 +251,7 @@ def load_density_cache(
     cell_size: float,
     cache_dir: str | Path = "cache",
 ) -> DensityGrid | None:
+    cell_size = normalize_cell_size(cell_size)
     path = density_cache_path(file_path, cell_size, cache_dir)
     metadata_path = density_metadata_path(file_path, cell_size, cache_dir)
     if not path.is_file() or not metadata_path.is_file():
@@ -285,7 +294,7 @@ def load_density_cache(
 
     expected_shape = _expected_density_shape(stats, cell_size)
     try:
-        cached_cell_size = float(cell_size_value)
+        cached_cell_size = normalize_cell_size(cell_size_value)
         cached_min_x = float(min_x_value)
         cached_min_y = float(min_y_value)
         cached_dtype = np.dtype(dtype_value)
@@ -293,7 +302,7 @@ def load_density_cache(
         return None
     cached_shape = tuple(shape_value)
 
-    if cached_cell_size != float(cell_size):
+    if cached_cell_size != cell_size:
         return None
     if cached_min_x != stats.min_x or cached_min_y != stats.min_y:
         return None

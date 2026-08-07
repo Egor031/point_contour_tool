@@ -13,6 +13,7 @@ from app.core.cache import (
     save_stats_cache,
 )
 from app.core.contour_extractor import ContourResult, build_external_contour
+from app.core.density_parameters import normalize_cell_size
 from app.core.density_grid import DensityGrid, build_density_grid
 from app.core.hole_detector import (
     HoleCandidate,
@@ -97,6 +98,7 @@ def prepare_density(
     progress_callback: ProgressCallback | None = None,
 ) -> DensityProcessingResult:
     source_path = Path(source_path)
+    cell_size = normalize_cell_size(cell_size)
     statistics_result = statistics or prepare_statistics(
         source_path=source_path,
         cache_dir=cache_dir,

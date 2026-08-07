@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from app.core.density_parameters import normalize_cell_size
 from app.core.density_grid import DensityGrid
 from app.core.preview_export import density_to_image
 
@@ -35,8 +35,10 @@ def validate_density_request(
     except (TypeError, ValueError) as exc:
         raise ValueError("Cell size must be numeric.") from exc
 
-    if not math.isfinite(validated_cell_size) or validated_cell_size <= 0:
-        raise ValueError("Cell size must be finite and greater than zero.")
+    try:
+        validated_cell_size = normalize_cell_size(validated_cell_size)
+    except ValueError as exc:
+        raise ValueError("Cell size must be finite and greater than zero.") from exc
 
     return source, validated_cell_size
 
