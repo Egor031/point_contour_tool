@@ -30,6 +30,7 @@ from app.core.mask_processing import (
     keep_largest_component,
     remove_small_components,
 )
+from app.core.progress import ProgressCallback
 from app.core.xyz_reader import PointCloudStats, compute_stats
 
 
@@ -72,6 +73,7 @@ def prepare_statistics(
     source_path: str | Path,
     cache_dir: str | Path = "cache",
     use_cache: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> StatisticsProcessingResult:
     source_path = Path(source_path)
 
@@ -79,7 +81,7 @@ def prepare_statistics(
     from_cache = stats is not None
 
     if stats is None:
-        stats = compute_stats(source_path)
+        stats = compute_stats(source_path, progress_callback=progress_callback)
         if use_cache:
             save_stats_cache(stats, cache_dir)
 
@@ -92,12 +94,14 @@ def prepare_density(
     cache_dir: str | Path = "cache",
     use_cache: bool = True,
     statistics: StatisticsProcessingResult | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> DensityProcessingResult:
     source_path = Path(source_path)
     statistics_result = statistics or prepare_statistics(
         source_path=source_path,
         cache_dir=cache_dir,
         use_cache=use_cache,
+        progress_callback=progress_callback,
     )
     stats = statistics_result.stats
 
@@ -109,7 +113,12 @@ def prepare_density(
     density_from_cache = grid is not None
 
     if grid is None:
-        grid = build_density_grid(source_path, stats, cell_size)
+        grid = build_density_grid(
+            source_path,
+            stats,
+            cell_size,
+            progress_callback=progress_callback,
+        )
         if use_cache:
             save_density_cache(grid, source_path, cache_dir)
 

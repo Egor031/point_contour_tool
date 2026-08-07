@@ -7,6 +7,12 @@ from typing import Iterator, Tuple
 
 from tqdm import tqdm
 
+from app.core.progress import ProcessingProgress, ProgressCallback, ProgressStage
+
+
+_MIN_PROGRESS_INTERVAL_BYTES = 1024 * 1024
+_MAX_PROGRESS_UPDATES = 1000
+
 
 @dataclass
 class PointCloudStats:
@@ -53,12 +59,33 @@ def iter_xyz_points(
     file_path: str | Path,
     show_progress: bool = False,
     desc: str = "Reading",
+    progress_callback: ProgressCallback | None = None,
+    progress_stage: ProgressStage | None = None,
 ) -> Iterator[Tuple[float, float, float]]:
     path = Path(file_path)
     total_size = path.stat().st_size
 
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        iterator = f
+    if progress_callback is not None and progress_stage is None:
+        raise ValueError("progress_stage is required when progress_callback is set")
+
+    progress_interval = max(
+        _MIN_PROGRESS_INTERVAL_BYTES,
+        (total_size + _MAX_PROGRESS_UPDATES - 1) // _MAX_PROGRESS_UPDATES,
+    )
+    next_progress_at = progress_interval
+    completed_bytes = 0
+
+    if progress_callback is not None:
+        progress_callback(
+            ProcessingProgress(
+                stage=progress_stage,
+                completed=0,
+                total=total_size,
+                fraction=0.0,
+            )
+        )
+
+    with path.open("rb") as file:
 
         if show_progress:
             progress = tqdm(
@@ -71,19 +98,51 @@ def iter_xyz_points(
             progress = None
 
         try:
-            for line in iterator:
+            for raw_line in file:
+                completed_bytes += len(raw_line)
                 if progress is not None:
-                    progress.update(len(line.encode("utf-8", errors="ignore")))
+                    progress.update(len(raw_line))
 
+                if (
+                    progress_callback is not None
+                    and completed_bytes >= next_progress_at
+                    and completed_bytes < total_size
+                ):
+                    progress_callback(
+                        ProcessingProgress(
+                            stage=progress_stage,
+                            completed=completed_bytes,
+                            total=total_size,
+                            fraction=completed_bytes / total_size,
+                        )
+                    )
+                    next_progress_at = (
+                        completed_bytes // progress_interval + 1
+                    ) * progress_interval
+
+                line = raw_line.decode("utf-8", errors="ignore")
                 point = parse_xyz_line(line)
                 if point is not None:
                     yield point
+
+            if progress_callback is not None:
+                progress_callback(
+                    ProcessingProgress(
+                        stage=progress_stage,
+                        completed=total_size,
+                        total=total_size,
+                        fraction=1.0,
+                    )
+                )
         finally:
             if progress is not None:
                 progress.close()
 
 
-def compute_stats(file_path: str | Path) -> PointCloudStats:
+def compute_stats(
+    file_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> PointCloudStats:
     path = Path(file_path)
 
     point_count = 0
@@ -95,7 +154,13 @@ def compute_stats(file_path: str | Path) -> PointCloudStats:
     min_z = float("inf")
     max_z = float("-inf")
 
-    for x, y, z in iter_xyz_points(path, show_progress=True, desc="Stats pass"):
+    for x, y, z in iter_xyz_points(
+        path,
+        show_progress=progress_callback is None,
+        desc="Stats pass",
+        progress_callback=progress_callback,
+        progress_stage="statistics",
+    ):
         point_count += 1
 
         if x < min_x:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.core.progress import ProgressCallback
 from app.core.xyz_reader import PointCloudStats, iter_xyz_points
 
 
@@ -28,6 +29,7 @@ def build_density_grid(
     file_path: str | Path,
     stats: PointCloudStats,
     cell_size: float,
+    progress_callback: ProgressCallback | None = None,
 ) -> DensityGrid:
     if cell_size <= 0:
         raise ValueError("cell_size должен быть больше 0")
@@ -43,7 +45,13 @@ def build_density_grid(
 
     density = np.zeros((height_cells, width_cells), dtype=np.uint32)
 
-    for x, y, _z in iter_xyz_points(file_path, show_progress=True, desc="Density pass"):
+    for x, y, _z in iter_xyz_points(
+        file_path,
+        show_progress=progress_callback is None,
+        desc="Density pass",
+        progress_callback=progress_callback,
+        progress_stage="density",
+    ):
         ix = int((x - stats.min_x) / cell_size)
         iy = int((y - stats.min_y) / cell_size)
 

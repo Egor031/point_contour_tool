@@ -11,14 +11,20 @@ import numpy as np
 
 from app.core.coordinate_transform import CoordinateTransform
 from app.core.density_grid import DensityGrid
-from app.services.coarse_processing import DensityProcessingResult, prepare_density
+from app.services.coarse_processing import DensityProcessingResult
 from app.ui.density_workflow import (
     SUPPORTED_POINT_CLOUD_EXTENSIONS,
-    density_grid_to_preview,
     grid_preview_params,
-    preview_to_texture_rgba,
     reset_source_dependent_state,
     validate_density_request,
+)
+from app.ui.density_worker import (
+    DensityWorker,
+    DensityWorkerError,
+    DensityWorkerProgress,
+    DensityWorkerResult,
+    format_progress_bytes,
+    progress_stage_label,
 )
 
 
@@ -76,6 +82,11 @@ DENSITY_SOURCE_FILE_TAG = "density_source_file"
 DENSITY_CELL_SIZE_TAG = "density_cell_size"
 DENSITY_SESSION_INFO_TAG = "density_session_info"
 DENSITY_SOURCE_DIALOG_TAG = "open_density_source_dialog"
+DENSITY_SELECT_BUTTON_TAG = "density_select_button"
+DENSITY_BUILD_BUTTON_TAG = "density_build_button"
+DENSITY_PROGRESS_STAGE_TAG = "density_progress_stage"
+DENSITY_PROGRESS_BAR_TAG = "density_progress_bar"
+DENSITY_PROGRESS_BYTES_TAG = "density_progress_bytes"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -142,9 +153,111 @@ state = {
     "report_loaded": False,
 }
 
+_density_worker = DensityWorker()
+
 
 def _set_status(message: str) -> None:
     dpg.set_value(STATUS_TAG, message)
+
+
+def _set_density_controls_enabled(enabled: bool) -> None:
+    for tag in (
+        DENSITY_SOURCE_FILE_TAG,
+        DENSITY_SELECT_BUTTON_TAG,
+        DENSITY_CELL_SIZE_TAG,
+        DENSITY_BUILD_BUTTON_TAG,
+    ):
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, enabled=enabled)
+
+
+def _set_density_progress_waiting() -> None:
+    dpg.set_value(DENSITY_PROGRESS_STAGE_TAG, "Processing stage: checking cache...")
+    dpg.set_value(DENSITY_PROGRESS_BAR_TAG, 0.0)
+    dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Waiting")
+    dpg.set_value(DENSITY_PROGRESS_BYTES_TAG, "Waiting for source-read progress...")
+
+
+def _apply_density_progress(message: DensityWorkerProgress) -> None:
+    progress = message.progress
+    dpg.set_value(
+        DENSITY_PROGRESS_STAGE_TAG,
+        f"Processing stage: {progress_stage_label(progress.stage)}",
+    )
+    dpg.set_value(DENSITY_PROGRESS_BAR_TAG, progress.fraction)
+    dpg.configure_item(
+        DENSITY_PROGRESS_BAR_TAG,
+        overlay=f"{progress.fraction * 100.0:.0f}%",
+    )
+    dpg.set_value(DENSITY_PROGRESS_BYTES_TAG, format_progress_bytes(progress))
+
+
+def _finish_density_worker_result(message: DensityWorkerResult) -> None:
+    result = message.result
+    try:
+        _show_density_result(result, message.preview, message.texture_rgba)
+    except Exception as exc:
+        dpg.set_value(DENSITY_PROGRESS_STAGE_TAG, "Processing stage: display failed")
+        dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Error")
+        _set_status(f"Could not display density map: {exc}")
+    else:
+        if result.stats_from_cache and result.density_from_cache:
+            dpg.set_value(
+                DENSITY_PROGRESS_STAGE_TAG,
+                "Processing stage: loaded cached density",
+            )
+            dpg.set_value(DENSITY_PROGRESS_BAR_TAG, 0.0)
+            dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Cache hit")
+            dpg.set_value(DENSITY_PROGRESS_BYTES_TAG, "No source read required")
+        elif result.density_from_cache:
+            dpg.set_value(
+                DENSITY_PROGRESS_STAGE_TAG,
+                "Processing stage: statistics complete; density loaded from cache",
+            )
+            dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Done")
+        else:
+            dpg.set_value(
+                DENSITY_PROGRESS_STAGE_TAG,
+                "Processing stage: density map ready",
+            )
+            dpg.set_value(DENSITY_PROGRESS_BAR_TAG, 1.0)
+            dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="100%")
+
+        if result.density_from_cache:
+            _set_status("Density map loaded from cache.")
+        else:
+            _set_status("Density map is ready.")
+    finally:
+        _density_worker.mark_finished()
+        _set_density_controls_enabled(True)
+
+
+def _finish_density_worker_error(message: DensityWorkerError) -> None:
+    dpg.set_value(DENSITY_PROGRESS_STAGE_TAG, "Processing stage: failed")
+    dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Error")
+    _set_status(f"Could not build density map: {message.error}")
+    _density_worker.mark_finished()
+    _set_density_controls_enabled(True)
+
+
+def _process_density_worker_messages() -> None:
+    pending_progress: DensityWorkerProgress | None = None
+    for message in _density_worker.drain_messages():
+        if isinstance(message, DensityWorkerProgress):
+            pending_progress = message
+            continue
+
+        if pending_progress is not None:
+            _apply_density_progress(pending_progress)
+            pending_progress = None
+
+        if isinstance(message, DensityWorkerResult):
+            _finish_density_worker_result(message)
+        else:
+            _finish_density_worker_error(message)
+
+    if pending_progress is not None:
+        _apply_density_progress(pending_progress)
 
 
 def _update_density_session_info() -> None:
@@ -273,6 +386,10 @@ def _show_density_result(
 
 
 def _select_density_source_callback(_sender, app_data) -> None:
+    if _density_worker.is_active:
+        _set_status("Density processing is already active.")
+        return
+
     selections = app_data.get("selections", {})
     if not selections:
         return
@@ -280,6 +397,10 @@ def _select_density_source_callback(_sender, app_data) -> None:
 
 
 def _build_density_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if _density_worker.is_active:
+        _set_status("Density processing is already active.")
+        return
+
     try:
         source_path, cell_size = validate_density_request(
             dpg.get_value(DENSITY_SOURCE_FILE_TAG),
@@ -289,20 +410,19 @@ def _build_density_callback(_sender=None, _app_data=None, _user_data=None) -> No
         _set_status(str(exc))
         return
 
-    _set_status("Building density map...")
     try:
-        result = prepare_density(source_path, cell_size=cell_size)
-        preview = density_grid_to_preview(result.grid)
-        texture_rgba = preview_to_texture_rgba(preview)
-        _show_density_result(result, preview, texture_rgba)
+        started = _density_worker.start(source_path, cell_size)
     except Exception as exc:
-        _set_status(f"Could not build density map: {exc}")
+        _set_status(f"Could not start density worker: {exc}")
         return
 
-    if result.density_from_cache:
-        _set_status("Density map loaded from cache.")
-    else:
-        _set_status("Density map is ready.")
+    if not started:
+        _set_status("Density processing is already active.")
+        return
+
+    _set_density_controls_enabled(False)
+    _set_density_progress_waiting()
+    _set_status("Building density map in background...")
 
 
 def _format_cli_float(value: float) -> str:
@@ -3000,6 +3120,7 @@ def run() -> None:
                 dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-110)
                 dpg.add_button(
                     label="Select",
+                    tag=DENSITY_SELECT_BUTTON_TAG,
                     callback=lambda: dpg.show_item(DENSITY_SOURCE_DIALOG_TAG),
                 )
             dpg.add_input_float(
@@ -3011,8 +3132,20 @@ def run() -> None:
             )
             dpg.add_button(
                 label="Build density map",
+                tag=DENSITY_BUILD_BUTTON_TAG,
                 callback=_build_density_callback,
             )
+            dpg.add_text(
+                "Processing stage: idle",
+                tag=DENSITY_PROGRESS_STAGE_TAG,
+            )
+            dpg.add_progress_bar(
+                default_value=0.0,
+                overlay="Idle",
+                width=400,
+                tag=DENSITY_PROGRESS_BAR_TAG,
+            )
+            dpg.add_text("0 B / 0 B", tag=DENSITY_PROGRESS_BYTES_TAG)
             dpg.add_text(
                 "Density map has not been built.",
                 tag=DENSITY_SESSION_INFO_TAG,
@@ -3429,7 +3562,9 @@ def run() -> None:
     dpg.setup_dearpygui()
     dpg.show_viewport()
     dpg.set_primary_window("main_window", True)
-    dpg.start_dearpygui()
+    while dpg.is_dearpygui_running():
+        _process_density_worker_messages()
+        dpg.render_dearpygui_frame()
     dpg.destroy_context()
 
 
