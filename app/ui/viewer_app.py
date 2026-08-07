@@ -10,6 +10,16 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 from app.core.coordinate_transform import CoordinateTransform
+from app.core.density_grid import DensityGrid
+from app.services.coarse_processing import DensityProcessingResult, prepare_density
+from app.ui.density_workflow import (
+    SUPPORTED_POINT_CLOUD_EXTENSIONS,
+    density_grid_to_preview,
+    grid_preview_params,
+    preview_to_texture_rgba,
+    reset_source_dependent_state,
+    validate_density_request,
+)
 
 
 TEXTURE_TAG = "preview_texture"
@@ -62,6 +72,10 @@ MANUAL_HOLE_PICK_TAG = "manual_hole_pick_center"
 CONTOUR_INFO_TAG = "contour_info_text"
 MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
 DEMO_SUMMARY_INFO_TAG = "demo_summary_info_text"
+DENSITY_SOURCE_FILE_TAG = "density_source_file"
+DENSITY_CELL_SIZE_TAG = "density_cell_size"
+DENSITY_SESSION_INFO_TAG = "density_session_info"
+DENSITY_SOURCE_DIALOG_TAG = "open_density_source_dialog"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -90,6 +104,9 @@ CANVAS_WIDTH = 2400
 CANVAS_HEIGHT = 1600
 
 state = {
+    "density_result": None,
+    "density_preview": None,
+    "texture_tag": TEXTURE_TAG,
     "image_width": 0,
     "image_height": 0,
     "zoom": 1.0,
@@ -130,12 +147,174 @@ def _set_status(message: str) -> None:
     dpg.set_value(STATUS_TAG, message)
 
 
+def _update_density_session_info() -> None:
+    if not dpg.does_item_exist(DENSITY_SESSION_INFO_TAG):
+        return
+
+    result = state["density_result"]
+    if result is None:
+        dpg.set_value(DENSITY_SESSION_INFO_TAG, "Density map has not been built.")
+        return
+
+    cache_status = "cache" if result.density_from_cache else "calculated"
+    dpg.set_value(
+        DENSITY_SESSION_INFO_TAG,
+        f"File: {result.source_path.name}\n"
+        f"Points: {result.stats.point_count:,}\n"
+        f"Cell: {result.grid.cell_size:g} mm\n"
+        f"Grid: {result.grid.width} × {result.grid.height}\n"
+        f"Source: {cache_status}",
+    )
+
+
+def _set_grid_parameter_values(grid: DensityGrid) -> None:
+    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = (
+        grid_preview_params(grid)
+    )
+    dpg.set_value(PARAM_GRID_MIN_X, grid_min_x)
+    dpg.set_value(PARAM_GRID_MIN_Y, grid_min_y)
+    dpg.set_value(PARAM_CELL_SIZE, cell_size)
+    dpg.set_value(PARAM_GRID_WIDTH, grid_width)
+    dpg.set_value(PARAM_GRID_HEIGHT, grid_height)
+    state["report_loaded"] = False
+
+
+def _clear_source_dependent_ui_state() -> None:
+    reset_source_dependent_state(state)
+
+    if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        dpg.delete_item(SELECTION_TEXTURE_TAG)
+    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
+        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
+    if dpg.does_item_exist(MANUAL_HOLE_X_TAG):
+        dpg.set_value(MANUAL_HOLE_X_TAG, 0.0)
+    if dpg.does_item_exist(MANUAL_HOLE_Y_TAG):
+        dpg.set_value(MANUAL_HOLE_Y_TAG, 0.0)
+    if dpg.does_item_exist(MOVE_HOLE_ID_TAG):
+        dpg.set_value(MOVE_HOLE_ID_TAG, 0)
+    if dpg.does_item_exist(ROI_STATUS_TAG):
+        dpg.set_value(ROI_STATUS_TAG, "ROI mode: click two image corners.")
+    if dpg.does_item_exist(ROI_OUTPUT_TAG):
+        dpg.set_value(ROI_OUTPUT_TAG, "")
+    if dpg.does_item_exist(POLYGON_OUTPUT_TAG):
+        dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    if dpg.does_item_exist(COORDS_TAG):
+        dpg.set_value(
+            COORDS_TAG,
+            "pixel_x=- pixel_y=- | grid_x=- grid_y=- | world_x=- world_y=-",
+        )
+    if dpg.does_item_exist(DEBUG_COORDS_TAG):
+        dpg.set_value(
+            DEBUG_COORDS_TAG,
+            "mouse_screen_x=- mouse_screen_y=-\n"
+            "draw_min_x=- draw_min_y=-\n"
+            "local_mouse_x=- local_mouse_y=-\n"
+            "image_x=- image_y=-\n"
+            "zoom=1\n"
+            "pan_x=0 pan_y=0\n"
+            "image_origin_x=0 image_origin_y=0",
+        )
+
+    _update_polygon_points_text()
+    _update_contour_info()
+    _update_holes_stats()
+    _update_hole_groups_display()
+    _update_hole_group_target_combo()
+    _update_mixed_contour_info()
+    _update_mask_edits_count()
+    _update_last_brush_debug()
+    _update_demo_summary_info()
+
+
+def _show_density_result(
+    result: DensityProcessingResult,
+    preview: np.ndarray,
+    texture_rgba: np.ndarray,
+) -> None:
+    preview_height, preview_width = preview.shape
+    new_texture_tag = f"{TEXTURE_TAG}_{id(result)}"
+
+    with dpg.texture_registry():
+        dpg.add_static_texture(
+            width=preview_width,
+            height=preview_height,
+            default_value=texture_rgba.ravel(),
+            tag=new_texture_tag,
+        )
+
+    if dpg.does_item_exist(IMAGE_TAG):
+        dpg.delete_item(IMAGE_TAG)
+    old_texture_tag = state["texture_tag"]
+    if dpg.does_item_exist(old_texture_tag):
+        dpg.delete_item(old_texture_tag)
+
+    if dpg.does_item_exist("image_hint"):
+        dpg.delete_item("image_hint")
+
+    state["density_result"] = result
+    state["density_preview"] = preview
+    state["texture_tag"] = new_texture_tag
+    state["image_width"] = preview_width
+    state["image_height"] = preview_height
+    state["zoom"] = 1.0
+    state["pan_x"] = 0.0
+    state["pan_y"] = 0.0
+    state["last_pan_mouse"] = None
+
+    _set_grid_parameter_values(result.grid)
+    _clear_source_dependent_ui_state()
+    if dpg.does_item_exist(CMD_INPUT_FILE_TAG):
+        dpg.set_value(CMD_INPUT_FILE_TAG, str(result.source_path))
+    if dpg.does_item_exist(CMD_CELL_TAG):
+        dpg.set_value(CMD_CELL_TAG, result.grid.cell_size)
+    dpg.set_value(ZOOM_TEXT_TAG, "Zoom: 100%")
+    _update_density_session_info()
+    _redraw_preview()
+
+
+def _select_density_source_callback(_sender, app_data) -> None:
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+    dpg.set_value(DENSITY_SOURCE_FILE_TAG, next(iter(selections.values())))
+
+
+def _build_density_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    try:
+        source_path, cell_size = validate_density_request(
+            dpg.get_value(DENSITY_SOURCE_FILE_TAG),
+            dpg.get_value(DENSITY_CELL_SIZE_TAG),
+        )
+    except ValueError as exc:
+        _set_status(str(exc))
+        return
+
+    _set_status("Building density map...")
+    try:
+        result = prepare_density(source_path, cell_size=cell_size)
+        preview = density_grid_to_preview(result.grid)
+        texture_rgba = preview_to_texture_rgba(preview)
+        _show_density_result(result, preview, texture_rgba)
+    except Exception as exc:
+        _set_status(f"Could not build density map: {exc}")
+        return
+
+    if result.density_from_cache:
+        _set_status("Density map loaded from cache.")
+    else:
+        _set_status("Density map is ready.")
+
+
 def _format_cli_float(value: float) -> str:
     text = f"{float(value):.6f}".rstrip("0").rstrip(".")
     return text or "0"
 
 
 def _get_preview_params() -> tuple[float, float, float, int, int] | None:
+    density_result = state["density_result"]
+    if density_result is not None:
+        return grid_preview_params(density_result.grid)
+
     grid_min_x = float(dpg.get_value(PARAM_GRID_MIN_X))
     grid_min_y = float(dpg.get_value(PARAM_GRID_MIN_Y))
     cell_size = float(dpg.get_value(PARAM_CELL_SIZE))
@@ -266,6 +445,9 @@ def _parse_report_text(text: str) -> tuple[float, float, float, int, int]:
 
 
 def _preview_grid_params_are_default() -> bool:
+    if state["density_result"] is not None:
+        return False
+
     params = _get_preview_params()
     if params is None:
         return True
@@ -420,7 +602,8 @@ def _set_zoom(
 
 
 def _redraw_preview() -> None:
-    if not dpg.does_item_exist(TEXTURE_TAG):
+    texture_tag = state["texture_tag"]
+    if not dpg.does_item_exist(texture_tag):
         return
 
     image_width = int(state["image_width"])
@@ -441,7 +624,7 @@ def _redraw_preview() -> None:
         pan_x = float(state["pan_x"])
         pan_y = float(state["pan_y"])
         dpg.draw_image(
-            TEXTURE_TAG,
+            texture_tag,
             (pan_x, pan_y),
             (pan_x + scaled_width, pan_y + scaled_height),
         )
@@ -1460,34 +1643,11 @@ def _reset_report_params() -> None:
 
 
 def _clear_loaded_result_state() -> None:
-    state["contour_points"] = []
-    state["contour_file"] = ""
-    state["holes"] = []
-    state["hole_groups"] = []
-    state["visible_hole_group_ids"] = {}
-    state["pick_manual_hole_center"] = False
-    state["manual_hole_center_world"] = None
-    state["suppress_brush_until_mouse_release"] = False
-    if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
-        dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
-    state["mixed_contour_elements"] = []
-    state["mixed_contour_file"] = ""
-    state["mask_edits"] = []
-    state["last_brush_image"] = None
-    state["last_brush_world"] = None
-    state["brush_cursor_image"] = None
-    state["active_brush_stroke_id"] = None
-    state["next_brush_stroke_id"] = 1
-    state["demo_summary_file"] = ""
+    state["density_result"] = None
+    state["density_preview"] = None
     _reset_report_params()
-    _update_contour_info()
-    _update_holes_stats()
-    _update_hole_groups_display()
-    _update_hole_group_target_combo()
-    _update_mixed_contour_info()
-    _update_mask_edits_count()
-    _update_last_brush_debug()
-    _update_demo_summary_info()
+    _clear_source_dependent_ui_state()
+    _update_density_session_info()
 
 
 def _undo_last_brush_stroke() -> bool:
@@ -2135,8 +2295,9 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
         dpg.delete_item(SELECTION_TEXTURE_TAG)
 
-    if dpg.does_item_exist(TEXTURE_TAG):
-        dpg.delete_item(TEXTURE_TAG)
+    old_texture_tag = state["texture_tag"]
+    if dpg.does_item_exist(old_texture_tag):
+        dpg.delete_item(old_texture_tag)
 
     with dpg.texture_registry():
         dpg.add_static_texture(
@@ -2149,6 +2310,10 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     if dpg.does_item_exist("image_hint"):
         dpg.delete_item("image_hint")
 
+    state["density_result"] = None
+    state["density_preview"] = None
+    state["texture_tag"] = TEXTURE_TAG
+    _update_density_session_info()
     state["image_width"] = width
     state["image_height"] = height
     state["zoom"] = 1.0
@@ -2441,7 +2606,7 @@ def _load_report(path: str | Path) -> None:
 
     state["report_loaded"] = True
     _update_last_brush_debug()
-    if dpg.does_item_exist(TEXTURE_TAG):
+    if dpg.does_item_exist(state["texture_tag"]):
         _redraw_preview()
 
     _set_status(
@@ -2718,6 +2883,17 @@ def run() -> None:
     with dpg.file_dialog(
         directory_selector=False,
         show=False,
+        callback=_select_density_source_callback,
+        tag=DENSITY_SOURCE_DIALOG_TAG,
+        width=700,
+        height=400,
+    ):
+        for extension in sorted(SUPPORTED_POINT_CLOUD_EXTENSIONS):
+            dpg.add_file_extension(extension, color=(255, 200, 120, 255))
+
+    with dpg.file_dialog(
+        directory_selector=False,
+        show=False,
         callback=_open_file_callback,
         tag="open_png_dialog",
         width=700,
@@ -2818,6 +2994,31 @@ def run() -> None:
 
     with dpg.window(label="Point Contour Preview Viewer", tag="main_window"):
         dpg.add_text("Preview viewer for density/mask PNG images.")
+        with dpg.collapsing_header(label="Source point cloud", default_open=True):
+            dpg.add_text("File")
+            with dpg.group(horizontal=True):
+                dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-110)
+                dpg.add_button(
+                    label="Select",
+                    callback=lambda: dpg.show_item(DENSITY_SOURCE_DIALOG_TAG),
+                )
+            dpg.add_input_float(
+                label="Cell size, mm",
+                tag=DENSITY_CELL_SIZE_TAG,
+                default_value=0.8,
+                min_value=0.0,
+                width=260,
+            )
+            dpg.add_button(
+                label="Build density map",
+                callback=_build_density_callback,
+            )
+            dpg.add_text(
+                "Density map has not been built.",
+                tag=DENSITY_SESSION_INFO_TAG,
+            )
+        dpg.add_separator()
+        dpg.add_text("Legacy viewer / prepared artifacts")
         dpg.add_button(
             label="Open PNG",
             callback=lambda: dpg.show_item("open_png_dialog"),
@@ -2846,7 +3047,7 @@ def run() -> None:
             label="Load mixed contour JSON",
             callback=lambda: dpg.show_item("open_mixed_contour_dialog"),
         )
-        dpg.add_text("No .asc/.xyz processing is performed here.", tag=STATUS_TAG)
+        dpg.add_text("Select a point cloud and build the density map.", tag=STATUS_TAG)
         dpg.add_separator()
 
         with dpg.group(horizontal=True):
