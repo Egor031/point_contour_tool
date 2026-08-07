@@ -5,13 +5,6 @@ import math
 import time
 from pathlib import Path
 
-from app.core.cache import (
-    load_density_cache,
-    load_stats_cache,
-    save_density_cache,
-    save_stats_cache,
-)
-from app.core.density_grid import build_density_grid
 from app.core.preview_export import (
     save_density_preview,
     save_report,
@@ -20,33 +13,21 @@ from app.core.preview_export import (
     save_contour_preview,
     save_holes_preview,
 )
-from app.core.mask_processing import (
-    apply_polygon_roi_to_mask,
-    apply_roi_to_mask,
-    build_mask_from_density,
-    fill_small_holes,
-    keep_largest_component,
-    remove_small_components,
-)
 from app.core.mask_edits import (
-    apply_mask_edits,
     load_mask_edits,
     save_mask_edits_debug_preview,
 )
 from app.core.contour_extractor import (
-    build_external_contour,
     save_contour_csv,
 )
 
 from app.core.hole_detector import (
-    cluster_holes_by_diameter,
-    detect_circular_holes,
     save_holes_csv,
     save_holes_json,
 )
 from app.core.line_approximation import run_line_approximation
 
-from app.core.xyz_reader import compute_stats, export_decimated_points
+from app.core.xyz_reader import export_decimated_points
 
 from app.exporters.boundary_xyz_exporter import (
     build_boundary_band_mask,
@@ -54,6 +35,13 @@ from app.exporters.boundary_xyz_exporter import (
 )
 from app.exporters.clean_xyz_exporter import export_clean_points
 from app.exporters.dxf_exporter import load_holes_json_circles, save_contour_dxf
+from app.services.coarse_processing import (
+    build_processing_masks,
+    extract_preliminary_contour,
+    find_hole_candidates,
+    prepare_density,
+    prepare_statistics,
+)
 
 
 def parse_roi_poly(value: str) -> list[tuple[float, float]]:
@@ -659,17 +647,17 @@ def main() -> None:
 
     print("\n[1/3] Считаем или загружаем статистику файла...")
 
-    stats = None
-    if not args.no_cache:
-        stats = load_stats_cache(input_path, cache_dir)
+    statistics_result = prepare_statistics(
+        source_path=input_path,
+        cache_dir=cache_dir,
+        use_cache=not args.no_cache,
+    )
+    stats = statistics_result.stats
 
-    if stats is not None:
+    if statistics_result.from_cache:
         print("Статистика загружена из кэша.")
-    else:
-        stats = compute_stats(input_path)
-        if not args.no_cache:
-            save_stats_cache(stats, cache_dir)
-            print("Статистика сохранена в кэш.")
+    elif not args.no_cache:
+        print("Статистика сохранена в кэш.")
 
     t1 = time.perf_counter()
 
@@ -681,17 +669,19 @@ def main() -> None:
 
     print("\n[2/3] Строим или загружаем карту плотности...")
 
-    grid = None
-    if not args.no_cache:
-        grid = load_density_cache(input_path, stats, args.cell, cache_dir)
+    density_result = prepare_density(
+        source_path=input_path,
+        cell_size=args.cell,
+        cache_dir=cache_dir,
+        use_cache=not args.no_cache,
+        statistics=statistics_result,
+    )
+    grid = density_result.grid
 
-    if grid is not None:
+    if density_result.density_from_cache:
         print("Density grid загружен из кэша.")
-    else:
-        grid = build_density_grid(input_path, stats, args.cell)
-        if not args.no_cache:
-            save_density_cache(grid, input_path, cache_dir)
-            print("Density grid сохранён в кэш.")
+    elif not args.no_cache:
+        print("Density grid сохранён в кэш.")
 
     t2 = time.perf_counter()
     print(f"Время подготовки density grid: {t2 - t1:.2f} сек")
@@ -760,30 +750,30 @@ def main() -> None:
             max_size=args.preview_size,
         )
 
-    if args.threshold == "auto":
-        mask_result = build_mask_from_density(
-            grid.density,
-            mode="auto",
-        )
-    else:
+    threshold_mode = "auto"
+    manual_threshold = None
+    if args.threshold != "auto":
+        threshold_mode = "manual"
         manual_threshold = float(args.threshold)
-        mask_result = build_mask_from_density(
-            grid.density,
-            mode="manual",
-            manual_threshold=manual_threshold,
-        )
 
-    mask = mask_result.mask
+    roi = tuple(args.roi) if args.roi is not None else None
+    mask_edits = load_mask_edits(args.mask_edits) if args.mask_edits else None
+    masks = build_processing_masks(
+        grid=grid,
+        threshold_mode=threshold_mode,
+        manual_threshold=manual_threshold,
+        min_component_area=args.min_component_area,
+        keep_largest=args.keep_largest,
+        roi=roi,
+        polygon_roi=args.roi_poly,
+        mask_edits=mask_edits,
+        fill_holes_area=args.fill_holes_area,
+    )
+    mask_result = masks.threshold_result
+    mask_for_holes = masks.mask_for_holes
+    mask = masks.contour_mask
 
-    if args.min_component_area > 0:
-        mask = remove_small_components(mask, args.min_component_area)
-
-    if args.keep_largest:
-        mask = keep_largest_component(mask)
-
-    if args.roi is not None:
-        roi = tuple(args.roi)
-        mask = apply_roi_to_mask(mask, grid, roi)
+    if roi is not None:
         print(
             "Applied ROI: "
             f"min_x={roi[0]:.3f}, min_y={roi[1]:.3f}, "
@@ -791,19 +781,29 @@ def main() -> None:
         )
 
     if args.roi_poly is not None:
-        mask = apply_polygon_roi_to_mask(mask, grid, args.roi_poly)
+        mask_after_polygon = masks.mask_before_edits
+        if mask_after_polygon is None:
+            mask_after_polygon = mask_for_holes
         print(
             "Applied polygon ROI: "
-            f"points={len(args.roi_poly)}, mask_cells={int(mask.sum()):,}"
+            f"points={len(args.roi_poly)}, "
+            f"mask_cells={int(mask_after_polygon.sum()):,}"
         )
 
     if args.mask_edits:
-        mask_edits = load_mask_edits(args.mask_edits)
-        mask_before_edits = mask.copy()
-        mask_cells_before_edits = int(mask.sum())
-        mask, mask_edits_stats = apply_mask_edits(mask, grid, mask_edits)
-        mask_cells_after_edits = int(mask.sum())
-        mask_cells_changed_by_edits = int((mask != mask_before_edits).sum())
+        mask_before_edits = masks.mask_before_edits
+        mask_edits_stats = masks.mask_edits_stats
+        if (
+            mask_before_edits is None
+            or mask_edits_stats is None
+            or mask_edits is None
+        ):
+            raise RuntimeError("Mask edits result is incomplete")
+        mask_cells_before_edits = int(mask_before_edits.sum())
+        mask_cells_after_edits = int(mask_for_holes.sum())
+        mask_cells_changed_by_edits = int(
+            (mask_for_holes != mask_before_edits).sum()
+        )
         print(f"Applied mask edits: {len(mask_edits):,}")
         print(f"Mask cells before edits: {mask_cells_before_edits:,}")
         print(f"Mask cells after edits:  {mask_cells_after_edits:,}")
@@ -826,7 +826,11 @@ def main() -> None:
             f"{mask_edits_stats.pixel_min_ix}, {mask_edits_stats.pixel_min_iy} .. "
             f"{mask_edits_stats.pixel_max_ix}, {mask_edits_stats.pixel_max_iy}"
         )
-        save_mask_preview(mask, mask_after_edits_path, max_size=args.preview_size)
+        save_mask_preview(
+            mask_for_holes,
+            mask_after_edits_path,
+            max_size=args.preview_size,
+        )
         save_mask_edits_debug_preview(
             mask=mask_before_edits,
             grid=grid,
@@ -834,19 +838,6 @@ def main() -> None:
             output_path=mask_edits_debug_path,
             max_size=args.preview_size,
         )
-    
-
-    # Эту маску используем для поиска отверстий.
-    # Она уже очищена от внешнего мусора, но дырки ещё не залиты.
-    mask_for_holes = mask.copy()
-
-    # А эту маску используем для внешнего контура.
-    if args.fill_holes_area > 0:
-        mask = fill_small_holes(mask, args.fill_holes_area)
-
-    if args.fill_holes_area > 0:
-        mask = fill_small_holes(mask, args.fill_holes_area)
-
     holes = []
     hole_groups = []
 
@@ -855,18 +846,16 @@ def main() -> None:
             None if args.max_hole_diameter_mm <= 0 else args.max_hole_diameter_mm
         )
 
-        holes = detect_circular_holes(
-            mask=mask_for_holes,
-            grid=grid,
+        hole_detection_result = find_hole_candidates(
+            masks=masks,
             min_diameter_mm=args.min_hole_diameter_mm,
             max_diameter_mm=max_hole_diameter,
             min_circularity=args.min_circularity,
             max_error_ratio=args.max_circle_error_ratio,
+            group_tolerance_mm=args.hole_group_tolerance_mm,
         )
-        hole_groups = cluster_holes_by_diameter(
-            holes=holes,
-            tolerance_mm=args.hole_group_tolerance_mm,
-        )
+        holes = hole_detection_result.candidates
+        hole_groups = hole_detection_result.groups
 
         save_holes_csv(
             holes=holes,
@@ -932,9 +921,8 @@ def main() -> None:
     contour_result = None
 
     if args.contour:
-        contour_result = build_external_contour(
-            mask=mask,
-            grid=grid,
+        contour_result = extract_preliminary_contour(
+            masks=masks,
             simplify_mm=args.simplify_mm,
         )
 
