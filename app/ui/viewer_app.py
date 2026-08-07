@@ -9,6 +9,8 @@ import cv2
 import dearpygui.dearpygui as dpg
 import numpy as np
 
+from app.core.coordinate_transform import CoordinateTransform
+
 
 TEXTURE_TAG = "preview_texture"
 SELECTION_TEXTURE_TAG = "selection_dim_texture"
@@ -144,6 +146,25 @@ def _get_preview_params() -> tuple[float, float, float, int, int] | None:
         return None
 
     return grid_min_x, grid_min_y, cell_size, grid_width, grid_height
+
+
+def _get_coordinate_transform() -> CoordinateTransform | None:
+    params = _get_preview_params()
+    preview_width = int(state["image_width"])
+    preview_height = int(state["image_height"])
+    if params is None or preview_width <= 0 or preview_height <= 0:
+        return None
+
+    grid_min_x, grid_min_y, cell_size, grid_width, grid_height = params
+    return CoordinateTransform(
+        grid_min_x=grid_min_x,
+        grid_min_y=grid_min_y,
+        cell_size=cell_size,
+        grid_width=grid_width,
+        grid_height=grid_height,
+        preview_width=preview_width,
+        preview_height=preview_height,
+    )
 
 
 def _parse_report_float_value(value: str) -> float:
@@ -283,6 +304,16 @@ def _scaled_image_size() -> tuple[int, int]:
     return width, height
 
 
+def _preview_to_draw_scales() -> tuple[float, float]:
+    image_width = int(state["image_width"])
+    image_height = int(state["image_height"])
+    if image_width <= 0 or image_height <= 0:
+        return 1.0, 1.0
+
+    scaled_width, scaled_height = _scaled_image_size()
+    return scaled_width / image_width, scaled_height / image_height
+
+
 def _image_origin() -> tuple[float, float]:
     return float(state["pan_x"]), float(state["pan_y"])
 
@@ -306,44 +337,45 @@ def screen_to_image(mouse_x: float, mouse_y: float) -> tuple[float, float] | Non
     if zoom <= 0:
         return None
 
-    image_x = (canvas_x - origin_x) / zoom
-    image_y = (canvas_y - origin_y) / zoom
-
     image_width = int(state["image_width"])
     image_height = int(state["image_height"])
-    if image_x < 0 or image_y < 0 or image_x >= image_width or image_y >= image_height:
+    if image_width <= 0 or image_height <= 0:
         return None
 
-    return image_x, image_y
+    draw_scale_x, draw_scale_y = _preview_to_draw_scales()
+    image_edge_x = (canvas_x - origin_x) / draw_scale_x
+    image_edge_y = (canvas_y - origin_y) / draw_scale_y
+    if (
+        image_edge_x < 0
+        or image_edge_y < 0
+        or image_edge_x >= image_width
+        or image_edge_y >= image_height
+    ):
+        return None
+
+    return image_edge_x - 0.5, image_edge_y - 0.5
 
 
 def image_to_drawlist(image_x: float, image_y: float) -> tuple[float, float]:
     origin_x, origin_y = _image_origin()
-    zoom = float(state["zoom"])
-    return origin_x + image_x * zoom, origin_y + image_y * zoom
+    draw_scale_x, draw_scale_y = _preview_to_draw_scales()
+    return (
+        origin_x + (image_x + 0.5) * draw_scale_x,
+        origin_y + (image_y + 0.5) * draw_scale_y,
+    )
 
 
 def image_to_world(
     image_x: float,
     image_y: float,
 ) -> tuple[float, float, float, float] | None:
-    image_width = int(state["image_width"])
-    image_height = int(state["image_height"])
-    if image_width <= 0 or image_height <= 0:
+    transform = _get_coordinate_transform()
+    if transform is None:
         return None
 
-    params = _get_preview_params()
-    if params is None:
-        return None
-
-    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
-    displayed_grid_x = image_x
-    original_grid_y = (grid_height - 1) - image_y
-
-    world_x = grid_min_x + (displayed_grid_x + 0.5) * cell_size
-    world_y = grid_min_y + (original_grid_y + 0.5) * cell_size
-
-    return displayed_grid_x, original_grid_y, world_x, world_y
+    grid_x, grid_y = transform.preview_to_grid(image_x, image_y)
+    world_x, world_y = transform.grid_to_world(grid_x, grid_y)
+    return grid_x, grid_y, world_x, world_y
 
 
 def screen_to_world(
@@ -458,51 +490,23 @@ def _mouse_to_world() -> tuple[float, float, float, float, float, float] | None:
     return screen_to_world(mouse_x, mouse_y)
 
 
-def _world_to_image_pixel(world_x: float, world_y: float) -> tuple[float, float] | None:
-    image_width = int(state["image_width"])
-    image_height = int(state["image_height"])
-    if image_width <= 0 or image_height <= 0:
+def _world_to_drawlist(world_x: float, world_y: float) -> tuple[float, float] | None:
+    transform = _get_coordinate_transform()
+    if transform is None:
         return None
 
-    params = _get_preview_params()
-    if params is None:
-        return None
-
-    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
-
-    grid_x = (world_x - grid_min_x) / cell_size - 0.5
-    original_grid_y = (world_y - grid_min_y) / cell_size - 0.5
-    displayed_grid_y = (grid_height - 1) - original_grid_y
-
-    pixel_x = grid_x
-    pixel_y = displayed_grid_y
-
-    return image_to_drawlist(pixel_x, pixel_y)
+    return image_to_drawlist(*transform.world_to_preview(world_x, world_y))
 
 
-def _world_to_original_image_pixel(
+def _world_to_preview_pixel(
     world_x: float,
     world_y: float,
 ) -> tuple[float, float] | None:
-    image_width = int(state["image_width"])
-    image_height = int(state["image_height"])
-    if image_width <= 0 or image_height <= 0:
+    transform = _get_coordinate_transform()
+    if transform is None:
         return None
 
-    params = _get_preview_params()
-    if params is None:
-        return None
-
-    grid_min_x, grid_min_y, cell_size, _grid_width, grid_height = params
-
-    grid_x = (world_x - grid_min_x) / cell_size - 0.5
-    original_grid_y = (world_y - grid_min_y) / cell_size - 0.5
-    displayed_grid_y = (grid_height - 1) - original_grid_y
-
-    pixel_x = grid_x
-    pixel_y = displayed_grid_y
-
-    return pixel_x, pixel_y
+    return transform.world_to_preview(world_x, world_y)
 
 
 def _update_polygon_points_text() -> None:
@@ -568,8 +572,8 @@ def _redraw_polygon_overlay() -> None:
     rectangle_roi = state["rectangle_roi"]
     if rectangle_roi is not None:
         min_x, min_y, max_x, max_y = rectangle_roi
-        pixel_a = _world_to_image_pixel(min_x, min_y)
-        pixel_b = _world_to_image_pixel(max_x, max_y)
+        pixel_a = _world_to_drawlist(min_x, min_y)
+        pixel_b = _world_to_drawlist(max_x, max_y)
         if pixel_a is not None and pixel_b is not None:
             ax, ay = pixel_a
             bx, by = pixel_b
@@ -583,7 +587,7 @@ def _redraw_polygon_overlay() -> None:
 
     pixel_points = []
     for world_x, world_y in state["polygon_points"]:
-        pixel_point = _world_to_image_pixel(world_x, world_y)
+        pixel_point = _world_to_drawlist(world_x, world_y)
         if pixel_point is not None:
             pixel_points.append(pixel_point)
 
@@ -623,19 +627,40 @@ def _redraw_polygon_overlay() -> None:
         )
 
 
-def _brush_radius_to_draw_radius(radius_mm: float) -> float:
-    params = _get_preview_params()
-    if params is None:
-        return 1.0
+def _world_radius_to_draw_radii(radius_mm: float) -> tuple[float, float]:
+    transform = _get_coordinate_transform()
+    if transform is None:
+        return 1.0, 1.0
 
-    _grid_min_x, _grid_min_y, cell_size, grid_width, _grid_height = params
-    image_width = int(state["image_width"])
-    if cell_size <= 0 or grid_width <= 0 or image_width <= 0:
-        return 1.0
+    radius_preview_x, radius_preview_y = transform.world_radius_to_preview(
+        radius_mm
+    )
+    draw_scale_x, draw_scale_y = _preview_to_draw_scales()
+    return (
+        max(1.0, radius_preview_x * draw_scale_x),
+        max(1.0, radius_preview_y * draw_scale_y),
+    )
 
-    radius_cells = radius_mm / cell_size
-    radius_image_px = radius_cells * image_width / grid_width
-    return max(1.0, radius_image_px * float(state["zoom"]))
+
+def _draw_world_radius_ellipse(
+    center: tuple[float, float],
+    radii: tuple[float, float],
+    *,
+    color: tuple[int, int, int, int],
+    fill: tuple[int, int, int, int],
+    thickness: float,
+    parent: str,
+) -> None:
+    center_x, center_y = center
+    radius_x, radius_y = radii
+    dpg.draw_ellipse(
+        (center_x - radius_x, center_y - radius_y),
+        (center_x + radius_x, center_y + radius_y),
+        color=color,
+        fill=fill,
+        thickness=thickness,
+        parent=parent,
+    )
 
 
 def _get_brush_edit_mode() -> str:
@@ -676,15 +701,15 @@ def _redraw_mask_edits_overlay() -> None:
         elif not _display_layer_enabled(SHOW_MASK_REMOVE_EDITS_TAG):
             continue
 
-        pixel_point = _world_to_image_pixel(edit["x"], edit["y"])
+        pixel_point = _world_to_drawlist(edit["x"], edit["y"])
         if pixel_point is None:
             continue
 
-        radius = _brush_radius_to_draw_radius(edit["radius_mm"])
+        radii = _world_radius_to_draw_radii(edit["radius_mm"])
         color, fill = _brush_edit_colors(edit_mode)
-        dpg.draw_circle(
+        _draw_world_radius_ellipse(
             pixel_point,
-            radius,
+            radii,
             color=color,
             fill=fill,
             thickness=2,
@@ -707,14 +732,14 @@ def _redraw_brush_cursor_overlay() -> None:
         return
 
     radius_mm = max(0.001, float(dpg.get_value(BRUSH_SIZE_TAG)))
-    radius = _brush_radius_to_draw_radius(radius_mm)
+    radii = _world_radius_to_draw_radii(radius_mm)
     center = image_to_drawlist(*image_pos)
     color, _fill = _brush_edit_colors(_get_brush_edit_mode())
 
     dpg.add_draw_layer(parent=IMAGE_TAG, tag=BRUSH_CURSOR_LAYER_TAG)
-    dpg.draw_circle(
+    _draw_world_radius_ellipse(
         center,
-        radius,
+        radii,
         color=color,
         fill=(0, 0, 0, 0),
         thickness=2,
@@ -734,18 +759,6 @@ def _update_brush_cursor_from_mouse() -> None:
 
     state["brush_cursor_image"] = image_pos
     _redraw_brush_cursor_overlay()
-
-
-def _hole_draw_radius(radius_mm: float) -> float:
-    params = _get_preview_params()
-    if params is None:
-        return 1.0
-
-    _grid_min_x, _grid_min_y, cell_size, _grid_width, _grid_height = params
-    if cell_size <= 0:
-        return 1.0
-
-    return max(1.0, radius_mm / cell_size * float(state["zoom"]))
 
 
 def _hole_overlay_colors(
@@ -811,22 +824,22 @@ def _redraw_holes_overlay() -> None:
         elif not _display_layer_enabled(SHOW_REJECTED_HOLES_TAG):
             continue
 
-        center = _world_to_image_pixel(hole["center_x"], hole["center_y"])
+        center = _world_to_drawlist(hole["center_x"], hole["center_y"])
         if center is None:
             continue
 
-        radius = _hole_draw_radius(displayed_radius)
+        radii = _world_radius_to_draw_radii(displayed_radius)
         color, fill = _hole_overlay_colors(accepted)
-        dpg.draw_circle(
+        _draw_world_radius_ellipse(
             center,
-            radius,
+            radii,
             color=color,
             fill=fill,
             thickness=2,
             parent=HOLES_LAYER_TAG,
         )
         dpg.draw_text(
-            (center[0] + radius + 4, center[1] - 7),
+            (center[0] + radii[0] + 4, center[1] - 7),
             str(hole.get("id", "")),
             color=color,
             size=14,
@@ -845,7 +858,7 @@ def _redraw_manual_hole_center_overlay() -> None:
     if center_world is None:
         return
 
-    pixel_point = _world_to_image_pixel(center_world[0], center_world[1])
+    pixel_point = _world_to_drawlist(center_world[0], center_world[1])
     if pixel_point is None:
         return
 
@@ -888,7 +901,7 @@ def _redraw_contour_overlay() -> None:
 
     draw_points = []
     for world_x, world_y in contour_points:
-        point = _world_to_image_pixel(world_x, world_y)
+        point = _world_to_drawlist(world_x, world_y)
         if point is not None:
             draw_points.append(point)
 
@@ -939,8 +952,8 @@ def _redraw_mixed_contour_overlay() -> None:
                 continue
             start = element.get("start", {})
             end = element.get("end", {})
-            point_a = _world_to_image_pixel(float(start["x"]), float(start["y"]))
-            point_b = _world_to_image_pixel(float(end["x"]), float(end["y"]))
+            point_a = _world_to_drawlist(float(start["x"]), float(start["y"]))
+            point_b = _world_to_drawlist(float(end["x"]), float(end["y"]))
             if point_a is None or point_b is None:
                 continue
 
@@ -956,7 +969,7 @@ def _redraw_mixed_contour_overlay() -> None:
                 continue
             draw_points = []
             for point in element.get("points", []):
-                draw_point = _world_to_image_pixel(float(point["x"]), float(point["y"]))
+                draw_point = _world_to_drawlist(float(point["x"]), float(point["y"]))
                 if draw_point is not None:
                     draw_points.append(draw_point)
 
@@ -1846,7 +1859,7 @@ def _build_selection_inside_mask() -> np.ndarray | None:
     if state["polygon_finished"] and len(state["polygon_points"]) >= 3:
         points_pixels = []
         for world_x, world_y in state["polygon_points"]:
-            pixel = _world_to_original_image_pixel(world_x, world_y)
+            pixel = _world_to_preview_pixel(world_x, world_y)
             if pixel is None:
                 return None
             pixel_x, pixel_y = pixel
@@ -1866,8 +1879,8 @@ def _build_selection_inside_mask() -> np.ndarray | None:
     rectangle_roi = state["rectangle_roi"]
     if rectangle_roi is not None:
         min_x, min_y, max_x, max_y = rectangle_roi
-        pixel_a = _world_to_original_image_pixel(min_x, min_y)
-        pixel_b = _world_to_original_image_pixel(max_x, max_y)
+        pixel_a = _world_to_preview_pixel(min_x, min_y)
+        pixel_b = _world_to_preview_pixel(max_x, max_y)
         if pixel_a is None or pixel_b is None:
             return None
 
@@ -2428,6 +2441,8 @@ def _load_report(path: str | Path) -> None:
 
     state["report_loaded"] = True
     _update_last_brush_debug()
+    if dpg.does_item_exist(TEXTURE_TAG):
+        _redraw_preview()
 
     _set_status(
         "Report loaded: "
