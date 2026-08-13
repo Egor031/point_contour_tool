@@ -81,6 +81,23 @@ def apply_working_area_state(
     target["selection_kind"] = working_area.kind
     target["selection_polygon_points"] = list(working_area.polygon_points)
     target["editing_overlay_visible"] = False
+    invalidate_preliminary_contour_state(target)
+
+
+def invalidate_preliminary_contour_state(
+    target: MutableMapping[str, Any],
+) -> None:
+    target["contour_processing_result"] = None
+    target["mask_editing_session"] = None
+    target["contour_points"] = []
+    target["contour_file"] = ""
+    target["processing_mask_preview"] = None
+    target["mask_edits"] = []
+    target["last_brush_image"] = None
+    target["last_brush_world"] = None
+    target["brush_cursor_image"] = None
+    target["active_brush_stroke_id"] = None
+    target["next_brush_stroke_id"] = 1
 
 
 def enter_rectangle_mode_state(target: MutableMapping[str, Any]) -> None:
@@ -183,6 +200,17 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
             "polygon_points": [],
             "active_working_area": None,
             "working_area_density_session": None,
+            "contour_processing_result": None,
+            "mask_editing_session": None,
+            "contour_points": [],
+            "contour_file": "",
+            "processing_mask_preview": None,
+            "mask_edits": [],
+            "last_brush_image": None,
+            "last_brush_world": None,
+            "brush_cursor_image": None,
+            "active_brush_stroke_id": None,
+            "next_brush_stroke_id": 1,
         }
     )
 
@@ -216,6 +244,9 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
             "suppress_brush_until_mouse_release": False,
             "contour_points": [],
             "contour_file": "",
+            "contour_processing_result": None,
+            "mask_editing_session": None,
+            "processing_mask_preview": None,
             "mixed_contour_elements": [],
             "mixed_contour_file": "",
             "demo_summary_file": "",

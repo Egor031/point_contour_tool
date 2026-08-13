@@ -29,6 +29,41 @@ class MaskEditsStats:
     pixel_max_iy: int | None
 
 
+def rasterize_mask_edit_cells(
+    mask_shape: tuple[int, int],
+    grid: DensityGrid,
+    edit: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return grid row/column indices covered by one existing mask-edit command."""
+    height, width = mask_shape
+    x = float(edit["x"])
+    y = float(edit["y"])
+    radius_mm = float(edit.get("radius_mm", 0.0))
+
+    ix = int((x - grid.min_x) / grid.cell_size)
+    iy = int((y - grid.min_y) / grid.cell_size)
+    radius_cells = max(1, int(math.ceil(radius_mm / grid.cell_size)))
+
+    min_x = max(0, ix - radius_cells)
+    max_x = min(width - 1, ix + radius_cells)
+    min_y = max(0, iy - radius_cells)
+    max_y = min(height - 1, iy + radius_cells)
+    if min_x > max_x or min_y > max_y:
+        empty = np.empty(0, dtype=np.intp)
+        return empty, empty
+
+    local = np.zeros((max_y - min_y + 1, max_x - min_x + 1), dtype=np.uint8)
+    cv2.circle(
+        local,
+        center=(ix - min_x, iy - min_y),
+        radius=radius_cells,
+        color=1,
+        thickness=-1,
+    )
+    rows, columns = np.nonzero(local)
+    return rows + min_y, columns + min_x
+
+
 def load_mask_edits(path: str | Path) -> list[dict[str, Any]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -69,14 +104,8 @@ def apply_mask_edits(
 
         x = float(edit["x"])
         y = float(edit["y"])
-        radius_mm = float(edit.get("radius_mm", 0.0))
-
         ix = int((x - grid.min_x) / grid.cell_size)
         iy = int((y - grid.min_y) / grid.cell_size)
-        radius_cells = int(math.ceil(radius_mm / grid.cell_size))
-
-        if radius_cells <= 0:
-            radius_cells = 1
 
         world_xs.append(x)
         world_ys.append(y)
@@ -89,21 +118,12 @@ def apply_mask_edits(
         else:
             edits_outside_grid += 1
 
-        if mode == "remove" and _circle_touches_white_mask(
-            edited,
-            center=(ix, iy),
-            radius=radius_cells,
-        ):
+        rows, columns = rasterize_mask_edit_cells(edited.shape, grid, edit)
+        if mode == "remove" and np.any(edited[rows, columns] > 0):
             edits_that_touched_white_mask += 1
 
         value = 0 if mode == "remove" else 1
-        cv2.circle(
-            edited,
-            center=(ix, iy),
-            radius=radius_cells,
-            color=value,
-            thickness=-1,
-        )
+        edited[rows, columns] = value
 
     changed_cells = int((edited != before).sum())
     stats = MaskEditsStats(
@@ -123,25 +143,6 @@ def apply_mask_edits(
     )
 
     return edited, stats
-
-
-def _circle_touches_white_mask(
-    mask: np.ndarray,
-    center: tuple[int, int],
-    radius: int,
-) -> bool:
-    circle_mask = np.zeros_like(mask, dtype=np.uint8)
-    cv2.circle(
-        circle_mask,
-        center=center,
-        radius=radius,
-        color=1,
-        thickness=-1,
-    )
-
-    return bool(np.any((circle_mask > 0) & (mask > 0)))
-
-
 def save_mask_edits_debug_preview(
     mask: np.ndarray,
     grid: DensityGrid,

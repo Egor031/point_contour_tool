@@ -37,13 +37,26 @@ from app.ui.density_worker import (
     format_progress_bytes,
     progress_stage_label,
 )
+from app.ui.contour_workflow import (
+    MaskEditingSession,
+    PreliminaryContourParameters,
+    PreliminaryContourSession,
+    find_preliminary_contour_for_working_area,
+    mask_edits_for_world_segment,
+    preliminary_contour_parameters_for_threshold,
+    processing_mask_to_preview,
+    rebuild_preliminary_contour_from_edited_mask,
+    validate_brush_diameter,
+)
 
 
 TEXTURE_TAG = "preview_texture"
 SELECTION_TEXTURE_TAG = "selection_dim_texture"
+PROCESSING_MASK_TEXTURE_TAG = "processing_mask_texture"
 IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
+PROCESSING_MASK_LAYER_TAG = "processing_mask_layer"
 MASK_EDITS_LAYER_TAG = "mask_edits_layer"
 HOLES_LAYER_TAG = "holes_overlay_layer"
 MANUAL_HOLE_CENTER_LAYER_TAG = "manual_hole_center_overlay_layer"
@@ -59,6 +72,7 @@ SHOW_UNGROUPED_HOLES_TAG = "show_ungrouped_holes"
 SHOW_OVERSIZED_HOLES_TAG = "show_oversized_holes"
 MAX_DISPLAYED_HOLE_DIAMETER_TAG = "max_displayed_hole_diameter_mm"
 SHOW_CONTOUR_TAG = "show_contour"
+SHOW_PROCESSING_MASK_TAG = "show_processing_mask"
 SHOW_MIXED_CONTOUR_LINES_TAG = "show_mixed_contour_lines"
 SHOW_MIXED_CONTOUR_GAPS_TAG = "show_mixed_contour_gaps"
 STATUS_TAG = "status_text"
@@ -76,6 +90,10 @@ DEBUG_COORDS_TAG = "debug_coords_text"
 BRUSH_SIZE_TAG = "brush_size_mm"
 BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
+MASK_BRUSH_BUTTON_TAG = "mask_brush_button"
+MASK_UNDO_BUTTON_TAG = "mask_undo_button"
+MASK_CLEAR_BUTTON_TAG = "mask_clear_button"
+REBUILD_CONTOUR_BUTTON_TAG = "rebuild_contour_button"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
 HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
@@ -88,6 +106,8 @@ MANUAL_HOLE_Y_TAG = "manual_hole_y"
 MANUAL_HOLE_DIAMETER_TAG = "manual_hole_diameter"
 MANUAL_HOLE_PICK_TAG = "manual_hole_pick_center"
 CONTOUR_INFO_TAG = "contour_info_text"
+CONTOUR_THRESHOLD_MODE_TAG = "contour_threshold_mode"
+CONTOUR_MANUAL_THRESHOLD_TAG = "contour_manual_threshold"
 MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
 DEMO_SUMMARY_INFO_TAG = "demo_summary_info_text"
 DENSITY_SOURCE_FILE_TAG = "density_source_file"
@@ -162,6 +182,9 @@ state = {
     "suppress_brush_until_mouse_release": False,
     "contour_points": [],
     "contour_file": "",
+    "contour_processing_result": None,
+    "mask_editing_session": None,
+    "processing_mask_preview": None,
     "mixed_contour_elements": [],
     "mixed_contour_file": "",
     "demo_summary_file": "",
@@ -341,6 +364,10 @@ def _set_grid_parameter_values(grid: DensityGrid) -> None:
 
 def _clear_source_dependent_ui_state() -> None:
     reset_source_dependent_state(state)
+    _delete_processing_mask_texture()
+    _set_mask_edit_controls_enabled(False)
+    _update_mask_edits_count()
+    _redraw_brush_cursor_overlay()
 
     if dpg.does_item_exist(SELECTION_TEXTURE_TAG):
         dpg.delete_item(SELECTION_TEXTURE_TAG)
@@ -798,6 +825,7 @@ def _redraw_preview() -> None:
         )
 
     _redraw_selection_overlay()
+    _redraw_processing_mask_overlay()
     _redraw_polygon_overlay()
     _redraw_mask_edits_overlay()
     _redraw_holes_overlay()
@@ -829,6 +857,70 @@ def _redraw_selection_overlay() -> None:
         (pan_x, pan_y),
         (pan_x + scaled_width, pan_y + scaled_height),
         parent=SELECTION_LAYER_TAG,
+    )
+
+
+def _delete_processing_mask_texture() -> None:
+    if dpg.does_item_exist(PROCESSING_MASK_LAYER_TAG):
+        dpg.delete_item(PROCESSING_MASK_LAYER_TAG)
+    if dpg.does_item_exist(PROCESSING_MASK_TEXTURE_TAG):
+        dpg.delete_item(PROCESSING_MASK_TEXTURE_TAG)
+    state["processing_mask_preview"] = None
+
+
+def _update_processing_mask_texture(
+    mask: np.ndarray,
+) -> None:
+    preview_width = int(state["image_width"])
+    preview_height = int(state["image_height"])
+    preview_mask = processing_mask_to_preview(
+        mask,
+        preview_width=preview_width,
+        preview_height=preview_height,
+    )
+
+    overlay = np.zeros((preview_height, preview_width, 4), dtype=np.float32)
+    overlay[preview_mask > 0] = (0.08, 0.72, 1.0, 0.34)
+
+    texture_value = overlay.ravel().tolist()
+    if dpg.does_item_exist(PROCESSING_MASK_TEXTURE_TAG):
+        dpg.set_value(PROCESSING_MASK_TEXTURE_TAG, texture_value)
+    else:
+        with dpg.texture_registry():
+            dpg.add_static_texture(
+                width=preview_width,
+                height=preview_height,
+                default_value=texture_value,
+                tag=PROCESSING_MASK_TEXTURE_TAG,
+            )
+    state["processing_mask_preview"] = preview_mask
+
+
+def _redraw_processing_mask_overlay() -> None:
+    if not dpg.does_item_exist(IMAGE_TAG):
+        return
+
+    if dpg.does_item_exist(PROCESSING_MASK_LAYER_TAG):
+        dpg.delete_item(PROCESSING_MASK_LAYER_TAG)
+
+    if not isinstance(state.get("mask_editing_session"), MaskEditingSession):
+        return
+    if state.get("processing_mask_preview") is None:
+        return
+    if not _display_layer_enabled(SHOW_PROCESSING_MASK_TAG, default=False):
+        return
+    if not dpg.does_item_exist(PROCESSING_MASK_TEXTURE_TAG):
+        return
+
+    dpg.add_draw_layer(parent=IMAGE_TAG, tag=PROCESSING_MASK_LAYER_TAG)
+    scaled_width, scaled_height = _scaled_image_size()
+    pan_x = float(state["pan_x"])
+    pan_y = float(state["pan_y"])
+    dpg.draw_image(
+        PROCESSING_MASK_TEXTURE_TAG,
+        (pan_x, pan_y),
+        (pan_x + scaled_width, pan_y + scaled_height),
+        parent=PROCESSING_MASK_LAYER_TAG,
     )
 
 
@@ -1094,6 +1186,50 @@ def _get_brush_edit_mode() -> str:
     return "remove"
 
 
+def _set_mask_edit_controls_enabled(enabled: bool) -> None:
+    for tag in (
+        MASK_BRUSH_BUTTON_TAG,
+        MASK_UNDO_BUTTON_TAG,
+        MASK_CLEAR_BUTTON_TAG,
+        REBUILD_CONTOUR_BUTTON_TAG,
+        BRUSH_MODE_TAG,
+        BRUSH_SIZE_TAG,
+    ):
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, enabled=enabled)
+
+
+def _active_mask_editing_session() -> MaskEditingSession | None:
+    editing = state.get("mask_editing_session")
+    result = state.get("contour_processing_result")
+    density_result = state.get("density_result")
+    working_area = get_active_working_area()
+    if not isinstance(editing, MaskEditingSession):
+        return None
+    if not isinstance(result, PreliminaryContourSession):
+        return None
+    if editing.grid is not getattr(density_result, "grid", None):
+        return None
+    if editing.working_area != working_area:
+        return None
+    return editing
+
+
+def _clear_mask_editing_state() -> None:
+    state["mask_editing_session"] = None
+    state["mask_edits"] = []
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
+    state["brush_cursor_image"] = None
+    state["active_brush_stroke_id"] = None
+    state["next_brush_stroke_id"] = 1
+    if state.get("mode") == "mask_brush":
+        state["mode"] = "rectangle"
+    _set_mask_edit_controls_enabled(False)
+    _update_mask_edits_count()
+    _redraw_brush_cursor_overlay()
+
+
 def _brush_edit_colors(mode: str) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
     if mode == "add":
         return (60, 170, 255, 220), (60, 150, 255, 90)
@@ -1151,7 +1287,10 @@ def _redraw_brush_cursor_overlay() -> None:
     if image_pos is None:
         return
 
-    radius_mm = max(0.001, float(dpg.get_value(BRUSH_SIZE_TAG)))
+    try:
+        radius_mm = validate_brush_diameter(dpg.get_value(BRUSH_SIZE_TAG)) / 2.0
+    except ValueError:
+        return
     radii = _world_radius_to_draw_radii(radius_mm)
     center = image_to_drawlist(*image_pos)
     color, _fill = _brush_edit_colors(_get_brush_edit_mode())
@@ -1436,6 +1575,7 @@ def _update_mask_brush_from_mouse() -> None:
         state["suppress_brush_until_mouse_release"] = False
 
     if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
+        _finish_active_mask_stroke()
         state["last_brush_image"] = None
         state["last_brush_world"] = None
         state["active_brush_stroke_id"] = None
@@ -1452,9 +1592,19 @@ def _update_mask_brush_from_mouse() -> None:
     if coords is None:
         return
 
+    editing = _active_mask_editing_session()
+    if editing is None:
+        _set_status("Find a preliminary contour before editing its mask.")
+        return
+
     image_x, image_y, _grid_x, _grid_y, world_x, world_y = coords
-    radius_mm = float(dpg.get_value(BRUSH_SIZE_TAG))
-    radius_mm = max(0.001, radius_mm)
+    try:
+        brush_diameter_mm = validate_brush_diameter(
+            dpg.get_value(BRUSH_SIZE_TAG)
+        )
+    except ValueError as exc:
+        _set_status(str(exc))
+        return
     brush_mode = _get_brush_edit_mode()
     stroke_id = state["active_brush_stroke_id"]
     if stroke_id is None:
@@ -1462,35 +1612,63 @@ def _update_mask_brush_from_mouse() -> None:
         state["active_brush_stroke_id"] = stroke_id
         state["next_brush_stroke_id"] = stroke_id + 1
 
-    last_brush_image = state["last_brush_image"]
-    if last_brush_image is not None:
-        last_x, last_y = last_brush_image
-        dx = image_x - last_x
-        dy = image_y - last_y
-        if (dx * dx + dy * dy) ** 0.5 < 2.0:
-            return
-
-    state["mask_edits"].append(
-        {
-            "stroke_id": stroke_id,
-            "mode": brush_mode,
-            "x": world_x,
-            "y": world_y,
-            "radius_mm": radius_mm,
-        }
+    start_world = state["last_brush_world"] or (world_x, world_y)
+    edits = mask_edits_for_world_segment(
+        editing.grid,
+        start_world,
+        (world_x, world_y),
+        mode=brush_mode,
+        brush_diameter_mm=brush_diameter_mm,
+        stroke_id=stroke_id,
     )
+    changed = False
+    changed_edits = []
+    for edit in edits:
+        if editing.apply_edit(edit):
+            changed = True
+            changed_edits.append(edit)
+    state["mask_edits"].extend(changed_edits)
     state["last_brush_image"] = (image_x, image_y)
     state["last_brush_world"] = (world_x, world_y)
     _update_mask_edits_count()
     _update_last_brush_debug()
-    _redraw_preview()
+    if changed:
+        _update_processing_mask_texture(editing.edited_mask)
+        _update_contour_info()
+        _redraw_preview()
+        _set_status("Mask modified. Press Rebuild contour to apply.")
+
+
+def _finish_active_mask_stroke() -> bool:
+    editing = _active_mask_editing_session()
+    if editing is None:
+        return False
+    finished = editing.finish_stroke()
+    processing_result = state.get("contour_processing_result")
+    if finished and isinstance(processing_result, PreliminaryContourSession):
+        editing.update_contour_stale(processing_result.masks.contour_mask)
+        _update_contour_info()
+    return finished
+
+
+def _mouse_release_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if state["mode"] != "mask_brush":
+        return
+    _finish_active_mask_stroke()
+    state["active_brush_stroke_id"] = None
+    state["last_brush_image"] = None
+    state["last_brush_world"] = None
 
 
 def _update_mask_edits_count() -> None:
     if dpg.does_item_exist(BRUSH_EDITS_COUNT_TAG):
+        stroke_ids = {
+            edit.get("stroke_id", index)
+            for index, edit in enumerate(state["mask_edits"])
+        }
         dpg.set_value(
             BRUSH_EDITS_COUNT_TAG,
-            f"Brush edits count: {len(state['mask_edits'])}",
+            f"Mask edit strokes: {len(stroke_ids)}",
         )
 
 
@@ -1815,12 +1993,143 @@ def _update_contour_info() -> None:
     if not dpg.does_item_exist(CONTOUR_INFO_TAG):
         return
 
-    contour_file = str(state["contour_file"]) or "-"
+    processing_result = state.get("contour_processing_result")
+    if isinstance(processing_result, PreliminaryContourSession):
+        editing = state.get("mask_editing_session")
+        state_text = "stale — rebuild required" if (
+            isinstance(editing, MaskEditingSession) and editing.contour_stale
+        ) else "ready"
+        dpg.set_value(
+            CONTOUR_INFO_TAG,
+            f"Preliminary contour: {state_text}\n"
+            f"Points: {processing_result.contour.point_count}\n"
+            f"Threshold: {processing_result.masks.threshold_result.threshold:.3f}",
+        )
+        return
+
+    contour_file = str(state["contour_file"])
+    if contour_file:
+        text = (
+            "Preliminary contour: not built\n"
+            f"Legacy contour file: {contour_file}\n"
+            f"Points: {len(state['contour_points'])}"
+        )
+    elif state["contour_points"]:
+        text = (
+            "Preliminary contour: not active\n"
+            f"Unbound contour points: {len(state['contour_points'])}"
+        )
+    else:
+        text = "Preliminary contour: not built\nPoints: 0"
     dpg.set_value(
         CONTOUR_INFO_TAG,
-        f"Contour file: {contour_file}\n"
-        f"Contour points count: {len(state['contour_points'])}",
+        text,
     )
+
+
+def _selected_contour_parameters() -> PreliminaryContourParameters:
+    threshold_mode = dpg.get_value(CONTOUR_THRESHOLD_MODE_TAG)
+    manual_threshold = None
+    if str(threshold_mode).strip().lower() == "manual":
+        manual_threshold = dpg.get_value(CONTOUR_MANUAL_THRESHOLD_TAG)
+    return preliminary_contour_parameters_for_threshold(
+        threshold_mode,
+        manual_threshold,
+    )
+
+
+def _contour_threshold_settings_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    threshold_mode = str(dpg.get_value(CONTOUR_THRESHOLD_MODE_TAG)).strip().lower()
+    if dpg.does_item_exist(CONTOUR_MANUAL_THRESHOLD_TAG):
+        dpg.configure_item(
+            CONTOUR_MANUAL_THRESHOLD_TAG,
+            enabled=threshold_mode == "manual",
+        )
+    _set_status("Contour settings changed. Press Find contour to apply.")
+
+
+def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    density_result = state.get("density_result")
+    if not isinstance(density_result, DensityProcessingResult):
+        _set_status("Build a density map before finding a preliminary contour.")
+        return
+
+    working_area = get_active_working_area()
+    if working_area is None:
+        _set_status("Select and apply a Working Area first.")
+        return
+
+    try:
+        parameters = _selected_contour_parameters()
+    except ValueError as exc:
+        _set_status(f"Invalid contour threshold: {exc}")
+        return
+
+    _set_status("Building preliminary contour...")
+    try:
+        processing_result = find_preliminary_contour_for_working_area(
+            density_result.grid,
+            working_area,
+            density_session=density_result,
+            parameters=parameters,
+        )
+        editing_session = MaskEditingSession.from_preliminary_contour(
+            processing_result
+        )
+        _update_processing_mask_texture(editing_session.edited_mask)
+    except Exception as exc:
+        _set_status(f"Could not build preliminary contour: {exc}")
+        return
+
+    state["contour_processing_result"] = processing_result
+    state["mask_editing_session"] = editing_session
+    state["mask_edits"] = []
+    state["next_brush_stroke_id"] = 1
+    state["contour_points"] = [
+        (float(x), float(y)) for x, y in processing_result.contour.contour_world
+    ]
+    state["contour_file"] = ""
+    _set_mask_edit_controls_enabled(True)
+    _update_mask_edits_count()
+    _update_contour_info()
+    _redraw_preview()
+    _set_status(
+        "Preliminary contour ready: "
+        f"{processing_result.contour.point_count} points."
+    )
+
+
+def _rebuild_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    processing_result = state.get("contour_processing_result")
+    editing_session = state.get("mask_editing_session")
+    if not isinstance(processing_result, PreliminaryContourSession) or not isinstance(
+        editing_session,
+        MaskEditingSession,
+    ):
+        _set_status("Find a preliminary contour before rebuilding it.")
+        return
+
+    try:
+        rebuilt = rebuild_preliminary_contour_from_edited_mask(
+            processing_result,
+            editing_session,
+        )
+    except Exception as exc:
+        _set_status(f"Could not rebuild preliminary contour: {exc}")
+        return
+
+    state["contour_processing_result"] = rebuilt
+    state["contour_points"] = [
+        (float(x), float(y)) for x, y in rebuilt.contour.contour_world
+    ]
+    state["contour_file"] = ""
+    _update_contour_info()
+    _redraw_preview()
+    _set_status(f"Preliminary contour rebuilt: {rebuilt.contour.point_count} points.")
 
 
 def _mixed_contour_counts() -> tuple[int, int, int]:
@@ -1878,28 +2187,36 @@ def _clear_loaded_result_state() -> None:
 
 
 def _undo_last_brush_stroke() -> bool:
-    edits = state["mask_edits"]
-    if not edits:
+    editing = _active_mask_editing_session()
+    if editing is None:
+        _set_status("Find a preliminary contour before editing its mask.")
+        return False
+    _finish_active_mask_stroke()
+    if not editing.undo_last_stroke():
         _set_status("No brush strokes to undo.")
         return False
 
-    last_edit = edits[-1]
-    stroke_id = last_edit.get("stroke_id")
+    edits = state["mask_edits"]
+    stroke_id = edits[-1].get("stroke_id") if edits else None
     if stroke_id is None:
-        edits.pop()
-        removed_count = 1
+        state["mask_edits"] = edits[:-1]
     else:
-        kept_edits = [edit for edit in edits if edit.get("stroke_id") != stroke_id]
-        removed_count = len(edits) - len(kept_edits)
-        state["mask_edits"] = kept_edits
+        state["mask_edits"] = [
+            edit for edit in edits if edit.get("stroke_id") != stroke_id
+        ]
 
     state["active_brush_stroke_id"] = None
     state["last_brush_image"] = None
     state["last_brush_world"] = None
     _update_mask_edits_count()
     _update_last_brush_debug()
+    processing_result = state.get("contour_processing_result")
+    if isinstance(processing_result, PreliminaryContourSession):
+        editing.update_contour_stale(processing_result.masks.contour_mask)
+    _update_processing_mask_texture(editing.edited_mask)
+    _update_contour_info()
     _redraw_preview()
-    _set_status(f"Undid brush stroke: removed {removed_count} edits.")
+    _set_status("Undid last mask edit stroke.")
     return True
 
 
@@ -2047,6 +2364,7 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
         return
 
     if state["mode"] == "mask_brush":
+        _update_mask_brush_from_mouse()
         return
 
     if _warn_preview_grid_params_not_loaded():
@@ -2151,17 +2469,34 @@ def _polygon_mode_callback(_sender=None, _app_data=None, _user_data=None) -> Non
 
 
 def _mask_brush_mode_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    if _active_mask_editing_session() is None:
+        _set_status("Find a preliminary contour before editing its mask.")
+        return
+    try:
+        validate_brush_diameter(dpg.get_value(BRUSH_SIZE_TAG))
+    except ValueError as exc:
+        _set_status(str(exc))
+        return
     state["mode"] = "mask_brush"
     state["roi_first_world"] = None
     state["roi_current_world"] = None
     state["editing_overlay_visible"] = False
     state["last_brush_image"] = None
+    state["last_brush_world"] = None
+    state["active_brush_stroke_id"] = None
+    if dpg.does_item_exist(SHOW_PROCESSING_MASK_TAG):
+        dpg.set_value(SHOW_PROCESSING_MASK_TAG, True)
     _update_brush_cursor_from_mouse()
     _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Mask brush mode: hold left mouse button.")
 
 
 def _brush_settings_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    try:
+        validate_brush_diameter(dpg.get_value(BRUSH_SIZE_TAG))
+    except ValueError as exc:
+        _set_status(str(exc))
+        return
     _redraw_brush_cursor_overlay()
 
 
@@ -2326,13 +2661,22 @@ def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
 
     _update_selection_texture(inside_mask)
     apply_working_area_state(state, working_area, density_result)
+    _delete_processing_mask_texture()
+    _set_mask_edit_controls_enabled(False)
+    _update_mask_edits_count()
+    _redraw_brush_cursor_overlay()
     _update_working_area_info()
+    _update_contour_info()
     _redraw_preview()
     dpg.set_value(ROI_STATUS_TAG, "Working Area applied.")
 
 
 def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     clear_working_area_state(state)
+    _delete_processing_mask_texture()
+    _set_mask_edit_controls_enabled(False)
+    _update_mask_edits_count()
+    _redraw_brush_cursor_overlay()
 
     dpg.set_value(ROI_OUTPUT_TAG, "")
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
@@ -2343,10 +2687,16 @@ def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
         dpg.delete_item(SELECTION_TEXTURE_TAG)
 
     _update_working_area_info()
+    _update_contour_info()
     dpg.set_value(ROI_STATUS_TAG, "Working Area cleared.")
 
 
 def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    editing = _active_mask_editing_session()
+    if editing is None:
+        _set_status("Find a preliminary contour before editing its mask.")
+        return
+    editing.clear_edits()
     state["mask_edits"] = []
     state["last_brush_image"] = None
     state["last_brush_world"] = None
@@ -2355,8 +2705,13 @@ def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) ->
     state["next_brush_stroke_id"] = 1
     _update_mask_edits_count()
     _update_last_brush_debug()
+    processing_result = state.get("contour_processing_result")
+    if isinstance(processing_result, PreliminaryContourSession):
+        editing.update_contour_stale(processing_result.masks.contour_mask)
+    _update_processing_mask_texture(editing.edited_mask)
+    _update_contour_info()
     _redraw_preview()
-    _set_status("Mask edits cleared.")
+    _set_status("Mask edits cleared. Press Rebuild contour to apply if required.")
 
 
 def _write_mask_edits_json(output_path: str | Path) -> None:
@@ -2550,6 +2905,9 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     state["polygon_points"] = []
     state["active_working_area"] = None
     state["working_area_density_session"] = None
+    state["contour_processing_result"] = None
+    _clear_mask_editing_state()
+    _delete_processing_mask_texture()
     state["last_brush_image"] = None
     state["last_brush_world"] = None
     state["brush_cursor_image"] = None
@@ -2571,6 +2929,7 @@ def _show_png(path: str | Path, clear_mask_edits: bool = True) -> None:
     _update_mask_edits_count()
     _update_last_brush_debug()
     _update_working_area_info()
+    _update_contour_info()
     _redraw_preview()
     if state["contour_points"]:
         _set_status("Preview changed. Loaded contour may belong to another result.")
@@ -2987,6 +3346,9 @@ def _load_contour_csv(path: str | Path) -> None:
 
     state["contour_points"] = contour_points
     state["contour_file"] = str(contour_path)
+    state["contour_processing_result"] = None
+    _clear_mask_editing_state()
+    _delete_processing_mask_texture()
     _update_contour_info()
     _redraw_preview()
     _set_status(f"Contour loaded: {contour_path}, points={len(contour_points)}")
@@ -3004,6 +3366,9 @@ def _open_contour_callback(_sender, app_data) -> None:
 def _clear_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     state["contour_points"] = []
     state["contour_file"] = ""
+    state["contour_processing_result"] = None
+    _clear_mask_editing_state()
+    _delete_processing_mask_texture()
     _update_contour_info()
     _redraw_preview()
     _set_status("Contour cleared.")
@@ -3212,6 +3577,10 @@ def run() -> None:
             button=dpg.mvMouseButton_Left,
             callback=_mouse_click_callback,
         )
+        dpg.add_mouse_release_handler(
+            button=dpg.mvMouseButton_Left,
+            callback=_mouse_release_callback,
+        )
         dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
         dpg.add_key_press_handler(callback=_key_press_callback)
 
@@ -3288,7 +3657,12 @@ def run() -> None:
                 )
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
-                dpg.add_button(label="Mask brush", callback=_mask_brush_mode_callback)
+                dpg.add_button(
+                    label="Mask brush",
+                    tag=MASK_BRUSH_BUTTON_TAG,
+                    callback=_mask_brush_mode_callback,
+                    enabled=False,
+                )
                 dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
                 dpg.add_button(
                     label="Undo last polygon point",
@@ -3362,6 +3736,12 @@ def run() -> None:
                     label="Show contour",
                     tag=SHOW_CONTOUR_TAG,
                     default_value=True,
+                    callback=lambda: _redraw_preview(),
+                )
+                dpg.add_checkbox(
+                    label="Show processing mask",
+                    tag=SHOW_PROCESSING_MASK_TAG,
+                    default_value=False,
                     callback=lambda: _redraw_preview(),
                 )
                 dpg.add_checkbox(
@@ -3485,8 +3865,36 @@ def run() -> None:
                 )
                 dpg.push_container_stack(contour_header)
                 dpg.add_text(
-                    "Contour file: -\nContour points count: 0",
+                    "Preliminary contour: not built\nPoints: 0",
                     tag=CONTOUR_INFO_TAG,
+                )
+                dpg.add_text("Threshold mode")
+                dpg.add_combo(
+                    ["Auto", "Manual"],
+                    tag=CONTOUR_THRESHOLD_MODE_TAG,
+                    default_value="Auto",
+                    width=-1,
+                    callback=_contour_threshold_settings_callback,
+                )
+                dpg.add_text("Manual threshold")
+                dpg.add_input_float(
+                    tag=CONTOUR_MANUAL_THRESHOLD_TAG,
+                    default_value=1.0,
+                    width=-1,
+                    enabled=False,
+                    callback=_contour_threshold_settings_callback,
+                )
+                dpg.add_button(
+                    label="Find contour",
+                    callback=_find_contour_callback,
+                    width=-1,
+                )
+                dpg.add_button(
+                    label="Rebuild contour",
+                    tag=REBUILD_CONTOUR_BUTTON_TAG,
+                    callback=_rebuild_contour_callback,
+                    width=-1,
+                    enabled=False,
                 )
                 dpg.add_button(label="Clear contour", callback=_clear_contour_callback)
                 dpg.add_text(
@@ -3511,16 +3919,18 @@ def run() -> None:
                     default_value="Remove from mask",
                     width=-1,
                     callback=_brush_settings_callback,
+                    enabled=False,
                 )
-                dpg.add_text("Brush size mm")
+                dpg.add_text("Brush diameter, mm")
                 dpg.add_input_float(
                     tag=BRUSH_SIZE_TAG,
                     default_value=5.0,
                     min_value=0.001,
                     width=-1,
                     callback=_brush_settings_callback,
+                    enabled=False,
                 )
-                dpg.add_text("Brush edits count: 0", tag=BRUSH_EDITS_COUNT_TAG)
+                dpg.add_text("Mask edit strokes: 0", tag=BRUSH_EDITS_COUNT_TAG)
                 dpg.add_text(
                     "grid_min_x=-\n"
                     "grid_min_y=-\n"
@@ -3530,9 +3940,16 @@ def run() -> None:
                 )
                 dpg.add_button(
                     label="Undo last brush stroke",
+                    tag=MASK_UNDO_BUTTON_TAG,
                     callback=_undo_last_brush_stroke_callback,
+                    enabled=False,
                 )
-                dpg.add_button(label="Clear mask edits", callback=_clear_mask_edits_callback)
+                dpg.add_button(
+                    label="Clear edits",
+                    tag=MASK_CLEAR_BUTTON_TAG,
+                    callback=_clear_mask_edits_callback,
+                    enabled=False,
+                )
                 dpg.add_button(
                     label="Save mask edits JSON",
                     callback=_save_mask_edits_callback,
