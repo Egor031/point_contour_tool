@@ -33,7 +33,7 @@ class PreliminaryContourSession:
     masks: MaskProcessingResult
     contour: ContourResult
     density_session: object | None
-    working_area: WorkingArea
+    working_area: WorkingArea | None
     parameters: PreliminaryContourParameters
 
 
@@ -46,13 +46,14 @@ class MaskStrokeDelta:
 @dataclass(slots=True)
 class MaskEditingSession:
     grid: DensityGrid
-    working_area: WorkingArea
+    working_area: WorkingArea | None
     base_mask: np.ndarray
     edited_mask: np.ndarray
     working_area_mask: np.ndarray
     history: list[MaskStrokeDelta] = field(default_factory=list)
     contour_stale: bool = False
     _active_previous: dict[int, int] | None = None
+    _active_had_command: bool = False
 
     @classmethod
     def from_preliminary_contour(
@@ -60,7 +61,13 @@ class MaskEditingSession:
         result: PreliminaryContourSession,
     ) -> MaskEditingSession:
         base_mask = result.masks.contour_mask
-        working_area_mask = result.working_area.to_grid_mask(result.masks.grid)
+        if result.working_area is None:
+            working_area_mask = np.ones(
+                result.masks.grid.density.shape,
+                dtype=bool,
+            )
+        else:
+            working_area_mask = result.working_area.to_grid_mask(result.masks.grid)
         edited_mask = (base_mask > 0).astype(np.uint8)
         edited_mask[~working_area_mask] = 0
         return cls(
@@ -74,6 +81,7 @@ class MaskEditingSession:
     def begin_stroke(self) -> None:
         if self._active_previous is None:
             self._active_previous = {}
+            self._active_had_command = False
 
     def apply_edit(self, edit: dict[str, object]) -> bool:
         mode = edit.get("mode")
@@ -87,11 +95,11 @@ class MaskEditingSession:
             self.grid,
             edit,
         )
-        if mode == "add":
-            allowed = self.working_area_mask[rows, columns]
-            rows, columns = rows[allowed], columns[allowed]
+        allowed = self.working_area_mask[rows, columns]
+        rows, columns = rows[allowed], columns[allowed]
         if rows.size == 0:
             return False
+        self._active_had_command = True
 
         new_value = 1 if mode == "add" else 0
         changed = self.edited_mask[rows, columns] != new_value
@@ -115,8 +123,11 @@ class MaskEditingSession:
     def finish_stroke(self) -> bool:
         previous = self._active_previous
         self._active_previous = None
-        if not previous:
+        had_command = self._active_had_command
+        self._active_had_command = False
+        if not had_command:
             return False
+        previous = previous or {}
         indices = np.fromiter(previous.keys(), dtype=np.intp)
         values = np.fromiter(previous.values(), dtype=np.uint8)
         self.history.append(MaskStrokeDelta(indices, values))
@@ -124,6 +135,7 @@ class MaskEditingSession:
 
     def undo_last_stroke(self) -> bool:
         self._active_previous = None
+        self._active_had_command = False
         if not self.history:
             return False
         delta = self.history.pop()
@@ -134,6 +146,7 @@ class MaskEditingSession:
 
     def clear_edits(self) -> bool:
         self._active_previous = None
+        self._active_had_command = False
         changed = not np.array_equal(self.edited_mask, self.base_mask)
         self.edited_mask[...] = self.base_mask > 0
         self.edited_mask[~self.working_area_mask] = 0
@@ -266,13 +279,13 @@ def find_preliminary_contour_for_working_area(
     density_session: object | None = None,
     parameters: PreliminaryContourParameters | None = None,
 ) -> PreliminaryContourSession:
-    if working_area is None:
-        raise ValueError("Select and apply a Working Area first.")
-
     selected_parameters = validate_preliminary_contour_parameters(
         parameters or PreliminaryContourParameters()
     )
-    roi, polygon_roi = working_area.processing_parameters()
+    if working_area is None:
+        roi, polygon_roi = None, None
+    else:
+        roi, polygon_roi = working_area.processing_parameters()
     masks = build_processing_masks(
         grid,
         threshold_mode=selected_parameters.threshold_mode,
@@ -286,7 +299,8 @@ def find_preliminary_contour_for_working_area(
     )
 
     if not np.any(masks.contour_mask):
-        raise ValueError("The processing mask is empty inside the Working Area.")
+        area_name = "Working Area" if working_area is not None else "full scan"
+        raise ValueError(f"The processing mask is empty inside the {area_name}.")
 
     try:
         contour = extract_preliminary_contour(
@@ -327,3 +341,34 @@ def rebuild_preliminary_contour_from_edited_mask(
     rebuilt = replace(result, masks=edited_masks, contour=contour)
     editing.mark_contour_rebuilt()
     return rebuilt
+
+
+def rebase_preliminary_contour_with_edits(
+    grid: DensityGrid,
+    working_area: WorkingArea | None,
+    edits: list[dict[str, object]],
+    *,
+    density_session: object | None = None,
+    parameters: PreliminaryContourParameters | None = None,
+) -> tuple[PreliminaryContourSession, MaskEditingSession]:
+    result = find_preliminary_contour_for_working_area(
+        grid,
+        working_area,
+        density_session=density_session,
+        parameters=parameters,
+    )
+    editing = MaskEditingSession.from_preliminary_contour(result)
+
+    current_stroke: object = object()
+    for index, edit in enumerate(edits):
+        stroke_id = edit.get("stroke_id", ("legacy", index))
+        if stroke_id != current_stroke:
+            editing.finish_stroke()
+            editing.begin_stroke()
+            current_stroke = stroke_id
+        editing.apply_edit(edit)
+    editing.finish_stroke()
+
+    if edits:
+        result = rebuild_preliminary_contour_from_edited_mask(result, editing)
+    return result, editing

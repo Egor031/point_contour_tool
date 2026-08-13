@@ -45,6 +45,7 @@ from app.ui.contour_workflow import (
     mask_edits_for_world_segment,
     preliminary_contour_parameters_for_threshold,
     processing_mask_to_preview,
+    rebase_preliminary_contour_with_edits,
     rebuild_preliminary_contour_from_edited_mask,
     validate_brush_diameter,
 )
@@ -91,9 +92,7 @@ BRUSH_SIZE_TAG = "brush_size_mm"
 BRUSH_MODE_TAG = "brush_mode"
 BRUSH_EDITS_COUNT_TAG = "brush_edits_count_text"
 MASK_BRUSH_BUTTON_TAG = "mask_brush_button"
-MASK_UNDO_BUTTON_TAG = "mask_undo_button"
 MASK_CLEAR_BUTTON_TAG = "mask_clear_button"
-REBUILD_CONTOUR_BUTTON_TAG = "rebuild_contour_button"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
 HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
@@ -119,6 +118,10 @@ DENSITY_BUILD_BUTTON_TAG = "density_build_button"
 DENSITY_PROGRESS_STAGE_TAG = "density_progress_stage"
 DENSITY_PROGRESS_BAR_TAG = "density_progress_bar"
 DENSITY_PROGRESS_BYTES_TAG = "density_progress_bytes"
+DENSITY_SETUP_WINDOW_TAG = "density_setup_window"
+DENSITY_SUMMARY_TAG = "density_summary_text"
+DENSITY_STATUS_TAG = "density_status_text"
+UNDO_BUTTON_TAG = "undo_button"
 
 CMD_INPUT_FILE_TAG = "cmd_input_file_path"
 CMD_CELL_TAG = "cmd_cell"
@@ -184,6 +187,7 @@ state = {
     "contour_file": "",
     "contour_processing_result": None,
     "mask_editing_session": None,
+    "undo_history": [],
     "processing_mask_preview": None,
     "mixed_contour_elements": [],
     "mixed_contour_file": "",
@@ -196,6 +200,12 @@ _density_worker = DensityWorker()
 
 def _set_status(message: str) -> None:
     dpg.set_value(STATUS_TAG, message)
+
+
+def _set_density_status(message: str) -> None:
+    _set_status(message)
+    if dpg.does_item_exist(DENSITY_STATUS_TAG):
+        dpg.set_value(DENSITY_STATUS_TAG, message)
 
 
 def _set_density_controls_enabled(enabled: bool) -> None:
@@ -237,7 +247,7 @@ def _finish_density_worker_result(message: DensityWorkerResult) -> None:
     except Exception as exc:
         dpg.set_value(DENSITY_PROGRESS_STAGE_TAG, "Processing stage: display failed")
         dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Error")
-        _set_status(f"Could not display density map: {exc}")
+        _set_density_status(f"Could not display density map: {exc}")
     else:
         if result.stats_from_cache and result.density_from_cache:
             dpg.set_value(
@@ -262,9 +272,9 @@ def _finish_density_worker_result(message: DensityWorkerResult) -> None:
             dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="100%")
 
         if result.density_from_cache:
-            _set_status("Density map loaded from cache.")
+            _set_density_status("Density map loaded from cache.")
         else:
-            _set_status("Density map is ready.")
+            _set_density_status("Density map is ready.")
     finally:
         _density_worker.mark_finished()
         _set_density_controls_enabled(True)
@@ -273,7 +283,7 @@ def _finish_density_worker_result(message: DensityWorkerResult) -> None:
 def _finish_density_worker_error(message: DensityWorkerError) -> None:
     dpg.set_value(DENSITY_PROGRESS_STAGE_TAG, "Processing stage: failed")
     dpg.configure_item(DENSITY_PROGRESS_BAR_TAG, overlay="Error")
-    _set_status(f"Could not build density map: {message.error}")
+    _set_density_status(f"Could not build density map: {message.error}")
     _density_worker.mark_finished()
     _set_density_controls_enabled(True)
 
@@ -299,21 +309,26 @@ def _process_density_worker_messages() -> None:
 
 
 def _update_density_session_info() -> None:
-    if not dpg.does_item_exist(DENSITY_SESSION_INFO_TAG):
-        return
-
     result = state["density_result"]
     if result is None:
-        dpg.set_value(DENSITY_SESSION_INFO_TAG, "Density map has not been built.")
+        text = "Density map has not been built."
+        summary = "No density map"
+        if dpg.does_item_exist(DENSITY_SESSION_INFO_TAG):
+            dpg.set_value(DENSITY_SESSION_INFO_TAG, text)
+        if dpg.does_item_exist(DENSITY_SUMMARY_TAG):
+            dpg.set_value(DENSITY_SUMMARY_TAG, summary)
         return
 
     cache_status = "cache" if result.density_from_cache else "calculated"
-    dpg.set_value(
-        DENSITY_SESSION_INFO_TAG,
+    text = (
         f"{result.source_path.name} | {result.stats.point_count:,} pts | "
         f"cell {result.grid.cell_size:g} mm | "
-        f"grid {result.grid.width} x {result.grid.height} | {cache_status}",
+        f"grid {result.grid.width} x {result.grid.height} | {cache_status}"
     )
+    if dpg.does_item_exist(DENSITY_SESSION_INFO_TAG):
+        dpg.set_value(DENSITY_SESSION_INFO_TAG, text)
+    if dpg.does_item_exist(DENSITY_SUMMARY_TAG):
+        dpg.set_value(DENSITY_SUMMARY_TAG, text)
 
 
 def get_active_working_area() -> WorkingArea | None:
@@ -332,7 +347,7 @@ def _update_working_area_info() -> None:
 
     working_area = get_active_working_area()
     if working_area is None:
-        dpg.set_value(WORKING_AREA_INFO_TAG, "Working area: not selected")
+        dpg.set_value(WORKING_AREA_INFO_TAG, "Working area: Full scan")
         return
 
     if working_area.kind == "rectangle":
@@ -462,18 +477,19 @@ def _show_density_result(
 
 def _select_density_source_callback(_sender, app_data) -> None:
     if _density_worker.is_active:
-        _set_status("Density processing is already active.")
+        _set_density_status("Density processing is already active.")
         return
 
     selections = app_data.get("selections", {})
     if not selections:
         return
     dpg.set_value(DENSITY_SOURCE_FILE_TAG, next(iter(selections.values())))
+    _set_density_status("Source selected. Review cell size and build density.")
 
 
 def _build_density_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     if _density_worker.is_active:
-        _set_status("Density processing is already active.")
+        _set_density_status("Density processing is already active.")
         return
 
     try:
@@ -482,22 +498,22 @@ def _build_density_callback(_sender=None, _app_data=None, _user_data=None) -> No
             dpg.get_value(DENSITY_CELL_SIZE_TAG),
         )
     except ValueError as exc:
-        _set_status(str(exc))
+        _set_density_status(str(exc))
         return
 
     try:
         started = _density_worker.start(source_path, cell_size)
     except Exception as exc:
-        _set_status(f"Could not start density worker: {exc}")
+        _set_density_status(f"Could not start density worker: {exc}")
         return
 
     if not started:
-        _set_status("Density processing is already active.")
+        _set_density_status("Density processing is already active.")
         return
 
     _set_density_controls_enabled(False)
     _set_density_progress_waiting()
-    _set_status("Building density map in background...")
+    _set_density_status("Building density map in background...")
 
 
 def _format_cli_float(value: float) -> str:
@@ -962,8 +978,12 @@ def _update_polygon_points_text() -> None:
     dpg.set_value(POLYGON_POINTS_TAG, "\n".join(lines))
 
 
-def _undo_last_polygon_point() -> bool:
-    if state["selection_applied"] and not state["editing_overlay_visible"]:
+def _undo_last_polygon_point(*, allow_hidden_draft: bool = False) -> bool:
+    if (
+        not allow_hidden_draft
+        and state["selection_applied"]
+        and not state["editing_overlay_visible"]
+    ):
         dpg.set_value(ROI_STATUS_TAG, "Select Polygon ROI mode first.")
         return False
 
@@ -1189,9 +1209,7 @@ def _get_brush_edit_mode() -> str:
 def _set_mask_edit_controls_enabled(enabled: bool) -> None:
     for tag in (
         MASK_BRUSH_BUTTON_TAG,
-        MASK_UNDO_BUTTON_TAG,
         MASK_CLEAR_BUTTON_TAG,
-        REBUILD_CONTOUR_BUTTON_TAG,
         BRUSH_MODE_TAG,
         BRUSH_SIZE_TAG,
     ):
@@ -1223,6 +1241,11 @@ def _clear_mask_editing_state() -> None:
     state["brush_cursor_image"] = None
     state["active_brush_stroke_id"] = None
     state["next_brush_stroke_id"] = 1
+    state["undo_history"] = [
+        action
+        for action in state["undo_history"]
+        if action.get("kind") != "mask_stroke"
+    ]
     if state.get("mode") == "mask_brush":
         state["mode"] = "rectangle"
     _set_mask_edit_controls_enabled(False)
@@ -1622,12 +1645,10 @@ def _update_mask_brush_from_mouse() -> None:
         stroke_id=stroke_id,
     )
     changed = False
-    changed_edits = []
     for edit in edits:
         if editing.apply_edit(edit):
             changed = True
-            changed_edits.append(edit)
-    state["mask_edits"].extend(changed_edits)
+    state["mask_edits"].extend(edits)
     state["last_brush_image"] = (image_x, image_y)
     state["last_brush_world"] = (world_x, world_y)
     _update_mask_edits_count()
@@ -1636,18 +1657,28 @@ def _update_mask_brush_from_mouse() -> None:
         _update_processing_mask_texture(editing.edited_mask)
         _update_contour_info()
         _redraw_preview()
-        _set_status("Mask modified. Press Rebuild contour to apply.")
+        _set_status("Mask modified. Release the mouse to update contour.")
 
 
 def _finish_active_mask_stroke() -> bool:
     editing = _active_mask_editing_session()
     if editing is None:
         return False
+    stroke_id = state.get("active_brush_stroke_id")
     finished = editing.finish_stroke()
     processing_result = state.get("contour_processing_result")
     if finished and isinstance(processing_result, PreliminaryContourSession):
+        state["undo_history"].append(
+            {
+                "kind": "mask_stroke",
+                "stroke_id": stroke_id,
+                "density_session": state.get("density_result"),
+                "mask_editing_session": editing,
+            }
+        )
         editing.update_contour_stale(processing_result.masks.contour_mask)
-        _update_contour_info()
+        if _refresh_contour_from_current_edits():
+            _set_status("Mask edit applied; preliminary contour updated.")
     return finished
 
 
@@ -1996,7 +2027,7 @@ def _update_contour_info() -> None:
     processing_result = state.get("contour_processing_result")
     if isinstance(processing_result, PreliminaryContourSession):
         editing = state.get("mask_editing_session")
-        state_text = "stale — rebuild required" if (
+        state_text = "editing in progress" if (
             isinstance(editing, MaskEditingSession) and editing.contour_stale
         ) else "ready"
         dpg.set_value(
@@ -2049,7 +2080,23 @@ def _contour_threshold_settings_callback(
             CONTOUR_MANUAL_THRESHOLD_TAG,
             enabled=threshold_mode == "manual",
         )
+    if isinstance(state.get("contour_processing_result"), PreliminaryContourSession):
+        if _refresh_contour_for_settings(preserve_edits=True):
+            label = "Auto" if threshold_mode == "auto" else "Manual"
+            _set_status(f"Preliminary contour updated for {label} threshold.")
+        return
     _set_status("Contour settings changed. Press Find contour to apply.")
+
+
+def _manual_threshold_commit_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    if str(dpg.get_value(CONTOUR_THRESHOLD_MODE_TAG)).strip().lower() != "manual":
+        return
+    if _refresh_contour_for_settings(preserve_edits=True):
+        _set_status("Preliminary contour updated for Manual threshold.")
 
 
 def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -2059,10 +2106,6 @@ def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> Non
         return
 
     working_area = get_active_working_area()
-    if working_area is None:
-        _set_status("Select and apply a Working Area first.")
-        return
-
     try:
         parameters = _selected_contour_parameters()
     except ValueError as exc:
@@ -2071,14 +2114,13 @@ def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> Non
 
     _set_status("Building preliminary contour...")
     try:
-        processing_result = find_preliminary_contour_for_working_area(
+        existing_edits = list(state["mask_edits"])
+        processing_result, editing_session = rebase_preliminary_contour_with_edits(
             density_result.grid,
             working_area,
+            existing_edits,
             density_session=density_result,
             parameters=parameters,
-        )
-        editing_session = MaskEditingSession.from_preliminary_contour(
-            processing_result
         )
         _update_processing_mask_texture(editing_session.edited_mask)
     except Exception as exc:
@@ -2087,12 +2129,14 @@ def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> Non
 
     state["contour_processing_result"] = processing_result
     state["mask_editing_session"] = editing_session
-    state["mask_edits"] = []
-    state["next_brush_stroke_id"] = 1
+    state["mask_edits"] = existing_edits
     state["contour_points"] = [
         (float(x), float(y)) for x, y in processing_result.contour.contour_world
     ]
     state["contour_file"] = ""
+    for action in state["undo_history"]:
+        if action.get("kind") == "mask_stroke":
+            action["mask_editing_session"] = editing_session
     _set_mask_edit_controls_enabled(True)
     _update_mask_edits_count()
     _update_contour_info()
@@ -2103,33 +2147,69 @@ def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> Non
     )
 
 
-def _rebuild_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+def _refresh_contour_from_current_edits() -> bool:
     processing_result = state.get("contour_processing_result")
-    editing_session = state.get("mask_editing_session")
-    if not isinstance(processing_result, PreliminaryContourSession) or not isinstance(
-        editing_session,
-        MaskEditingSession,
-    ):
-        _set_status("Find a preliminary contour before rebuilding it.")
-        return
-
+    editing_session = _active_mask_editing_session()
+    if not isinstance(processing_result, PreliminaryContourSession) or editing_session is None:
+        return False
     try:
         rebuilt = rebuild_preliminary_contour_from_edited_mask(
             processing_result,
             editing_session,
         )
     except Exception as exc:
-        _set_status(f"Could not rebuild preliminary contour: {exc}")
-        return
+        _set_status(f"Could not update preliminary contour: {exc}")
+        return False
 
     state["contour_processing_result"] = rebuilt
     state["contour_points"] = [
         (float(x), float(y)) for x, y in rebuilt.contour.contour_world
     ]
     state["contour_file"] = ""
+    _update_processing_mask_texture(editing_session.edited_mask)
     _update_contour_info()
     _redraw_preview()
-    _set_status(f"Preliminary contour rebuilt: {rebuilt.contour.point_count} points.")
+    return True
+
+
+def _refresh_contour_for_settings(*, preserve_edits: bool) -> bool:
+    density_result = state.get("density_result")
+    current_result = state.get("contour_processing_result")
+    if not isinstance(density_result, DensityProcessingResult) or not isinstance(
+        current_result,
+        PreliminaryContourSession,
+    ):
+        return False
+    try:
+        parameters = _selected_contour_parameters()
+        edits = list(state["mask_edits"]) if preserve_edits else []
+        result, editing = rebase_preliminary_contour_with_edits(
+            density_result.grid,
+            get_active_working_area(),
+            edits,
+            density_session=density_result,
+            parameters=parameters,
+        )
+    except Exception as exc:
+        _set_status(f"Could not update preliminary contour: {exc}")
+        return False
+
+    state["contour_processing_result"] = result
+    state["mask_editing_session"] = editing
+    state["mask_edits"] = edits
+    state["contour_points"] = [
+        (float(x), float(y)) for x, y in result.contour.contour_world
+    ]
+    state["contour_file"] = ""
+    for action in state["undo_history"]:
+        if action.get("kind") == "mask_stroke":
+            action["mask_editing_session"] = editing
+    _update_processing_mask_texture(editing.edited_mask)
+    _set_mask_edit_controls_enabled(True)
+    _update_mask_edits_count()
+    _update_contour_info()
+    _redraw_preview()
+    return True
 
 
 def _mixed_contour_counts() -> tuple[int, int, int]:
@@ -2186,12 +2266,13 @@ def _clear_loaded_result_state() -> None:
     _update_density_session_info()
 
 
-def _undo_last_brush_stroke() -> bool:
+def _undo_last_brush_stroke(*, finish_active: bool = True) -> bool:
     editing = _active_mask_editing_session()
     if editing is None:
         _set_status("Find a preliminary contour before editing its mask.")
         return False
-    _finish_active_mask_stroke()
+    if finish_active:
+        _finish_active_mask_stroke()
     if not editing.undo_last_stroke():
         _set_status("No brush strokes to undo.")
         return False
@@ -2210,22 +2291,117 @@ def _undo_last_brush_stroke() -> bool:
     state["last_brush_world"] = None
     _update_mask_edits_count()
     _update_last_brush_debug()
-    processing_result = state.get("contour_processing_result")
-    if isinstance(processing_result, PreliminaryContourSession):
-        editing.update_contour_stale(processing_result.masks.contour_mask)
-    _update_processing_mask_texture(editing.edited_mask)
-    _update_contour_info()
-    _redraw_preview()
-    _set_status("Undid last mask edit stroke.")
+    if _refresh_contour_from_current_edits():
+        _set_status("Undid last mask edit stroke; contour updated.")
     return True
 
 
-def _undo_last_brush_stroke_callback(
+def _undo_history_for_working_area_change() -> list[dict[str, object]]:
+    return [
+        action
+        for action in state["undo_history"]
+        if action.get("kind") != "mask_stroke"
+    ]
+
+
+def _working_area_draft_snapshot() -> dict[str, object]:
+    return {
+        "mode": state["mode"],
+        "rectangle_roi": state["rectangle_roi"],
+        "roi_first_world": state["roi_first_world"],
+        "roi_current_world": state["roi_current_world"],
+        "polygon_points": list(state["polygon_points"]),
+        "polygon_finished": bool(state["polygon_finished"]),
+    }
+
+
+def _restore_working_area_undo_action(action: dict[str, object]) -> bool:
+    density_result = state.get("density_result")
+    if not isinstance(density_result, DensityProcessingResult):
+        return False
+
+    history = list(state["undo_history"])
+    restored_area = action.get("restored_working_area")
+    if isinstance(restored_area, WorkingArea):
+        apply_working_area_state(state, restored_area, density_result)
+    else:
+        clear_working_area_state(state)
+        state["density_result"] = density_result
+    state["undo_history"] = history
+
+    draft = action.get("draft")
+    if isinstance(draft, dict):
+        state["mode"] = draft["mode"]
+        state["rectangle_roi"] = draft["rectangle_roi"]
+        state["roi_first_world"] = draft["roi_first_world"]
+        state["roi_current_world"] = draft["roi_current_world"]
+        state["polygon_points"] = list(draft["polygon_points"])
+        state["polygon_finished"] = bool(draft["polygon_finished"])
+        state["editing_overlay_visible"] = True
+    else:
+        state["editing_overlay_visible"] = False
+
+    if isinstance(restored_area, WorkingArea):
+        inside_mask = _build_selection_inside_mask(restored_area)
+        if inside_mask is not None:
+            _update_selection_texture(inside_mask)
+    elif dpg.does_item_exist(SELECTION_TEXTURE_TAG):
+        dpg.delete_item(SELECTION_TEXTURE_TAG)
+
+    _delete_processing_mask_texture()
+    _set_mask_edit_controls_enabled(False)
+    _update_mask_edits_count()
+    _redraw_brush_cursor_overlay()
+    dpg.set_value(ROI_OUTPUT_TAG, "")
+    dpg.set_value(POLYGON_OUTPUT_TAG, "")
+    _update_polygon_points_text()
+    _update_working_area_info()
+    _update_contour_info()
+    _redraw_preview()
+
+    if bool(action.get("had_contour")):
+        _find_contour_callback()
+
+    if action.get("kind") == "working_area_apply":
+        dpg.set_value(
+            ROI_STATUS_TAG,
+            "Working Area application undone; applied shape restored as draft.",
+        )
+    else:
+        dpg.set_value(ROI_STATUS_TAG, "Working Area clear undone.")
+    return True
+
+
+def _undo_user_action() -> bool:
+    history = state["undo_history"]
+    while history:
+        action = history.pop()
+        if action.get("density_session") is not state.get("density_result"):
+            continue
+        kind = action.get("kind")
+        if kind == "polygon_point":
+            expected_count = int(action["point_count"])
+            if len(state["polygon_points"]) < expected_count:
+                continue
+            return _undo_last_polygon_point(allow_hidden_draft=True)
+        if kind == "mask_stroke":
+            if action.get("mask_editing_session") is not state.get(
+                "mask_editing_session"
+            ):
+                continue
+            return _undo_last_brush_stroke(finish_active=False)
+        if kind in {"working_area_apply", "working_area_clear"}:
+            return _restore_working_area_undo_action(action)
+    _set_status("Nothing to undo.")
+    return False
+
+
+def _undo_user_action_callback(
     _sender=None,
     _app_data=None,
     _user_data=None,
 ) -> None:
-    _undo_last_brush_stroke()
+    _undo_user_action()
 
 
 def _update_last_brush_debug() -> None:
@@ -2378,6 +2554,13 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
 
     if state["mode"] == "polygon":
         state["polygon_points"].append((world_x, world_y))
+        state["undo_history"].append(
+            {
+                "kind": "polygon_point",
+                "point_count": len(state["polygon_points"]),
+                "density_session": state.get("density_result"),
+            }
+        )
         state["polygon_finished"] = False
         state["editing_overlay_visible"] = True
         dpg.set_value(
@@ -2504,14 +2687,6 @@ def _finish_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> N
     _finish_polygon()
 
 
-def _undo_last_polygon_point_callback(
-    _sender=None,
-    _app_data=None,
-    _user_data=None,
-) -> None:
-    _undo_last_polygon_point()
-
-
 def _finish_polygon() -> bool:
     points = state["polygon_points"]
     if len(points) < 3:
@@ -2531,6 +2706,11 @@ def _finish_polygon() -> bool:
 
 def _clear_polygon_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     clear_polygon_draft_state(state)
+    state["undo_history"] = [
+        action
+        for action in state["undo_history"]
+        if action.get("kind") != "polygon_point"
+    ]
     dpg.set_value(POLYGON_OUTPUT_TAG, "")
     _update_polygon_points_text()
     _redraw_preview()
@@ -2548,12 +2728,12 @@ def _key_press_callback(_sender=None, app_data=None, _user_data=None) -> None:
     )
     backspace = key == dpg.mvKey_Back
 
-    if state["mode"] == "polygon" and (undo_shortcut or backspace):
-        _undo_last_polygon_point()
+    if undo_shortcut:
+        _undo_user_action()
         return
 
-    if state["mode"] == "mask_brush" and undo_shortcut:
-        _undo_last_brush_stroke()
+    if state["mode"] == "polygon" and backspace:
+        _undo_last_polygon_point()
 
 
 def _working_area_from_draft() -> WorkingArea | None:
@@ -2659,8 +2839,25 @@ def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
         )
         return
 
+    previous_working_area = get_active_working_area()
+    draft_snapshot = _working_area_draft_snapshot()
+    previous_undo_history = _undo_history_for_working_area_change()
     _update_selection_texture(inside_mask)
+    had_contour = isinstance(
+        state.get("contour_processing_result"),
+        PreliminaryContourSession,
+    )
     apply_working_area_state(state, working_area, density_result)
+    state["undo_history"] = previous_undo_history
+    state["undo_history"].append(
+        {
+            "kind": "working_area_apply",
+            "density_session": density_result,
+            "restored_working_area": previous_working_area,
+            "draft": draft_snapshot,
+            "had_contour": had_contour,
+        }
+    )
     _delete_processing_mask_texture()
     _set_mask_edit_controls_enabled(False)
     _update_mask_edits_count()
@@ -2668,11 +2865,32 @@ def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
     _update_working_area_info()
     _update_contour_info()
     _redraw_preview()
-    dpg.set_value(ROI_STATUS_TAG, "Working Area applied.")
+    if had_contour:
+        _find_contour_callback()
+    dpg.set_value(ROI_STATUS_TAG, "Working Area applied; mask edits cleared.")
 
 
 def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    density_result = state.get("density_result")
+    previous_working_area = get_active_working_area()
+    had_contour = isinstance(
+        state.get("contour_processing_result"),
+        PreliminaryContourSession,
+    )
+    previous_undo_history = _undo_history_for_working_area_change()
     clear_working_area_state(state)
+    state["density_result"] = density_result
+    state["undo_history"] = previous_undo_history
+    if isinstance(previous_working_area, WorkingArea):
+        state["undo_history"].append(
+            {
+                "kind": "working_area_clear",
+                "density_session": density_result,
+                "restored_working_area": previous_working_area,
+                "draft": None,
+                "had_contour": had_contour,
+            }
+        )
     _delete_processing_mask_texture()
     _set_mask_edit_controls_enabled(False)
     _update_mask_edits_count()
@@ -2688,7 +2906,9 @@ def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
 
     _update_working_area_info()
     _update_contour_info()
-    dpg.set_value(ROI_STATUS_TAG, "Working Area cleared.")
+    if had_contour:
+        _find_contour_callback()
+    dpg.set_value(ROI_STATUS_TAG, "Working area: Full scan; mask edits cleared.")
 
 
 def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -2703,15 +2923,15 @@ def _clear_mask_edits_callback(_sender=None, _app_data=None, _user_data=None) ->
     state["brush_cursor_image"] = None
     state["active_brush_stroke_id"] = None
     state["next_brush_stroke_id"] = 1
+    state["undo_history"] = [
+        action
+        for action in state["undo_history"]
+        if action.get("kind") != "mask_stroke"
+    ]
     _update_mask_edits_count()
     _update_last_brush_debug()
-    processing_result = state.get("contour_processing_result")
-    if isinstance(processing_result, PreliminaryContourSession):
-        editing.update_contour_stale(processing_result.masks.contour_mask)
-    _update_processing_mask_texture(editing.edited_mask)
-    _update_contour_info()
-    _redraw_preview()
-    _set_status("Mask edits cleared. Press Rebuild contour to apply if required.")
+    if _refresh_contour_from_current_edits():
+        _set_status("Mask edits cleared; preliminary contour updated.")
 
 
 def _write_mask_edits_json(output_path: str | Path) -> None:
@@ -3584,43 +3804,61 @@ def run() -> None:
         dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
         dpg.add_key_press_handler(callback=_key_press_callback)
 
+    with dpg.item_handler_registry(tag="manual_threshold_commit_handlers"):
+        dpg.add_item_deactivated_after_edit_handler(
+            callback=_manual_threshold_commit_callback
+        )
+
+    with dpg.window(
+        label="Source / Density",
+        tag=DENSITY_SETUP_WINDOW_TAG,
+        show=False,
+        width=760,
+        height=260,
+    ):
+        dpg.add_text("Point cloud file")
+        with dpg.group(horizontal=True):
+            dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-105)
+            dpg.add_button(
+                label="Select",
+                tag=DENSITY_SELECT_BUTTON_TAG,
+                callback=lambda: dpg.show_item(DENSITY_SOURCE_DIALOG_TAG),
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_text("Cell size, mm")
+            dpg.add_input_float(
+                tag=DENSITY_CELL_SIZE_TAG,
+                default_value=0.8,
+                min_value=0.0,
+                width=130,
+            )
+            dpg.add_button(
+                label="Build density map",
+                tag=DENSITY_BUILD_BUTTON_TAG,
+                callback=_build_density_callback,
+            )
+        dpg.add_progress_bar(
+            default_value=0.0,
+            overlay="Idle",
+            width=-1,
+            tag=DENSITY_PROGRESS_BAR_TAG,
+        )
+        dpg.add_text("Processing stage: idle", tag=DENSITY_PROGRESS_STAGE_TAG)
+        dpg.add_text("0 B / 0 B", tag=DENSITY_PROGRESS_BYTES_TAG)
+        dpg.add_text("Density map has not been built.", tag=DENSITY_SESSION_INFO_TAG)
+        dpg.add_text("Ready.", tag=DENSITY_STATUS_TAG, wrap=720)
+
     with dpg.window(label="Point Contour Preview Viewer", tag="main_window"):
-        with dpg.collapsing_header(label="Source point cloud", default_open=True):
-            with dpg.group(horizontal=True):
-                dpg.add_text("File")
-                dpg.add_input_text(tag=DENSITY_SOURCE_FILE_TAG, width=-390)
-                dpg.add_button(
-                    label="Select",
-                    tag=DENSITY_SELECT_BUTTON_TAG,
-                    callback=lambda: dpg.show_item(DENSITY_SOURCE_DIALOG_TAG),
-                )
-                dpg.add_text("Cell, mm")
-                dpg.add_input_float(
-                    tag=DENSITY_CELL_SIZE_TAG,
-                    default_value=0.8,
-                    min_value=0.0,
-                    width=110,
-                )
-                dpg.add_button(
-                    label="Build density map",
-                    tag=DENSITY_BUILD_BUTTON_TAG,
-                    callback=_build_density_callback,
-                )
-            with dpg.group(horizontal=True):
-                dpg.add_progress_bar(
-                    default_value=0.0,
-                    overlay="Idle",
-                    width=320,
-                    tag=DENSITY_PROGRESS_BAR_TAG,
-                )
-                dpg.add_text(
-                    "Processing stage: idle",
-                    tag=DENSITY_PROGRESS_STAGE_TAG,
-                )
-                dpg.add_text("0 B / 0 B", tag=DENSITY_PROGRESS_BYTES_TAG)
-            dpg.add_text(
-                "Density map has not been built.",
-                tag=DENSITY_SESSION_INFO_TAG,
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Source / Density...",
+                callback=lambda: dpg.show_item(DENSITY_SETUP_WINDOW_TAG),
+            )
+            dpg.add_text("No density map", tag=DENSITY_SUMMARY_TAG)
+            dpg.add_button(
+                label="Undo",
+                tag=UNDO_BUTTON_TAG,
+                callback=_undo_user_action_callback,
             )
 
         with dpg.group(horizontal=True):
@@ -3651,23 +3889,13 @@ def run() -> None:
                 dpg.push_container_stack(workspace_header)
                 dpg.add_text("ROI mode: click two image corners.", tag=ROI_STATUS_TAG)
                 dpg.add_text(
-                    "Working area: not selected",
+                    "Working area: Full scan",
                     tag=WORKING_AREA_INFO_TAG,
                     wrap=320,
                 )
                 dpg.add_button(label="Rectangle ROI mode", callback=_reset_roi_callback)
                 dpg.add_button(label="Polygon ROI mode", callback=_polygon_mode_callback)
-                dpg.add_button(
-                    label="Mask brush",
-                    tag=MASK_BRUSH_BUTTON_TAG,
-                    callback=_mask_brush_mode_callback,
-                    enabled=False,
-                )
                 dpg.add_button(label="Finish polygon", callback=_finish_polygon_callback)
-                dpg.add_button(
-                    label="Undo last polygon point",
-                    callback=_undo_last_polygon_point_callback,
-                )
                 dpg.add_button(label="Clear polygon", callback=_clear_polygon_callback)
                 dpg.add_button(label="Apply selection", callback=_apply_selection_callback)
                 dpg.add_button(label="Clear selection", callback=_clear_selection_callback)
@@ -3882,19 +4110,15 @@ def run() -> None:
                     default_value=1.0,
                     width=-1,
                     enabled=False,
-                    callback=_contour_threshold_settings_callback,
+                )
+                dpg.bind_item_handler_registry(
+                    CONTOUR_MANUAL_THRESHOLD_TAG,
+                    "manual_threshold_commit_handlers",
                 )
                 dpg.add_button(
                     label="Find contour",
                     callback=_find_contour_callback,
                     width=-1,
-                )
-                dpg.add_button(
-                    label="Rebuild contour",
-                    tag=REBUILD_CONTOUR_BUTTON_TAG,
-                    callback=_rebuild_contour_callback,
-                    width=-1,
-                    enabled=False,
                 )
                 dpg.add_button(label="Clear contour", callback=_clear_contour_callback)
                 dpg.add_text(
@@ -3912,6 +4136,13 @@ def run() -> None:
                     default_open=False,
                 )
                 dpg.push_container_stack(mask_header)
+                dpg.add_button(
+                    label="Edit processing mask",
+                    tag=MASK_BRUSH_BUTTON_TAG,
+                    callback=_mask_brush_mode_callback,
+                    width=-1,
+                    enabled=False,
+                )
                 dpg.add_text("Brush mode")
                 dpg.add_combo(
                     ["Remove from mask", "Add to mask"],
@@ -3931,28 +4162,11 @@ def run() -> None:
                     enabled=False,
                 )
                 dpg.add_text("Mask edit strokes: 0", tag=BRUSH_EDITS_COUNT_TAG)
-                dpg.add_text(
-                    "grid_min_x=-\n"
-                    "grid_min_y=-\n"
-                    "last brush image x/y: -\n"
-                    "last brush world x/y: -",
-                    tag=LAST_BRUSH_DEBUG_TAG,
-                )
-                dpg.add_button(
-                    label="Undo last brush stroke",
-                    tag=MASK_UNDO_BUTTON_TAG,
-                    callback=_undo_last_brush_stroke_callback,
-                    enabled=False,
-                )
                 dpg.add_button(
                     label="Clear edits",
                     tag=MASK_CLEAR_BUTTON_TAG,
                     callback=_clear_mask_edits_callback,
                     enabled=False,
-                )
-                dpg.add_button(
-                    label="Save mask edits JSON",
-                    callback=_save_mask_edits_callback,
                 )
                 dpg.pop_container_stack()
 
@@ -3989,6 +4203,17 @@ def run() -> None:
                 dpg.add_button(
                     label="Load mixed contour JSON",
                     callback=lambda: dpg.show_item("open_mixed_contour_dialog"),
+                )
+                dpg.add_button(
+                    label="Save mask edits JSON",
+                    callback=_save_mask_edits_callback,
+                )
+                dpg.add_text(
+                    "grid_min_x=-\n"
+                    "grid_min_y=-\n"
+                    "last brush image x/y: -\n"
+                    "last brush world x/y: -",
+                    tag=LAST_BRUSH_DEBUG_TAG,
                 )
                 dpg.add_separator()
                 dpg.add_text("Legacy grid metadata")

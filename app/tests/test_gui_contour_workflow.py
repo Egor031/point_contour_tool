@@ -15,7 +15,9 @@ if str(_PACKAGE_PARENT) not in sys.path:
 
 
 from app.core.density_grid import DensityGrid  # noqa: E402
+from app.core.xyz_reader import PointCloudStats  # noqa: E402
 from app.core.working_area import WorkingArea  # noqa: E402
+from app.services.coarse_processing import DensityProcessingResult  # noqa: E402
 from app.ui import contour_workflow  # noqa: E402
 from app.ui.contour_workflow import (  # noqa: E402
     MaskEditingSession,
@@ -25,6 +27,7 @@ from app.ui.contour_workflow import (  # noqa: E402
     preliminary_contour_parameters_for_threshold,
     processing_mask_to_preview,
     rebuild_preliminary_contour_from_edited_mask,
+    rebase_preliminary_contour_with_edits,
 )
 from app.ui.density_workflow import (  # noqa: E402
     apply_working_area_state,
@@ -62,6 +65,24 @@ def _threshold_comparison_area() -> WorkingArea:
 
 
 class TestGuiContourWorkflow(unittest.TestCase):
+    def _density_session(self, grid: DensityGrid) -> DensityProcessingResult:
+        return DensityProcessingResult(
+            source_path=Path("unused.xyz"),
+            stats=PointCloudStats(
+                file_path=Path("unused.xyz"),
+                point_count=int(grid.density.sum()),
+                min_x=grid.min_x,
+                max_x=grid.min_x + grid.width * grid.cell_size,
+                min_y=grid.min_y,
+                max_y=grid.min_y + grid.height * grid.cell_size,
+                min_z=0.0,
+                max_z=0.0,
+            ),
+            grid=grid,
+            stats_from_cache=False,
+            density_from_cache=False,
+        )
+
     def _mask_editing_fixture(self):
         grid = _threshold_comparison_grid()
         result = find_preliminary_contour_for_working_area(
@@ -245,6 +266,51 @@ class TestGuiContourWorkflow(unittest.TestCase):
 
         self.assertEqual(replacement.history, [])
         np.testing.assert_array_equal(replacement.base_mask, replacement.edited_mask)
+
+    def test_threshold_rebase_replays_add_remove_and_preserves_undo(self):
+        grid = _threshold_comparison_grid()
+        area = _threshold_comparison_area()
+        edits = [
+            {
+                "stroke_id": 1,
+                "mode": "remove",
+                "x": 5.5,
+                "y": 12.5,
+                "radius_mm": 1.0,
+            },
+            {
+                "stroke_id": 2,
+                "mode": "add",
+                "x": 5.5,
+                "y": 5.5,
+                "radius_mm": 1.0,
+            },
+        ]
+
+        with (
+            patch("app.core.xyz_reader.iter_xyz_points") as source_reader,
+            patch("app.core.xyz_reader.compute_stats") as compute_stats,
+            patch("app.core.density_grid.build_density_grid") as build_density,
+        ):
+            result, editing = rebase_preliminary_contour_with_edits(
+                grid,
+                area,
+                edits,
+                parameters=preliminary_contour_parameters_for_threshold(
+                    "Manual",
+                    5.0,
+                ),
+            )
+
+        source_reader.assert_not_called()
+        compute_stats.assert_not_called()
+        build_density.assert_not_called()
+        self.assertEqual(editing.edited_mask[12, 5], 0)
+        self.assertEqual(editing.edited_mask[5, 5], 1)
+        self.assertEqual(len(editing.history), 2)
+        np.testing.assert_array_equal(result.masks.contour_mask, editing.edited_mask)
+        self.assertTrue(editing.undo_last_stroke())
+        self.assertEqual(editing.edited_mask[5, 5], editing.base_mask[5, 5])
 
     def test_auto_threshold_keeps_existing_default_behavior(self):
         grid = _threshold_comparison_grid()
@@ -494,12 +560,16 @@ class TestGuiContourWorkflow(unittest.TestCase):
         self.assertLess(float(result.contour.contour_world[:, 0].max()), 20.0)
         self.assertEqual(int(result.masks.contour_mask[:, 30:].sum()), 0)
 
-    def test_missing_working_area_is_a_controlled_error(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "Select and apply a Working Area first",
-        ):
-            find_preliminary_contour_for_working_area(_two_part_grid(), None)
+    def test_missing_working_area_uses_full_scan(self):
+        grid = _two_part_grid()
+
+        result = find_preliminary_contour_for_working_area(grid, None)
+        editing = MaskEditingSession.from_preliminary_contour(result)
+
+        self.assertIsNone(result.working_area)
+        self.assertGreater(result.contour.point_count, 0)
+        self.assertGreater(int(result.masks.contour_mask[:, 30:].sum()), 0)
+        self.assertTrue(np.all(editing.working_area_mask))
 
     def test_empty_workspace_mask_is_a_controlled_error(self):
         area = WorkingArea.from_rectangle_bounds((20.5, 20.5, 25.5, 25.5))
@@ -564,6 +634,453 @@ class TestGuiContourWorkflow(unittest.TestCase):
         self.assertIsNone(state["mask_editing_session"])
         self.assertIsNone(state["processing_mask_preview"])
         self.assertEqual(state["contour_points"], [])
+
+    def test_unified_undo_uses_chronological_actions_not_current_tool(self):
+        from app.ui import viewer_app
+
+        density_session = object()
+        target = {
+            "density_result": density_session,
+            "polygon_points": [(1.0, 1.0), (2.0, 2.0)],
+            "polygon_finished": False,
+            "selection_applied": False,
+            "editing_overlay_visible": True,
+            "mode": "mask_brush",
+            "undo_history": [
+                {
+                    "kind": "polygon_point",
+                    "point_count": 1,
+                    "density_session": density_session,
+                },
+                {
+                    "kind": "polygon_point",
+                    "point_count": 2,
+                    "density_session": density_session,
+                },
+            ],
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app.dpg, "set_value"),
+        ):
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.state["polygon_points"], [(1.0, 1.0)])
+
+    def test_unified_undo_prefers_latest_brush_then_hidden_polygon_draft(self):
+        from app.ui import viewer_app
+
+        result, editing = self._mask_editing_fixture()
+        density_session = type("DensitySession", (), {"grid": result.masks.grid})()
+        brush_edit = {
+            "stroke_id": 2,
+            "mode": "remove",
+            "x": 5.5,
+            "y": 5.5,
+            "radius_mm": 0.5,
+        }
+        editing.begin_stroke()
+        editing.apply_edit(brush_edit)
+        editing.finish_stroke()
+        target = {
+            "density_result": density_session,
+            "active_working_area": result.working_area,
+            "working_area_density_session": density_session,
+            "contour_processing_result": result,
+            "mask_editing_session": editing,
+            "mask_edits": [brush_edit],
+            "polygon_points": [(1.0, 1.0)],
+            "polygon_finished": False,
+            "selection_applied": True,
+            "editing_overlay_visible": False,
+            "mode": "mask_brush",
+            "active_brush_stroke_id": None,
+            "last_brush_image": None,
+            "last_brush_world": None,
+            "undo_history": [
+                {
+                    "kind": "polygon_point",
+                    "point_count": 1,
+                    "density_session": density_session,
+                },
+                {
+                    "kind": "mask_stroke",
+                    "stroke_id": 2,
+                    "density_session": density_session,
+                    "mask_editing_session": editing,
+                },
+            ],
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_refresh_contour_from_current_edits", return_value=True),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_update_last_brush_debug"),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_set_status"),
+            patch.object(viewer_app.dpg, "set_value"),
+        ):
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.state["mask_edits"], [])
+            self.assertEqual(viewer_app.state["polygon_points"], [(1.0, 1.0)])
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.state["polygon_points"], [])
+
+    def test_completed_brush_stroke_triggers_one_contour_refresh(self):
+        from app.ui import viewer_app
+
+        result, editing = self._mask_editing_fixture()
+        density_session = type("DensitySession", (), {"grid": result.masks.grid})()
+        edit = {
+            "stroke_id": 1,
+            "mode": "remove",
+            "x": 5.5,
+            "y": 5.5,
+            "radius_mm": 0.5,
+        }
+        editing.begin_stroke()
+        editing.apply_edit(edit)
+        target = {
+            "density_result": density_session,
+            "active_working_area": result.working_area,
+            "working_area_density_session": density_session,
+            "contour_processing_result": result,
+            "mask_editing_session": editing,
+            "mask_edits": [edit],
+            "active_brush_stroke_id": 1,
+            "undo_history": [],
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(
+                viewer_app,
+                "_refresh_contour_from_current_edits",
+                return_value=True,
+            ) as refresh,
+            patch.object(viewer_app, "_set_status"),
+        ):
+            self.assertTrue(viewer_app._finish_active_mask_stroke())
+            self.assertEqual(len(viewer_app.state["undo_history"]), 1)
+
+        refresh.assert_called_once_with()
+
+    def test_threshold_refresh_is_inactive_before_first_find(self):
+        from app.ui import viewer_app
+
+        target = {
+            "density_result": object(),
+            "contour_processing_result": None,
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(
+                viewer_app,
+                "rebase_preliminary_contour_with_edits",
+            ) as rebase,
+        ):
+            self.assertFalse(
+                viewer_app._refresh_contour_for_settings(preserve_edits=True)
+            )
+
+        rebase.assert_not_called()
+
+    def test_ctrl_z_dispatches_the_same_unified_undo(self):
+        from app.ui import viewer_app
+
+        def is_key_down(key):
+            return key == viewer_app.dpg.mvKey_LControl
+
+        with (
+            patch.object(viewer_app.dpg, "is_key_down", side_effect=is_key_down),
+            patch.object(viewer_app, "_undo_user_action") as undo,
+        ):
+            viewer_app._key_press_callback(app_data=viewer_app.dpg.mvKey_Z)
+
+        undo.assert_called_once_with()
+
+    def test_unified_undo_discards_actions_from_old_density(self):
+        from app.ui import viewer_app
+
+        target = {
+            "density_result": object(),
+            "polygon_points": [(1.0, 1.0)],
+            "undo_history": [
+                {
+                    "kind": "polygon_point",
+                    "point_count": 1,
+                    "density_session": object(),
+                }
+            ],
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_set_status"),
+        ):
+            self.assertFalse(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.state["polygon_points"], [(1.0, 1.0)])
+            self.assertEqual(viewer_app.state["undo_history"], [])
+
+    def test_undo_apply_restores_polygon_draft_then_undoes_last_point(self):
+        from app.ui import viewer_app
+
+        density_session = self._density_session(_two_part_grid())
+        points = [(4.5, 4.5), (15.5, 4.5), (15.5, 15.5), (4.5, 15.5)]
+        point_actions = [
+            {
+                "kind": "polygon_point",
+                "point_count": count,
+                "density_session": density_session,
+            }
+            for count in range(1, len(points) + 1)
+        ]
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": None,
+            "working_area_density_session": None,
+            "mode": "polygon",
+            "polygon_points": list(points),
+            "polygon_finished": True,
+            "selection_applied": False,
+            "editing_overlay_visible": True,
+            "undo_history": point_actions,
+            "contour_processing_result": None,
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_build_selection_inside_mask", return_value=np.ones((2, 2), dtype=np.uint8)),
+            patch.object(viewer_app, "_update_selection_texture"),
+            patch.object(viewer_app, "_delete_processing_mask_texture"),
+            patch.object(viewer_app, "_set_mask_edit_controls_enabled"),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_redraw_brush_cursor_overlay"),
+            patch.object(viewer_app, "_update_working_area_info"),
+            patch.object(viewer_app, "_update_contour_info"),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=False),
+        ):
+            viewer_app._apply_selection_callback()
+            self.assertIsInstance(viewer_app.get_active_working_area(), WorkingArea)
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertIsNone(viewer_app.get_active_working_area())
+            self.assertEqual(viewer_app.state["polygon_points"], points)
+            self.assertEqual(viewer_app.state["mode"], "polygon")
+            self.assertTrue(viewer_app.state["editing_overlay_visible"])
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.state["polygon_points"], points[:-1])
+
+    def test_undo_apply_restores_previous_area_and_rebuilds_its_contour(self):
+        from app.ui import viewer_app
+
+        grid = _two_part_grid()
+        density_session = self._density_session(grid)
+        area_a = WorkingArea.from_rectangle_bounds((4.5, 4.5, 15.5, 15.5))
+        points_b = [(29.5, 4.5), (48.5, 4.5), (48.5, 20.5), (29.5, 20.5)]
+        contour_a = find_preliminary_contour_for_working_area(
+            grid,
+            area_a,
+            density_session=density_session,
+        )
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": area_a,
+            "working_area_density_session": density_session,
+            "mode": "polygon",
+            "polygon_points": list(points_b),
+            "polygon_finished": True,
+            "selection_applied": True,
+            "editing_overlay_visible": True,
+            "undo_history": [
+                {
+                    "kind": "polygon_point",
+                    "point_count": count,
+                    "density_session": density_session,
+                }
+                for count in range(1, len(points_b) + 1)
+            ],
+            "contour_processing_result": contour_a,
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_build_selection_inside_mask", return_value=np.ones((2, 2), dtype=np.uint8)),
+            patch.object(viewer_app, "_update_selection_texture"),
+            patch.object(viewer_app, "_delete_processing_mask_texture"),
+            patch.object(viewer_app, "_set_mask_edit_controls_enabled"),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_redraw_brush_cursor_overlay"),
+            patch.object(viewer_app, "_update_working_area_info"),
+            patch.object(viewer_app, "_update_contour_info"),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_update_processing_mask_texture"),
+            patch.object(
+                viewer_app,
+                "_selected_contour_parameters",
+                return_value=PreliminaryContourParameters(),
+            ),
+            patch.object(viewer_app, "_set_status"),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=False),
+            patch("app.core.xyz_reader.iter_xyz_points") as source_reader,
+            patch("app.core.xyz_reader.compute_stats") as compute_stats,
+            patch("app.core.density_grid.build_density_grid") as build_density,
+        ):
+            viewer_app._apply_selection_callback()
+            self.assertNotEqual(viewer_app.get_active_working_area(), area_a)
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.get_active_working_area(), area_a)
+            self.assertEqual(viewer_app.state["polygon_points"], points_b)
+            self.assertEqual(
+                viewer_app.state["contour_processing_result"].working_area,
+                area_a,
+            )
+        source_reader.assert_not_called()
+        compute_stats.assert_not_called()
+        build_density.assert_not_called()
+
+    def test_undo_clear_then_undo_apply_preserves_history_order(self):
+        from app.ui import viewer_app
+
+        density_session = self._density_session(_two_part_grid())
+        points = [(4.5, 4.5), (15.5, 4.5), (15.5, 15.5), (4.5, 15.5)]
+        point_actions = [
+            {
+                "kind": "polygon_point",
+                "point_count": count,
+                "density_session": density_session,
+            }
+            for count in range(1, len(points) + 1)
+        ]
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": None,
+            "working_area_density_session": None,
+            "mode": "polygon",
+            "polygon_points": list(points),
+            "polygon_finished": True,
+            "selection_applied": False,
+            "editing_overlay_visible": True,
+            "undo_history": point_actions,
+            "contour_processing_result": None,
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_build_selection_inside_mask", return_value=np.ones((2, 2), dtype=np.uint8)),
+            patch.object(viewer_app, "_update_selection_texture"),
+            patch.object(viewer_app, "_delete_processing_mask_texture"),
+            patch.object(viewer_app, "_set_mask_edit_controls_enabled"),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_redraw_brush_cursor_overlay"),
+            patch.object(viewer_app, "_update_working_area_info"),
+            patch.object(viewer_app, "_update_contour_info"),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=False),
+        ):
+            viewer_app._apply_selection_callback()
+            applied = viewer_app.get_active_working_area()
+            viewer_app._clear_selection_callback()
+            self.assertIsNone(viewer_app.get_active_working_area())
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertEqual(viewer_app.get_active_working_area(), applied)
+
+            self.assertTrue(viewer_app._undo_user_action())
+            self.assertIsNone(viewer_app.get_active_working_area())
+            self.assertEqual(viewer_app.state["polygon_points"], points)
+
+    def test_undo_rectangle_apply_restores_rectangle_draft(self):
+        from app.ui import viewer_app
+
+        density_session = self._density_session(_two_part_grid())
+        bounds = (4.5, 4.5, 15.5, 15.5)
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": None,
+            "working_area_density_session": None,
+            "mode": "rectangle",
+            "rectangle_roi": bounds,
+            "roi_first_world": None,
+            "roi_current_world": None,
+            "selection_applied": False,
+            "editing_overlay_visible": True,
+            "undo_history": [],
+            "contour_processing_result": None,
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app, "_build_selection_inside_mask", return_value=np.ones((2, 2), dtype=np.uint8)),
+            patch.object(viewer_app, "_update_selection_texture"),
+            patch.object(viewer_app, "_delete_processing_mask_texture"),
+            patch.object(viewer_app, "_set_mask_edit_controls_enabled"),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_redraw_brush_cursor_overlay"),
+            patch.object(viewer_app, "_update_working_area_info"),
+            patch.object(viewer_app, "_update_contour_info"),
+            patch.object(viewer_app, "_update_polygon_points_text"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=False),
+        ):
+            viewer_app._apply_selection_callback()
+            self.assertTrue(viewer_app._undo_user_action())
+
+            self.assertIsNone(viewer_app.get_active_working_area())
+            self.assertEqual(viewer_app.state["rectangle_roi"], bounds)
+            self.assertEqual(viewer_app.state["mode"], "rectangle")
+            self.assertTrue(viewer_app.state["editing_overlay_visible"])
+
+    def test_brush_undo_precedes_working_area_apply_undo(self):
+        from app.ui import viewer_app
+
+        density_session = object()
+        editing_session = object()
+        target = {
+            "density_result": density_session,
+            "mask_editing_session": editing_session,
+            "undo_history": [
+                {
+                    "kind": "working_area_apply",
+                    "density_session": density_session,
+                },
+                {
+                    "kind": "mask_stroke",
+                    "density_session": density_session,
+                    "mask_editing_session": editing_session,
+                },
+            ],
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(
+                viewer_app,
+                "_undo_last_brush_stroke",
+                return_value=True,
+            ) as undo_brush,
+            patch.object(
+                viewer_app,
+                "_restore_working_area_undo_action",
+                return_value=True,
+            ) as undo_area,
+        ):
+            self.assertTrue(viewer_app._undo_user_action())
+            undo_brush.assert_called_once_with(finish_active=False)
+            undo_area.assert_not_called()
+
+            self.assertTrue(viewer_app._undo_user_action())
+            undo_area.assert_called_once()
 
 
 if __name__ == "__main__":

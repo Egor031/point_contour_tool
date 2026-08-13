@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -65,6 +66,41 @@ class TestGuiDensityWorkflow(unittest.TestCase):
         self.assertEqual(params, (-125.5, 48.25, 0.8, 17, 9))
         self.assertEqual(grid_preview_params(grid), params)
 
+    def test_headless_layout_keeps_density_controls_in_separate_window(self):
+        dpg = viewer_app.dpg
+        real_destroy_context = dpg.destroy_context
+        try:
+            with (
+                patch.object(dpg, "show_viewport"),
+                patch.object(dpg, "is_dearpygui_running", return_value=False),
+                patch.object(dpg, "destroy_context"),
+            ):
+                viewer_app.run()
+
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.DENSITY_SETUP_WINDOW_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.DENSITY_SOURCE_FILE_TAG)
+                )
+                self.assertTrue(dpg.does_item_exist(viewer_app.DENSITY_SUMMARY_TAG))
+                self.assertFalse(
+                    dpg.is_item_shown(viewer_app.DENSITY_SETUP_WINDOW_TAG)
+                )
+
+                item = viewer_app.DENSITY_SOURCE_FILE_TAG
+                ancestors = set()
+                while item:
+                    item = dpg.get_item_parent(item)
+                    ancestors.add(item)
+                self.assertIn(viewer_app.DENSITY_SETUP_WINDOW_TAG, ancestors)
+                self.assertNotIn("main_window", ancestors)
+
+                labels = [dpg.get_item_label(item) for item in dpg.get_all_items()]
+                self.assertNotIn("Rebuild contour", labels)
+        finally:
+            real_destroy_context()
+
     def test_density_request_validation_rejects_invalid_source_and_cell(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -104,6 +140,7 @@ class TestGuiDensityWorkflow(unittest.TestCase):
             "hole_groups": [{"id": "G1"}],
             "manual_hole_center_world": (3.0, 4.0),
             "selection_applied": True,
+            "undo_history": [{"kind": "polygon_point"}],
             "unrelated": "preserved",
         }
 
@@ -120,6 +157,7 @@ class TestGuiDensityWorkflow(unittest.TestCase):
         self.assertEqual(target["hole_groups"], [])
         self.assertIsNone(target["manual_hole_center_world"])
         self.assertFalse(target["selection_applied"])
+        self.assertEqual(target["undo_history"], [])
 
 
 if __name__ == "__main__":

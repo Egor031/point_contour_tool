@@ -98,6 +98,7 @@ def invalidate_preliminary_contour_state(
     target["brush_cursor_image"] = None
     target["active_brush_stroke_id"] = None
     target["next_brush_stroke_id"] = 1
+    target["undo_history"] = []
 
 
 def enter_rectangle_mode_state(target: MutableMapping[str, Any]) -> None:
@@ -211,6 +212,7 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
             "brush_cursor_image": None,
             "active_brush_stroke_id": None,
             "next_brush_stroke_id": 1,
+            "undo_history": [],
         }
     )
 
@@ -236,6 +238,7 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
             "brush_cursor_image": None,
             "active_brush_stroke_id": None,
             "next_brush_stroke_id": 1,
+            "undo_history": [],
             "holes": [],
             "hole_groups": [],
             "visible_hole_group_ids": {},
