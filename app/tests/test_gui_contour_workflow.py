@@ -64,6 +64,19 @@ def _threshold_comparison_area() -> WorkingArea:
     return WorkingArea.from_rectangle_bounds((3.5, 3.5, 16.5, 16.5))
 
 
+def _fill_holes_grid() -> DensityGrid:
+    density = np.zeros((32, 32), dtype=np.uint32)
+    density[2:30, 2:30] = 5
+    density[7:9, 7:9] = 0
+    density[14:20, 14:20] = 0
+    return DensityGrid(
+        density=density,
+        cell_size=1.0,
+        min_x=0.0,
+        min_y=0.0,
+    )
+
+
 class TestGuiContourWorkflow(unittest.TestCase):
     def _density_session(self, grid: DensityGrid) -> DensityProcessingResult:
         return DensityProcessingResult(
@@ -388,6 +401,230 @@ class TestGuiContourWorkflow(unittest.TestCase):
             ),
         )
 
+    def test_fill_holes_area_preserves_prefill_mask_and_fills_only_in_range(self):
+        grid = _fill_holes_grid()
+        disabled = find_preliminary_contour_for_working_area(
+            grid,
+            None,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=0,
+            ),
+        )
+        below_small_hole = find_preliminary_contour_for_working_area(
+            grid,
+            None,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=3,
+            ),
+        )
+        filled = find_preliminary_contour_for_working_area(
+            grid,
+            None,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=4,
+            ),
+        )
+
+        np.testing.assert_array_equal(
+            disabled.masks.mask_for_holes,
+            disabled.masks.contour_mask,
+        )
+        self.assertEqual(disabled.masks.contour_mask[7, 7], 0)
+        self.assertEqual(below_small_hole.masks.contour_mask[7, 7], 0)
+        self.assertEqual(filled.masks.mask_for_holes[7, 7], 0)
+        self.assertEqual(filled.masks.contour_mask[7, 7], 1)
+        self.assertEqual(filled.masks.mask_for_holes[15, 15], 0)
+        self.assertEqual(filled.masks.contour_mask[15, 15], 0)
+        self.assertEqual(filled.parameters.fill_holes_area, 4)
+        self.assertIs(filled.masks.grid, grid)
+
+        disabled_preview = processing_mask_to_preview(
+            disabled.masks.contour_mask,
+            preview_width=32,
+            preview_height=32,
+        )
+        filled_preview = processing_mask_to_preview(
+            filled.masks.contour_mask,
+            preview_width=32,
+            preview_height=32,
+        )
+        self.assertFalse(np.array_equal(disabled_preview, filled_preview))
+        self.assertEqual(filled_preview[32 - 1 - 7, 7], 1)
+
+    def test_working_area_is_applied_before_fill_and_keeps_cut_hole_open(self):
+        grid = _fill_holes_grid()
+        area = WorkingArea.from_rectangle_bounds((8.5, 2.5, 29.5, 29.5))
+        result = find_preliminary_contour_for_working_area(
+            grid,
+            area,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=100,
+            ),
+        )
+
+        self.assertEqual(result.masks.mask_for_holes[7, 8], 0)
+        self.assertEqual(result.masks.contour_mask[7, 8], 0)
+        self.assertEqual(result.masks.mask_for_holes[15, 15], 0)
+        self.assertEqual(result.masks.contour_mask[15, 15], 1)
+
+    def test_fill_holes_refind_reuses_grid_without_source_or_density(self):
+        grid = _fill_holes_grid()
+
+        with (
+            patch("app.core.xyz_reader.iter_xyz_points") as source_reader,
+            patch("app.core.xyz_reader.compute_stats") as compute_stats,
+            patch("app.core.density_grid.build_density_grid") as build_density,
+        ):
+            disabled = find_preliminary_contour_for_working_area(
+                grid,
+                None,
+                parameters=PreliminaryContourParameters(
+                    threshold_mode="manual",
+                    manual_threshold=1.0,
+                    fill_holes_area=0,
+                ),
+            )
+            filled = find_preliminary_contour_for_working_area(
+                grid,
+                None,
+                parameters=PreliminaryContourParameters(
+                    threshold_mode="manual",
+                    manual_threshold=1.0,
+                    fill_holes_area=4,
+                ),
+            )
+
+        self.assertIs(disabled.masks.grid, grid)
+        self.assertIs(filled.masks.grid, grid)
+        self.assertFalse(
+            np.array_equal(
+                disabled.masks.contour_mask,
+                filled.masks.contour_mask,
+            )
+        )
+        source_reader.assert_not_called()
+        compute_stats.assert_not_called()
+        build_density.assert_not_called()
+
+    def test_invalid_fill_holes_area_is_rejected_before_processing(self):
+        grid = _fill_holes_grid()
+
+        with patch.object(contour_workflow, "build_processing_masks") as build_masks:
+            for invalid_area in (-1, 1.5, float("inf"), True):
+                with self.subTest(invalid_area=invalid_area):
+                    invalid = PreliminaryContourParameters(
+                        threshold_mode="manual",
+                        manual_threshold=1.0,
+                        fill_holes_area=invalid_area,
+                    )
+                    with self.assertRaises(ValueError):
+                        find_preliminary_contour_for_working_area(
+                            grid,
+                            None,
+                            parameters=invalid,
+                        )
+
+        build_masks.assert_not_called()
+
+    def test_fill_holes_control_is_pending_until_find_and_invalid_preserves_result(self):
+        from app.ui import viewer_app
+
+        grid = _fill_holes_grid()
+        density_session = self._density_session(grid)
+        previous = find_preliminary_contour_for_working_area(
+            grid,
+            None,
+            density_session=density_session,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=0,
+            ),
+        )
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": None,
+            "working_area_density_session": None,
+            "contour_processing_result": previous,
+            "contour_points": list(map(tuple, previous.contour.contour_world)),
+        }
+
+        def selected_value(tag):
+            return {
+                viewer_app.CONTOUR_THRESHOLD_MODE_TAG: "Manual",
+                viewer_app.CONTOUR_MANUAL_THRESHOLD_TAG: 1.0,
+                viewer_app.HOLE_KEEP_LARGEST_TAG: False,
+                viewer_app.CONTOUR_FILL_HOLES_AREA_TAG: 4,
+            }[tag]
+
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app.dpg, "get_value", side_effect=selected_value),
+            patch.object(viewer_app, "_set_status"),
+            patch.object(viewer_app, "rebase_preliminary_contour_with_edits") as rebase,
+        ):
+            selected = viewer_app._selected_contour_parameters()
+            viewer_app._contour_fill_holes_settings_callback()
+
+            self.assertEqual(selected.fill_holes_area, 4)
+            self.assertIs(viewer_app.state["contour_processing_result"], previous)
+
+        rebase.assert_not_called()
+
+        def invalid_value(tag):
+            if tag == viewer_app.CONTOUR_FILL_HOLES_AREA_TAG:
+                return -1
+            return selected_value(tag)
+
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app.dpg, "get_value", side_effect=invalid_value),
+            patch.object(viewer_app, "_set_status"),
+            patch.object(viewer_app, "rebase_preliminary_contour_with_edits") as rebase,
+        ):
+            viewer_app._find_contour_callback()
+            self.assertIs(viewer_app.state["contour_processing_result"], previous)
+
+        rebase.assert_not_called()
+
+    def test_contour_info_reports_applied_fill_holes_area(self):
+        from app.ui import viewer_app
+
+        result = find_preliminary_contour_for_working_area(
+            _fill_holes_grid(),
+            None,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+                fill_holes_area=4,
+            ),
+        )
+        target = {
+            **viewer_app.state,
+            "contour_processing_result": result,
+            "mask_editing_session": MaskEditingSession.from_preliminary_contour(
+                result
+            ),
+        }
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(viewer_app.dpg, "set_value") as set_value,
+        ):
+            viewer_app._update_contour_info()
+
+        displayed = set_value.call_args.args[1]
+        self.assertIn("Fill holes max area: 4 cells", displayed)
+
     def test_invalid_manual_threshold_is_rejected_before_processing(self):
         grid = _threshold_comparison_grid()
         invalid = PreliminaryContourParameters(
@@ -431,6 +668,10 @@ class TestGuiContourWorkflow(unittest.TestCase):
                 return "Manual"
             if tag == viewer_app.CONTOUR_MANUAL_THRESHOLD_TAG:
                 return float("nan")
+            if tag == viewer_app.HOLE_KEEP_LARGEST_TAG:
+                return False
+            if tag == viewer_app.CONTOUR_FILL_HOLES_AREA_TAG:
+                return 0
             raise AssertionError(f"Unexpected DPG value request: {tag}")
 
         with (
@@ -521,6 +762,29 @@ class TestGuiContourWorkflow(unittest.TestCase):
         self.assertFalse(parameters.keep_largest)
         self.assertEqual(parameters.fill_holes_area, 0)
         self.assertEqual(parameters.simplify_mm, 0.0)
+
+    def test_keep_largest_parameter_uses_production_mask_processing_path(self):
+        grid = _two_part_grid()
+        parameters = PreliminaryContourParameters(
+            threshold_mode="manual",
+            manual_threshold=1.0,
+            keep_largest=True,
+        )
+
+        with patch.object(
+            contour_workflow,
+            "build_processing_masks",
+            wraps=contour_workflow.build_processing_masks,
+        ) as build_masks:
+            result = find_preliminary_contour_for_working_area(
+                grid,
+                None,
+                parameters=parameters,
+            )
+
+        self.assertTrue(build_masks.call_args.kwargs["keep_largest"])
+        self.assertFalse(np.any(result.masks.contour_mask[5:15, 5:15]))
+        self.assertTrue(np.any(result.masks.contour_mask[5:20, 30:48]))
 
     def test_rectangle_working_area_builds_preliminary_contour(self):
         grid = _two_part_grid()
@@ -786,6 +1050,88 @@ class TestGuiContourWorkflow(unittest.TestCase):
             )
 
         rebase.assert_not_called()
+
+    def test_keep_largest_commit_rebases_in_memory_and_invalidates_holes(self):
+        from app.ui import viewer_app
+
+        grid = _two_part_grid()
+        density_session = self._density_session(grid)
+        contour = find_preliminary_contour_for_working_area(
+            grid,
+            None,
+            density_session=density_session,
+            parameters=PreliminaryContourParameters(
+                threshold_mode="manual",
+                manual_threshold=1.0,
+            ),
+        )
+        editing = MaskEditingSession.from_preliminary_contour(contour)
+        target = {
+            **viewer_app.state,
+            "density_result": density_session,
+            "active_working_area": None,
+            "working_area_density_session": None,
+            "contour_processing_result": contour,
+            "mask_editing_session": editing,
+            "mask_edits": [],
+            "undo_history": [],
+            "contour_points": list(map(tuple, contour.contour.contour_world)),
+            "coarse_mask_revision": 6,
+            "hole_detection_session": object(),
+            "holes_outdated": True,
+        }
+
+        def selected_value(tag):
+            if tag == viewer_app.CONTOUR_THRESHOLD_MODE_TAG:
+                return "Manual"
+            if tag == viewer_app.CONTOUR_MANUAL_THRESHOLD_TAG:
+                return 1.0
+            if tag == viewer_app.HOLE_KEEP_LARGEST_TAG:
+                return True
+            if tag == viewer_app.CONTOUR_FILL_HOLES_AREA_TAG:
+                return 0
+            raise AssertionError(tag)
+
+        with (
+            patch.dict(viewer_app.state, target, clear=True),
+            patch.object(viewer_app.dpg, "get_value", side_effect=selected_value),
+            patch.object(
+                contour_workflow,
+                "build_processing_masks",
+                wraps=contour_workflow.build_processing_masks,
+            ) as build_masks,
+            patch.object(
+                viewer_app,
+                "_refresh_contour_for_settings",
+                wraps=viewer_app._refresh_contour_for_settings,
+            ) as refresh,
+            patch.object(viewer_app, "_update_processing_mask_texture"),
+            patch.object(viewer_app, "_set_mask_edit_controls_enabled"),
+            patch.object(viewer_app, "_update_mask_edits_count"),
+            patch.object(viewer_app, "_update_contour_info"),
+            patch.object(viewer_app, "_update_hole_detection_info"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_set_status"),
+            patch("app.core.xyz_reader.iter_xyz_points") as source_reader,
+            patch("app.core.xyz_reader.compute_stats") as compute_stats,
+            patch("app.core.density_grid.build_density_grid") as build_density,
+        ):
+            viewer_app._keep_largest_component_callback()
+
+            updated = viewer_app.state["contour_processing_result"]
+            self.assertTrue(updated.parameters.keep_largest)
+            self.assertIs(updated.masks.grid, grid)
+            self.assertFalse(np.any(updated.masks.contour_mask[5:15, 5:15]))
+            self.assertTrue(np.any(updated.masks.contour_mask[5:20, 30:48]))
+            self.assertIsNone(viewer_app.state["hole_detection_session"])
+            self.assertTrue(viewer_app.state["holes_outdated"])
+            self.assertEqual(viewer_app.state["coarse_mask_revision"], 7)
+
+        refresh.assert_called_once_with(preserve_edits=True)
+        self.assertTrue(build_masks.call_args.kwargs["keep_largest"])
+        source_reader.assert_not_called()
+        compute_stats.assert_not_called()
+        build_density.assert_not_called()
 
     def test_ctrl_z_dispatches_the_same_unified_undo(self):
         from app.ui import viewer_app

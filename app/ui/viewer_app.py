@@ -49,6 +49,14 @@ from app.ui.contour_workflow import (
     rebuild_preliminary_contour_from_edited_mask,
     validate_brush_diameter,
 )
+from app.ui.hole_workflow import (
+    HoleDetectionParameters,
+    HoleDetectionSession,
+    find_holes_for_current_mask,
+    hole_detection_session_is_current,
+    invalidate_hole_detection_state,
+    validate_hole_detection_parameters,
+)
 
 
 TEXTURE_TAG = "preview_texture"
@@ -95,6 +103,14 @@ MASK_BRUSH_BUTTON_TAG = "mask_brush_button"
 MASK_CLEAR_BUTTON_TAG = "mask_clear_button"
 LAST_BRUSH_DEBUG_TAG = "last_brush_debug_text"
 HOLES_STATS_TAG = "holes_stats_text"
+HOLE_DETECTION_INFO_TAG = "hole_detection_info_text"
+HOLE_MIN_DIAMETER_TAG = "hole_min_diameter_mm"
+HOLE_MAX_DIAMETER_TAG = "hole_max_diameter_mm"
+HOLE_ADVANCED_HEADER_TAG = "advanced_hole_detection_header"
+HOLE_KEEP_LARGEST_TAG = "hole_keep_largest_component"
+HOLE_MIN_CIRCULARITY_TAG = "hole_min_circularity"
+HOLE_MAX_ERROR_RATIO_TAG = "hole_max_circle_error_ratio"
+FIND_HOLES_BUTTON_TAG = "find_holes_button"
 HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
 MOVE_HOLE_ID_TAG = "move_hole_id"
 MOVE_HOLE_TARGET_GROUP_TAG = "move_hole_target_group"
@@ -107,6 +123,7 @@ MANUAL_HOLE_PICK_TAG = "manual_hole_pick_center"
 CONTOUR_INFO_TAG = "contour_info_text"
 CONTOUR_THRESHOLD_MODE_TAG = "contour_threshold_mode"
 CONTOUR_MANUAL_THRESHOLD_TAG = "contour_manual_threshold"
+CONTOUR_FILL_HOLES_AREA_TAG = "contour_fill_holes_area_cells"
 MIXED_CONTOUR_INFO_TAG = "mixed_contour_info_text"
 DEMO_SUMMARY_INFO_TAG = "demo_summary_info_text"
 DENSITY_SOURCE_FILE_TAG = "density_source_file"
@@ -177,6 +194,10 @@ state = {
     "brush_cursor_image": None,
     "active_brush_stroke_id": None,
     "next_brush_stroke_id": 1,
+    "coarse_mask_revision": 0,
+    "hole_detection_session": None,
+    "holes_outdated": False,
+    "hole_overlay_source": None,
     "holes": [],
     "hole_groups": [],
     "visible_hole_group_ids": {},
@@ -420,6 +441,7 @@ def _clear_source_dependent_ui_state() -> None:
     _update_polygon_points_text()
     _update_contour_info()
     _update_holes_stats()
+    _update_hole_detection_info()
     _update_hole_groups_display()
     _update_hole_group_target_combo()
     _update_mixed_contour_info()
@@ -1212,6 +1234,7 @@ def _set_mask_edit_controls_enabled(enabled: bool) -> None:
         MASK_CLEAR_BUTTON_TAG,
         BRUSH_MODE_TAG,
         BRUSH_SIZE_TAG,
+        FIND_HOLES_BUTTON_TAG,
     ):
         if dpg.does_item_exist(tag):
             dpg.configure_item(tag, enabled=enabled)
@@ -1233,7 +1256,38 @@ def _active_mask_editing_session() -> MaskEditingSession | None:
     return editing
 
 
+def _active_hole_detection_session() -> HoleDetectionSession | None:
+    session = state.get("hole_detection_session")
+    if hole_detection_session_is_current(
+        session,
+        density_session=state.get("density_result"),
+        contour_session=state.get("contour_processing_result"),
+        mask_editing_session=state.get("mask_editing_session"),
+        coarse_mask_revision=int(state.get("coarse_mask_revision", 0)),
+    ):
+        assert isinstance(session, HoleDetectionSession)
+        return session
+    return None
+
+
+def _invalidate_hole_detection(*, mark_outdated: bool = True) -> bool:
+    invalidated = invalidate_hole_detection_state(
+        state,
+        mark_outdated=mark_outdated,
+    )
+    _update_hole_detection_info()
+    return invalidated
+
+
+def _mark_effective_mask_changed() -> None:
+    state["coarse_mask_revision"] = int(
+        state.get("coarse_mask_revision", 0)
+    ) + 1
+    _invalidate_hole_detection()
+
+
 def _clear_mask_editing_state() -> None:
+    _invalidate_hole_detection()
     state["mask_editing_session"] = None
     state["mask_edits"] = []
     state["last_brush_image"] = None
@@ -1358,6 +1412,41 @@ def _redraw_holes_overlay() -> None:
 
     if dpg.does_item_exist(HOLES_LAYER_TAG):
         dpg.delete_item(HOLES_LAYER_TAG)
+
+    if state.get("hole_overlay_source") == "in_memory":
+        session = _active_hole_detection_session()
+        if session is None or not session.result.candidates:
+            return
+
+        dpg.add_draw_layer(parent=IMAGE_TAG, tag=HOLES_LAYER_TAG)
+        for candidate in session.result.candidates:
+            if candidate.accepted:
+                if not _display_layer_enabled(SHOW_ACCEPTED_HOLES_TAG):
+                    continue
+            elif not _display_layer_enabled(SHOW_REJECTED_HOLES_TAG):
+                continue
+
+            center = _world_to_drawlist(candidate.center_x, candidate.center_y)
+            if center is None:
+                continue
+            radii = _world_radius_to_draw_radii(candidate.radius)
+            color, fill = _hole_overlay_colors(candidate.accepted)
+            _draw_world_radius_ellipse(
+                center,
+                radii,
+                color=color,
+                fill=fill,
+                thickness=2,
+                parent=HOLES_LAYER_TAG,
+            )
+            dpg.draw_text(
+                (center[0] + radii[0] + 4, center[1] - 7),
+                str(candidate.id),
+                color=color,
+                size=14,
+                parent=HOLES_LAYER_TAG,
+            )
+        return
 
     holes = state["holes"]
     if not holes:
@@ -1722,6 +1811,97 @@ def _update_holes_stats() -> None:
     )
 
 
+def _update_hole_detection_info() -> None:
+    if not dpg.does_item_exist(HOLE_DETECTION_INFO_TAG):
+        return
+
+    session = _active_hole_detection_session()
+    if session is not None:
+        dpg.set_value(
+            HOLE_DETECTION_INFO_TAG,
+            "Hole candidates: {}\nAccepted: {} | Rejected: {}\nGroups: {}".format(
+                len(session.result.candidates),
+                session.result.accepted_count,
+                session.rejected_count,
+                len(session.result.groups),
+            ),
+        )
+    elif state.get("holes_outdated"):
+        dpg.set_value(
+            HOLE_DETECTION_INFO_TAG,
+            "Holes outdated. Press Find holes.",
+        )
+    else:
+        dpg.set_value(HOLE_DETECTION_INFO_TAG, "Holes: not searched")
+
+
+def _selected_hole_detection_parameters() -> HoleDetectionParameters:
+    return validate_hole_detection_parameters(
+        dpg.get_value(HOLE_MIN_DIAMETER_TAG),
+        dpg.get_value(HOLE_MAX_DIAMETER_TAG),
+        dpg.get_value(HOLE_MIN_CIRCULARITY_TAG),
+        dpg.get_value(HOLE_MAX_ERROR_RATIO_TAG),
+    )
+
+
+def _hole_detection_quality_settings_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    try:
+        _selected_hole_detection_parameters()
+    except ValueError as exc:
+        _set_status(f"Invalid hole detection settings: {exc}")
+        return
+
+    _invalidate_hole_detection()
+    _redraw_preview()
+    _set_status("Hole detection settings changed. Press Find holes to apply.")
+
+
+def _find_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    contour_session = state.get("contour_processing_result")
+    editing_session = _active_mask_editing_session()
+    if (
+        not isinstance(contour_session, PreliminaryContourSession)
+        or editing_session is None
+    ):
+        _set_status("Find a preliminary contour before finding holes.")
+        return
+
+    try:
+        parameters = _selected_hole_detection_parameters()
+    except ValueError as exc:
+        _set_status(f"Invalid hole detection settings: {exc}")
+        return
+
+    _set_status("Finding hole candidates...")
+    try:
+        session = find_holes_for_current_mask(
+            contour_session,
+            editing_session,
+            density_session=state.get("density_result"),
+            coarse_mask_revision=int(state.get("coarse_mask_revision", 0)),
+            parameters=parameters,
+        )
+    except Exception as exc:
+        _set_status(f"Could not find holes: {exc}")
+        return
+
+    state["hole_detection_session"] = session
+    state["holes_outdated"] = False
+    state["hole_overlay_source"] = "in_memory"
+    _update_hole_detection_info()
+    _redraw_preview()
+    _set_status(
+        "Hole candidates ready: "
+        f"total={len(session.result.candidates)}, "
+        f"accepted={session.result.accepted_count}, "
+        f"rejected={session.rejected_count}."
+    )
+
+
 def _hole_group_visibility_callback(sender, _app_data=None, user_data=None) -> None:
     group_id = str(user_data)
     state["visible_hole_group_ids"][group_id] = bool(dpg.get_value(sender))
@@ -1810,6 +1990,7 @@ def _get_selected_hole() -> tuple[int | None, dict | None]:
 
 
 def _refresh_hole_views() -> None:
+    state["hole_overlay_source"] = "legacy"
     _recount_hole_group_counts()
     _update_hole_groups_display()
     _update_holes_stats()
@@ -2034,7 +2215,9 @@ def _update_contour_info() -> None:
             CONTOUR_INFO_TAG,
             f"Preliminary contour: {state_text}\n"
             f"Points: {processing_result.contour.point_count}\n"
-            f"Threshold: {processing_result.masks.threshold_result.threshold:.3f}",
+            f"Threshold: {processing_result.masks.threshold_result.threshold:.3f}\n"
+            "Fill holes max area: "
+            f"{processing_result.parameters.fill_holes_area} cells",
         )
         return
 
@@ -2066,7 +2249,22 @@ def _selected_contour_parameters() -> PreliminaryContourParameters:
     return preliminary_contour_parameters_for_threshold(
         threshold_mode,
         manual_threshold,
+        keep_largest=bool(dpg.get_value(HOLE_KEEP_LARGEST_TAG)),
+        fill_holes_area=dpg.get_value(CONTOUR_FILL_HOLES_AREA_TAG),
     )
+
+
+def _contour_fill_holes_settings_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    try:
+        _selected_contour_parameters()
+    except ValueError as exc:
+        _set_status(f"Invalid contour settings: {exc}")
+        return
+    _set_status("Contour settings changed. Press Find contour to apply.")
 
 
 def _contour_threshold_settings_callback(
@@ -2097,6 +2295,20 @@ def _manual_threshold_commit_callback(
         return
     if _refresh_contour_for_settings(preserve_edits=True):
         _set_status("Preliminary contour updated for Manual threshold.")
+
+
+def _keep_largest_component_callback(
+    _sender=None,
+    _app_data=None,
+    _user_data=None,
+) -> None:
+    if isinstance(state.get("contour_processing_result"), PreliminaryContourSession):
+        if _refresh_contour_for_settings(preserve_edits=True):
+            enabled = bool(dpg.get_value(HOLE_KEEP_LARGEST_TAG))
+            label = "enabled" if enabled else "disabled"
+            _set_status(f"Keep largest component {label}; contour updated.")
+        return
+    _set_status("Contour settings changed. Press Find contour to apply.")
 
 
 def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -2134,6 +2346,7 @@ def _find_contour_callback(_sender=None, _app_data=None, _user_data=None) -> Non
         (float(x), float(y)) for x, y in processing_result.contour.contour_world
     ]
     state["contour_file"] = ""
+    _mark_effective_mask_changed()
     for action in state["undo_history"]:
         if action.get("kind") == "mask_stroke":
             action["mask_editing_session"] = editing_session
@@ -2152,6 +2365,7 @@ def _refresh_contour_from_current_edits() -> bool:
     editing_session = _active_mask_editing_session()
     if not isinstance(processing_result, PreliminaryContourSession) or editing_session is None:
         return False
+    _mark_effective_mask_changed()
     try:
         rebuilt = rebuild_preliminary_contour_from_edited_mask(
             processing_result,
@@ -2201,6 +2415,7 @@ def _refresh_contour_for_settings(*, preserve_edits: bool) -> bool:
         (float(x), float(y)) for x, y in result.contour.contour_world
     ]
     state["contour_file"] = ""
+    _mark_effective_mask_changed()
     for action in state["undo_history"]:
         if action.get("kind") == "mask_stroke":
             action["mask_editing_session"] = editing
@@ -2357,6 +2572,7 @@ def _restore_working_area_undo_action(action: dict[str, object]) -> bool:
     _update_polygon_points_text()
     _update_working_area_info()
     _update_contour_info()
+    _update_hole_detection_info()
     _redraw_preview()
 
     if bool(action.get("had_contour")):
@@ -2864,6 +3080,7 @@ def _apply_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
     _redraw_brush_cursor_overlay()
     _update_working_area_info()
     _update_contour_info()
+    _update_hole_detection_info()
     _redraw_preview()
     if had_contour:
         _find_contour_callback()
@@ -2906,6 +3123,7 @@ def _clear_selection_callback(_sender=None, _app_data=None, _user_data=None) -> 
 
     _update_working_area_info()
     _update_contour_info()
+    _update_hole_detection_info()
     if had_contour:
         _find_contour_callback()
     dpg.set_value(ROI_STATUS_TAG, "Working area: Full scan; mask edits cleared.")
@@ -3493,6 +3711,9 @@ def _load_holes_json(path: str | Path) -> None:
 
     state["holes"] = holes
     state["hole_groups"] = hole_groups
+    state["hole_detection_session"] = None
+    state["holes_outdated"] = False
+    state["hole_overlay_source"] = "legacy"
     state["visible_hole_group_ids"] = {
         str(group["id"]): bool(group.get("enabled", True)) for group in hole_groups
     }
@@ -3525,6 +3746,8 @@ def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None
     state["pick_manual_hole_center"] = False
     state["manual_hole_center_world"] = None
     state["suppress_brush_until_mouse_release"] = False
+    if state.get("hole_overlay_source") == "legacy":
+        state["hole_overlay_source"] = None
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
         dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
     _update_holes_stats()
@@ -3584,6 +3807,7 @@ def _open_contour_callback(_sender, app_data) -> None:
 
 
 def _clear_contour_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    _mark_effective_mask_changed()
     state["contour_points"] = []
     state["contour_file"] = ""
     state["contour_processing_result"] = None
@@ -3809,6 +4033,11 @@ def run() -> None:
             callback=_manual_threshold_commit_callback
         )
 
+    with dpg.item_handler_registry(tag="hole_detection_commit_handlers"):
+        dpg.add_item_deactivated_after_edit_handler(
+            callback=_hole_detection_quality_settings_callback
+        )
+
     with dpg.window(
         label="Source / Density",
         tag=DENSITY_SETUP_WINDOW_TAG,
@@ -3991,6 +4220,69 @@ def run() -> None:
                     default_open=False,
                 )
                 dpg.push_container_stack(holes_header)
+                dpg.add_text("Holes: not searched", tag=HOLE_DETECTION_INFO_TAG)
+                dpg.add_text("Min diameter, mm")
+                dpg.add_input_float(
+                    tag=HOLE_MIN_DIAMETER_TAG,
+                    default_value=8.0,
+                    min_value=0.0,
+                    width=-1,
+                )
+                dpg.add_text("Max diameter, mm (<= 0: unlimited)")
+                dpg.add_input_float(
+                    tag=HOLE_MAX_DIAMETER_TAG,
+                    default_value=0.0,
+                    width=-1,
+                )
+                advanced_holes_header = dpg.add_collapsing_header(
+                    label="Advanced hole detection",
+                    tag=HOLE_ADVANCED_HEADER_TAG,
+                    default_open=False,
+                )
+                dpg.push_container_stack(advanced_holes_header)
+                dpg.add_checkbox(
+                    label="Keep largest component",
+                    tag=HOLE_KEEP_LARGEST_TAG,
+                    default_value=False,
+                    callback=_keep_largest_component_callback,
+                )
+                dpg.add_text("Min circularity")
+                dpg.add_input_float(
+                    tag=HOLE_MIN_CIRCULARITY_TAG,
+                    default_value=0.55,
+                    min_value=0.0,
+                    width=-1,
+                )
+                dpg.bind_item_handler_registry(
+                    HOLE_MIN_CIRCULARITY_TAG,
+                    "hole_detection_commit_handlers",
+                )
+                dpg.add_text("Max circle error ratio")
+                dpg.add_input_float(
+                    tag=HOLE_MAX_ERROR_RATIO_TAG,
+                    default_value=0.18,
+                    min_value=0.0,
+                    width=-1,
+                )
+                dpg.bind_item_handler_registry(
+                    HOLE_MAX_ERROR_RATIO_TAG,
+                    "hole_detection_commit_handlers",
+                )
+                dpg.pop_container_stack()
+                dpg.add_button(
+                    label="Find holes",
+                    tag=FIND_HOLES_BUTTON_TAG,
+                    callback=_find_holes_callback,
+                    width=-1,
+                    enabled=False,
+                )
+                dpg.pop_container_stack()
+
+                legacy_holes_header = dpg.add_collapsing_header(
+                    label="Legacy holes editor",
+                    default_open=False,
+                )
+                dpg.push_container_stack(legacy_holes_header)
                 dpg.add_text(
                     "holes total: 0\naccepted: 0\nrejected: 0\ngroups count: 0",
                     tag=HOLES_STATS_TAG,
@@ -4114,6 +4406,15 @@ def run() -> None:
                 dpg.bind_item_handler_registry(
                     CONTOUR_MANUAL_THRESHOLD_TAG,
                     "manual_threshold_commit_handlers",
+                )
+                dpg.add_text("Fill holes max area (cells; 0: disabled)")
+                dpg.add_input_int(
+                    tag=CONTOUR_FILL_HOLES_AREA_TAG,
+                    default_value=0,
+                    min_value=0,
+                    min_clamped=True,
+                    width=-1,
+                    callback=_contour_fill_holes_settings_callback,
                 )
                 dpg.add_button(
                     label="Find contour",

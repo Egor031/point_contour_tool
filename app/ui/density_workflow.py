@@ -87,6 +87,7 @@ def apply_working_area_state(
 def invalidate_preliminary_contour_state(
     target: MutableMapping[str, Any],
 ) -> None:
+    had_hole_session = target.get("hole_detection_session") is not None
     target["contour_processing_result"] = None
     target["mask_editing_session"] = None
     target["contour_points"] = []
@@ -99,6 +100,13 @@ def invalidate_preliminary_contour_state(
     target["active_brush_stroke_id"] = None
     target["next_brush_stroke_id"] = 1
     target["undo_history"] = []
+    target["coarse_mask_revision"] = int(
+        target.get("coarse_mask_revision", 0)
+    ) + 1
+    target["hole_detection_session"] = None
+    target["holes_outdated"] = bool(
+        had_hole_session or target.get("holes_outdated", False)
+    )
 
 
 def enter_rectangle_mode_state(target: MutableMapping[str, Any]) -> None:
@@ -187,6 +195,7 @@ def working_area_draft_visibility(
 
 
 def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
+    had_hole_session = target.get("hole_detection_session") is not None
     target.update(
         {
             "roi_first_world": None,
@@ -213,6 +222,13 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
             "active_brush_stroke_id": None,
             "next_brush_stroke_id": 1,
             "undo_history": [],
+            "coarse_mask_revision": int(
+                target.get("coarse_mask_revision", 0)
+            ) + 1,
+            "hole_detection_session": None,
+            "holes_outdated": bool(
+                had_hole_session or target.get("holes_outdated", False)
+            ),
         }
     )
 
@@ -239,6 +255,12 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
             "active_brush_stroke_id": None,
             "next_brush_stroke_id": 1,
             "undo_history": [],
+            "coarse_mask_revision": int(
+                target.get("coarse_mask_revision", 0)
+            ) + 1,
+            "hole_detection_session": None,
+            "holes_outdated": False,
+            "hole_overlay_source": None,
             "holes": [],
             "hole_groups": [],
             "visible_hole_group_ids": {},

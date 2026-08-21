@@ -305,7 +305,7 @@ class TestContourAndHolesCharacterization(unittest.TestCase):
         self.assertEqual(float(result.contour_world[:, 1].min()), -39.0)
         self.assertEqual(float(result.contour_world[:, 1].max()), -23.0)
 
-    def test_hole_detection_geometry_and_equivalent_diameter_filters(self):
+    def test_hole_detection_geometry_and_fitted_diameter_search_range(self):
         mask = _mask_with_circular_hole()
         grid = _grid(mask.shape, min_x=100.0, min_y=200.0)
 
@@ -325,27 +325,100 @@ class TestContourAndHolesCharacterization(unittest.TestCase):
         self.assertLess(candidate.diameter, filter_boundary)
         self.assertLess(filter_boundary, equivalent_diameter)
 
-        min_at_boundary = _detect_holes(
+        below_min_at_boundary = _detect_holes(
             mask,
             grid,
             min_diameter_mm=filter_boundary,
-        )[0]
-        too_small = _detect_holes(
+        )
+        below_larger_min = _detect_holes(
             mask,
             grid,
             min_diameter_mm=equivalent_diameter + 0.1,
-        )[0]
-        too_large = _detect_holes(
+        )
+        max_at_boundary = _detect_holes(
             mask,
             grid,
             max_diameter_mm=filter_boundary,
         )[0]
 
-        self.assertTrue(min_at_boundary.accepted)
-        self.assertFalse(too_small.accepted)
-        self.assertEqual(too_small.reject_reason, "too_small")
-        self.assertFalse(too_large.accepted)
-        self.assertEqual(too_large.reject_reason, "too_large")
+        # Product requirement: the same fitted diameter shown to the user is
+        # now used by Min/Max instead of the legacy equivalent-area diameter.
+        self.assertEqual(below_min_at_boundary, [])
+        self.assertEqual(below_larger_min, [])
+        self.assertTrue(max_at_boundary.accepted)
+
+    def test_fitted_diameter_filter_can_accept_when_equivalent_is_smaller(self):
+        mask = np.zeros((81, 81), dtype=np.uint8)
+        mask[2:-2, 2:-2] = 1
+        cv2.ellipse(mask, (40, 40), (10, 4), 0, 0, 360, 0, -1)
+        grid = _grid(mask.shape)
+
+        candidate = _detect_holes(
+            mask,
+            grid,
+            max_aspect_ratio_deviation=10.0,
+        )[0]
+        equivalent_diameter = 2.0 * math.sqrt(candidate.area_mm2 / math.pi)
+        filter_boundary = (candidate.diameter + equivalent_diameter) / 2.0
+        self.assertLess(equivalent_diameter, filter_boundary)
+        self.assertLess(filter_boundary, candidate.diameter)
+
+        min_filtered = _detect_holes(
+            mask,
+            grid,
+            min_diameter_mm=filter_boundary,
+            max_aspect_ratio_deviation=10.0,
+        )[0]
+        above_max = _detect_holes(
+            mask,
+            grid,
+            max_diameter_mm=filter_boundary,
+            max_aspect_ratio_deviation=10.0,
+        )
+
+        self.assertTrue(min_filtered.accepted)
+        self.assertEqual(above_max, [])
+
+    def test_hole_border_and_quality_rejections_are_unchanged(self):
+        grid = _grid((81, 81))
+        solid = np.zeros((81, 81), dtype=np.uint8)
+        solid[2:-2, 2:-2] = 1
+        self.assertEqual(_detect_holes(solid, grid), [])
+
+        ellipse = solid.copy()
+        cv2.ellipse(ellipse, (40, 40), (10, 4), 0, 0, 360, 0, -1)
+        bad_aspect = _detect_holes(
+            ellipse,
+            grid,
+            max_aspect_ratio_deviation=0.1,
+            max_error_ratio=1.0,
+        )[0]
+        bad_fit = _detect_holes(
+            ellipse,
+            grid,
+            max_aspect_ratio_deviation=10.0,
+            max_error_ratio=0.1,
+        )[0]
+
+        rectangle = solid.copy()
+        cv2.rectangle(rectangle, (28, 38), (52, 42), 0, -1)
+        low_circularity = _detect_holes(
+            rectangle,
+            grid,
+            min_circularity=0.8,
+            max_aspect_ratio_deviation=10.0,
+            max_error_ratio=1.0,
+        )[0]
+
+        self.assertEqual(bad_aspect.reject_reason, "bad_aspect_ratio")
+        self.assertEqual(bad_fit.reject_reason, "bad_circle_fit")
+        self.assertEqual(low_circularity.reject_reason, "low_circularity")
+        quality_reasons = {
+            item.reject_reason
+            for item in (bad_aspect, bad_fit, low_circularity)
+        }
+        self.assertNotIn("too_small", quality_reasons)
+        self.assertNotIn("too_large", quality_reasons)
 
     def test_hole_grouping_uses_diameter_tolerance_for_accepted_holes(self):
         holes = [

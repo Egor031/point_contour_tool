@@ -84,6 +84,56 @@ class TestGuiDensityWorkflow(unittest.TestCase):
                     dpg.does_item_exist(viewer_app.DENSITY_SOURCE_FILE_TAG)
                 )
                 self.assertTrue(dpg.does_item_exist(viewer_app.DENSITY_SUMMARY_TAG))
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_DETECTION_INFO_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(
+                        viewer_app.CONTOUR_FILL_HOLES_AREA_TAG
+                    )
+                )
+                self.assertEqual(
+                    dpg.get_value(viewer_app.CONTOUR_FILL_HOLES_AREA_TAG),
+                    0,
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_MIN_DIAMETER_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_MAX_DIAMETER_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_ADVANCED_HEADER_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_KEEP_LARGEST_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_MIN_CIRCULARITY_TAG)
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.HOLE_MAX_ERROR_RATIO_TAG)
+                )
+                self.assertFalse(dpg.get_value(viewer_app.HOLE_ADVANCED_HEADER_TAG))
+                self.assertFalse(dpg.get_value(viewer_app.HOLE_KEEP_LARGEST_TAG))
+                self.assertAlmostEqual(
+                    dpg.get_value(viewer_app.HOLE_MIN_CIRCULARITY_TAG),
+                    0.55,
+                )
+                self.assertAlmostEqual(
+                    dpg.get_value(viewer_app.HOLE_MAX_ERROR_RATIO_TAG),
+                    0.18,
+                )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.FIND_HOLES_BUTTON_TAG)
+                )
+                self.assertFalse(
+                    dpg.is_item_enabled(viewer_app.FIND_HOLES_BUTTON_TAG)
+                )
+                viewer_app._set_mask_edit_controls_enabled(True)
+                self.assertTrue(
+                    dpg.is_item_enabled(viewer_app.FIND_HOLES_BUTTON_TAG)
+                )
                 self.assertFalse(
                     dpg.is_item_shown(viewer_app.DENSITY_SETUP_WINDOW_TAG)
                 )
@@ -141,6 +191,9 @@ class TestGuiDensityWorkflow(unittest.TestCase):
             "manual_hole_center_world": (3.0, 4.0),
             "selection_applied": True,
             "undo_history": [{"kind": "polygon_point"}],
+            "hole_detection_session": object(),
+            "holes_outdated": False,
+            "coarse_mask_revision": 2,
             "unrelated": "preserved",
         }
 
@@ -158,6 +211,9 @@ class TestGuiDensityWorkflow(unittest.TestCase):
         self.assertIsNone(target["manual_hole_center_world"])
         self.assertFalse(target["selection_applied"])
         self.assertEqual(target["undo_history"], [])
+        self.assertIsNone(target["hole_detection_session"])
+        self.assertFalse(target["holes_outdated"])
+        self.assertEqual(target["coarse_mask_revision"], 3)
 
 
 if __name__ == "__main__":

@@ -51,9 +51,12 @@ class MaskEditingSession:
     edited_mask: np.ndarray
     working_area_mask: np.ndarray
     history: list[MaskStrokeDelta] = field(default_factory=list)
+    semantic_edits: list[dict[str, object]] = field(default_factory=list)
+    semantic_stroke_lengths: list[int] = field(default_factory=list)
     contour_stale: bool = False
     _active_previous: dict[int, int] | None = None
     _active_had_command: bool = False
+    _active_semantic_start: int | None = None
 
     @classmethod
     def from_preliminary_contour(
@@ -61,15 +64,16 @@ class MaskEditingSession:
         result: PreliminaryContourSession,
     ) -> MaskEditingSession:
         base_mask = result.masks.contour_mask
-        if result.working_area is None:
-            working_area_mask = np.ones(
-                result.masks.grid.density.shape,
-                dtype=bool,
-            )
-        else:
-            working_area_mask = result.working_area.to_grid_mask(result.masks.grid)
-        edited_mask = (base_mask > 0).astype(np.uint8)
-        edited_mask[~working_area_mask] = 0
+        working_area_mask = working_area_mask_for_grid(
+            result.masks.grid,
+            result.working_area,
+        )
+        edited_mask = build_effective_mask(
+            base_mask,
+            result.masks.grid,
+            result.working_area,
+            [],
+        )
         return cls(
             grid=result.masks.grid,
             working_area=result.working_area,
@@ -82,6 +86,7 @@ class MaskEditingSession:
         if self._active_previous is None:
             self._active_previous = {}
             self._active_had_command = False
+            self._active_semantic_start = len(self.semantic_edits)
 
     def apply_edit(self, edit: dict[str, object]) -> bool:
         mode = edit.get("mode")
@@ -90,16 +95,16 @@ class MaskEditingSession:
         self.begin_stroke()
         assert self._active_previous is not None
 
-        rows, columns = rasterize_mask_edit_cells(
+        rows, columns = rasterize_clipped_mask_edit_cells(
             self.edited_mask.shape,
             self.grid,
+            self.working_area_mask,
             edit,
         )
-        allowed = self.working_area_mask[rows, columns]
-        rows, columns = rows[allowed], columns[allowed]
         if rows.size == 0:
             return False
         self._active_had_command = True
+        self.semantic_edits.append(dict(edit))
 
         new_value = 1 if mode == "add" else 0
         changed = self.edited_mask[rows, columns] != new_value
@@ -125,20 +130,28 @@ class MaskEditingSession:
         self._active_previous = None
         had_command = self._active_had_command
         self._active_had_command = False
+        semantic_start = self._active_semantic_start
+        self._active_semantic_start = None
         if not had_command:
             return False
         previous = previous or {}
         indices = np.fromiter(previous.keys(), dtype=np.intp)
         values = np.fromiter(previous.values(), dtype=np.uint8)
         self.history.append(MaskStrokeDelta(indices, values))
+        assert semantic_start is not None
+        self.semantic_stroke_lengths.append(len(self.semantic_edits) - semantic_start)
         return True
 
     def undo_last_stroke(self) -> bool:
         self._active_previous = None
         self._active_had_command = False
+        self._active_semantic_start = None
         if not self.history:
             return False
         delta = self.history.pop()
+        semantic_count = self.semantic_stroke_lengths.pop()
+        if semantic_count:
+            del self.semantic_edits[-semantic_count:]
         self.edited_mask.ravel()[delta.flat_indices] = delta.previous_values
         self.edited_mask[~self.working_area_mask] = 0
         self.contour_stale = True
@@ -147,10 +160,16 @@ class MaskEditingSession:
     def clear_edits(self) -> bool:
         self._active_previous = None
         self._active_had_command = False
-        changed = not np.array_equal(self.edited_mask, self.base_mask)
+        self._active_semantic_start = None
+        changed = bool(self.semantic_edits) or not np.array_equal(
+            self.edited_mask,
+            self.base_mask,
+        )
         self.edited_mask[...] = self.base_mask > 0
         self.edited_mask[~self.working_area_mask] = 0
         self.history.clear()
+        self.semantic_edits.clear()
+        self.semantic_stroke_lengths.clear()
         if changed:
             self.contour_stale = True
         return changed
@@ -161,6 +180,56 @@ class MaskEditingSession:
     def update_contour_stale(self, contour_mask: np.ndarray) -> bool:
         self.contour_stale = not np.array_equal(self.edited_mask, contour_mask)
         return self.contour_stale
+
+
+def working_area_mask_for_grid(
+    grid: DensityGrid,
+    working_area: WorkingArea | None,
+) -> np.ndarray:
+    if working_area is None:
+        return np.ones(grid.density.shape, dtype=bool)
+    return working_area.to_grid_mask(grid)
+
+
+def rasterize_clipped_mask_edit_cells(
+    mask_shape: tuple[int, int],
+    grid: DensityGrid,
+    working_area_mask: np.ndarray,
+    edit: dict[str, object],
+) -> tuple[np.ndarray, np.ndarray]:
+    if working_area_mask.shape != mask_shape:
+        raise ValueError("Working Area mask shape does not match the processing mask.")
+    rows, columns = rasterize_mask_edit_cells(mask_shape, grid, edit)
+    allowed = working_area_mask[rows, columns]
+    return rows[allowed], columns[allowed]
+
+
+def build_effective_mask(
+    base_mask: np.ndarray,
+    grid: DensityGrid,
+    working_area: WorkingArea | None,
+    semantic_edits: list[dict[str, object]],
+) -> np.ndarray:
+    """Replay GUI mask commands on any base mask using GUI clipping semantics."""
+    if base_mask.shape != grid.density.shape:
+        raise ValueError("Base mask shape does not match the density grid.")
+
+    working_area_mask = working_area_mask_for_grid(grid, working_area)
+    effective = (base_mask > 0).astype(np.uint8)
+    effective[~working_area_mask] = 0
+    for edit in semantic_edits:
+        mode = edit.get("mode")
+        if mode not in {"add", "remove"}:
+            raise ValueError("Mask edit mode must be add or remove.")
+        rows, columns = rasterize_clipped_mask_edit_cells(
+            effective.shape,
+            grid,
+            working_area_mask,
+            edit,
+        )
+        effective[rows, columns] = 1 if mode == "add" else 0
+    effective[~working_area_mask] = 0
+    return effective
 
 
 def validate_brush_diameter(brush_diameter_mm: object) -> float:
@@ -223,9 +292,30 @@ def _validated_manual_threshold(value: object) -> float:
     return manual_threshold
 
 
+def _validated_fill_holes_area(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Fill holes area must be an integer number of cells.")
+    try:
+        area = int(value)
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "Fill holes area must be an integer number of cells."
+        ) from exc
+    if not math.isfinite(numeric_value) or numeric_value != area:
+        raise ValueError("Fill holes area must be an integer number of cells.")
+    if area < 0:
+        raise ValueError("Fill holes area must be non-negative.")
+    return area
+
+
 def validate_preliminary_contour_parameters(
     parameters: PreliminaryContourParameters,
 ) -> PreliminaryContourParameters:
+    parameters = replace(
+        parameters,
+        fill_holes_area=_validated_fill_holes_area(parameters.fill_holes_area),
+    )
     if parameters.threshold_mode == "auto":
         return replace(parameters, manual_threshold=None)
     if parameters.threshold_mode != "manual":
@@ -239,14 +329,23 @@ def validate_preliminary_contour_parameters(
 def preliminary_contour_parameters_for_threshold(
     threshold_mode: object,
     manual_threshold: object = None,
+    *,
+    keep_largest: bool = False,
+    fill_holes_area: object = 0,
 ) -> PreliminaryContourParameters:
+    validated_fill_holes_area = _validated_fill_holes_area(fill_holes_area)
     normalized_mode = str(threshold_mode).strip().lower()
     if normalized_mode == "auto":
-        return PreliminaryContourParameters()
+        return PreliminaryContourParameters(
+            keep_largest=bool(keep_largest),
+            fill_holes_area=validated_fill_holes_area,
+        )
     if normalized_mode == "manual":
         return PreliminaryContourParameters(
             threshold_mode="manual",
             manual_threshold=_validated_manual_threshold(manual_threshold),
+            keep_largest=bool(keep_largest),
+            fill_holes_area=validated_fill_holes_area,
         )
     raise ValueError("Threshold mode must be Auto or Manual.")
 

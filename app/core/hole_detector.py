@@ -134,8 +134,6 @@ def detect_circular_holes(
             continue
 
         area_mm2 = area_cells * grid.cell_size * grid.cell_size
-        equivalent_radius = float(np.sqrt(area_mm2 / np.pi))
-        equivalent_diameter = equivalent_radius * 2.0
 
         bbox_width_mm = width * grid.cell_size
         bbox_height_mm = height * grid.cell_size
@@ -146,21 +144,6 @@ def detect_circular_holes(
         aspect_ratio = bbox_width_mm / bbox_height_mm
         if aspect_ratio < 1.0:
             aspect_ratio = 1.0 / aspect_ratio
-
-        accepted = True
-        reject_reason = ""
-
-        if equivalent_diameter < min_diameter_mm:
-            accepted = False
-            reject_reason = "too_small"
-
-        if max_diameter_mm is not None and equivalent_diameter > max_diameter_mm:
-            accepted = False
-            reject_reason = "too_large"
-
-        if aspect_ratio > (1.0 + max_aspect_ratio_deviation):
-            accepted = False
-            reject_reason = "bad_aspect_ratio"
 
         component_mask = (labels == label_id).astype(np.uint8)
 
@@ -183,16 +166,20 @@ def detect_circular_holes(
 
         circularity = float(4.0 * np.pi * area_mm2 / (perimeter_mm * perimeter_mm))
 
-        if circularity < min_circularity:
-            accepted = False
-            reject_reason = "low_circularity"
-
         contour_pixels = contour[:, 0, :].astype(np.float64)
         contour_world = _pixel_points_to_world(contour_pixels, grid)
 
         try:
             cx, cy, r = _fit_circle_least_squares(contour_world)
         except ValueError:
+            continue
+
+        fitted_diameter = 2.0 * r
+        # Diameter limits define the requested search range. Out-of-range
+        # components are not user-visible candidates or quality rejections.
+        if fitted_diameter < min_diameter_mm:
+            continue
+        if max_diameter_mm is not None and fitted_diameter > max_diameter_mm:
             continue
 
         distances = np.sqrt(
@@ -205,6 +192,17 @@ def detect_circular_holes(
         mean_error_mm = float(errors.mean())
         max_error_mm = float(errors.max())
         error_ratio = float(mean_error_mm / r) if r > 0 else float("inf")
+
+        accepted = True
+        reject_reason = ""
+
+        if aspect_ratio > (1.0 + max_aspect_ratio_deviation):
+            accepted = False
+            reject_reason = "bad_aspect_ratio"
+
+        if circularity < min_circularity:
+            accepted = False
+            reject_reason = "low_circularity"
 
         if error_ratio > max_error_ratio:
             accepted = False
@@ -220,7 +218,7 @@ def detect_circular_holes(
                 center_x=cx,
                 center_y=cy,
                 radius=r,
-                diameter=2.0 * r,
+                diameter=fitted_diameter,
                 center_px=center_px,
                 center_py=center_py,
                 radius_px=radius_px,
