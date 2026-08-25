@@ -148,6 +148,7 @@ class TestGuiDensityWorkflow(unittest.TestCase):
 
                 labels = [dpg.get_item_label(item) for item in dpg.get_all_items()]
                 self.assertNotIn("Rebuild contour", labels)
+                self.assertNotIn("Review holes", labels)
         finally:
             real_destroy_context()
 
@@ -189,6 +190,7 @@ class TestGuiDensityWorkflow(unittest.TestCase):
             "holes": [{"id": 1}],
             "hole_groups": [{"id": "G1"}],
             "manual_hole_center_world": (3.0, 4.0),
+            "mouse_gestures": {"left": {"dragged": True}},
             "selection_applied": True,
             "undo_history": [{"kind": "polygon_point"}],
             "hole_detection_session": object(),
@@ -209,6 +211,7 @@ class TestGuiDensityWorkflow(unittest.TestCase):
         self.assertEqual(target["holes"], [])
         self.assertEqual(target["hole_groups"], [])
         self.assertIsNone(target["manual_hole_center_world"])
+        self.assertEqual(target["mouse_gestures"], {})
         self.assertFalse(target["selection_applied"])
         self.assertEqual(target["undo_history"], [])
         self.assertIsNone(target["hole_detection_session"])

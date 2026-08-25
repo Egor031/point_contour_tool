@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import MutableMapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -38,10 +38,89 @@ class HoleDetectionSession:
     working_area: WorkingArea | None
     coarse_mask_revision: int
     parameters: HoleDetectionParameters
+    automatic_acceptance: dict[int, bool] = field(default_factory=dict)
+    manual_overrides: dict[int, bool] = field(default_factory=dict)
 
     @property
     def rejected_count(self) -> int:
         return len(self.result.candidates) - self.result.accepted_count
+
+
+@dataclass(frozen=True, slots=True)
+class HoleHitRegion:
+    candidate_id: int
+    center_x: float
+    center_y: float
+    radius_x: float
+    radius_y: float
+
+
+def hit_test_hole_regions(
+    regions: list[HoleHitRegion],
+    cursor: tuple[float, float],
+    *,
+    tolerance_px: float = 5.0,
+) -> int | None:
+    """Return the closest candidate whose screen-space ellipse contains cursor."""
+    tolerance = float(tolerance_px)
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("Hole hit-test tolerance must be finite and non-negative.")
+
+    cursor_x, cursor_y = cursor
+    hits: list[tuple[float, int]] = []
+    for region in regions:
+        radius_x = max(0.0, float(region.radius_x)) + tolerance
+        radius_y = max(0.0, float(region.radius_y)) + tolerance
+        if radius_x <= 0 or radius_y <= 0:
+            continue
+        dx = float(cursor_x) - float(region.center_x)
+        dy = float(cursor_y) - float(region.center_y)
+        if (dx / radius_x) ** 2 + (dy / radius_y) ** 2 <= 1.0:
+            hits.append((dx * dx + dy * dy, int(region.candidate_id)))
+
+    if not hits:
+        return None
+    return min(hits)[1]
+
+
+def apply_manual_hole_status(
+    session: HoleDetectionSession,
+    candidate_id: int,
+    *,
+    accepted: bool,
+) -> bool:
+    """Apply a user decision without replacing detector geometry or diagnostics."""
+    candidate = next(
+        (
+            item
+            for item in session.result.candidates
+            if int(item.id) == int(candidate_id)
+        ),
+        None,
+    )
+    if candidate is None:
+        raise KeyError(candidate_id)
+
+    requested_status = bool(accepted)
+    if bool(candidate.accepted) == requested_status:
+        return False
+
+    session.automatic_acceptance.setdefault(
+        int(candidate.id),
+        bool(candidate.accepted),
+    )
+    session.manual_overrides[int(candidate.id)] = requested_status
+    candidate.accepted = requested_status
+
+    accepted_counts: dict[str, int] = {}
+    for item in session.result.candidates:
+        if item.accepted and item.group_id is not None:
+            group_id = str(item.group_id)
+            accepted_counts[group_id] = accepted_counts.get(group_id, 0) + 1
+    for group in session.result.groups:
+        group_id = str(group.get("id", ""))
+        group["count"] = accepted_counts.get(group_id, 0)
+    return True
 
 
 def validate_hole_detection_parameters(
@@ -162,6 +241,10 @@ def find_holes_for_current_mask(
         working_area=contour_session.working_area,
         coarse_mask_revision=int(coarse_mask_revision),
         parameters=selected,
+        automatic_acceptance={
+            int(candidate.id): bool(candidate.accepted)
+            for candidate in result.candidates
+        },
     )
 
 

@@ -229,6 +229,8 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
             "holes_outdated": bool(
                 had_hole_session or target.get("holes_outdated", False)
             ),
+            "hovered_hole_id": None,
+            "mouse_gestures": {},
         }
     )
 
@@ -261,12 +263,13 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
             "hole_detection_session": None,
             "holes_outdated": False,
             "hole_overlay_source": None,
+            "hovered_hole_id": None,
+            "mouse_gestures": {},
             "holes": [],
             "hole_groups": [],
             "visible_hole_group_ids": {},
             "pick_manual_hole_center": False,
             "manual_hole_center_world": None,
-            "suppress_brush_until_mouse_release": False,
             "contour_points": [],
             "contour_file": "",
             "contour_processing_result": None,

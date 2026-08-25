@@ -50,9 +50,12 @@ from app.ui.contour_workflow import (
     validate_brush_diameter,
 )
 from app.ui.hole_workflow import (
+    HoleHitRegion,
     HoleDetectionParameters,
     HoleDetectionSession,
+    apply_manual_hole_status,
     find_holes_for_current_mask,
+    hit_test_hole_regions,
     hole_detection_session_is_current,
     invalidate_hole_detection_state,
     validate_hole_detection_parameters,
@@ -112,6 +115,7 @@ HOLE_MIN_CIRCULARITY_TAG = "hole_min_circularity"
 HOLE_MAX_ERROR_RATIO_TAG = "hole_max_circle_error_ratio"
 FIND_HOLES_BUTTON_TAG = "find_holes_button"
 HOLE_GROUPS_CONTAINER_TAG = "hole_groups_container"
+HOLE_HOVER_INFO_TAG = "hole_hover_info_text"
 MOVE_HOLE_ID_TAG = "move_hole_id"
 MOVE_HOLE_TARGET_GROUP_TAG = "move_hole_target_group"
 EDIT_GROUP_TARGET_TAG = "edit_group_target"
@@ -163,6 +167,7 @@ PARAM_GRID_HEIGHT = "param_original_grid_height"
 MIN_ZOOM = 0.1
 MAX_ZOOM = 16.0
 ZOOM_STEP = 1.25
+MOUSE_DRAG_THRESHOLD_PX = 5.0
 CANVAS_WIDTH = 2400
 CANVAS_HEIGHT = 1600
 
@@ -198,12 +203,13 @@ state = {
     "hole_detection_session": None,
     "holes_outdated": False,
     "hole_overlay_source": None,
+    "hovered_hole_id": None,
+    "mouse_gestures": {},
     "holes": [],
     "hole_groups": [],
     "visible_hole_group_ids": {},
     "pick_manual_hole_center": False,
     "manual_hole_center_world": None,
-    "suppress_brush_until_mouse_release": False,
     "contour_points": [],
     "contour_file": "",
     "contour_processing_result": None,
@@ -409,6 +415,8 @@ def _clear_source_dependent_ui_state() -> None:
         dpg.delete_item(SELECTION_TEXTURE_TAG)
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
         dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
+    if dpg.does_item_exist(HOLE_HOVER_INFO_TAG):
+        dpg.set_value(HOLE_HOVER_INFO_TAG, "Hover a hole candidate for details.")
     if dpg.does_item_exist(MANUAL_HOLE_X_TAG):
         dpg.set_value(MANUAL_HOLE_X_TAG, 0.0)
     if dpg.does_item_exist(MANUAL_HOLE_Y_TAG):
@@ -1271,6 +1279,7 @@ def _active_hole_detection_session() -> HoleDetectionSession | None:
 
 
 def _invalidate_hole_detection(*, mark_outdated: bool = True) -> bool:
+    state["hovered_hole_id"] = None
     invalidated = invalidate_hole_detection_state(
         state,
         mark_outdated=mark_outdated,
@@ -1406,6 +1415,55 @@ def _hole_overlay_colors(
     return (255, 140, 50, 230), (255, 110, 40, 45)
 
 
+def _visible_hole_candidates(session: HoleDetectionSession) -> list:
+    return [
+        candidate
+        for candidate in session.result.candidates
+        if (
+            candidate.accepted
+            and _display_layer_enabled(SHOW_ACCEPTED_HOLES_TAG)
+        )
+        or (
+            not candidate.accepted
+            and _display_layer_enabled(SHOW_REJECTED_HOLES_TAG)
+        )
+    ]
+
+
+def _hole_candidate_hit_region(candidate) -> HoleHitRegion | None:
+    center = _world_to_drawlist(candidate.center_x, candidate.center_y)
+    if center is None:
+        return None
+    radius_x, radius_y = _world_radius_to_draw_radii(candidate.radius)
+    return HoleHitRegion(
+        candidate_id=int(candidate.id),
+        center_x=center[0],
+        center_y=center[1],
+        radius_x=radius_x,
+        radius_y=radius_y,
+    )
+
+
+def _hole_at_screen(mouse_x: float, mouse_y: float) -> int | None:
+    if state.get("pick_manual_hole_center"):
+        return None
+    if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
+        return None
+    canvas_pos = _screen_to_canvas(mouse_x, mouse_y)
+    if canvas_pos is None:
+        return None
+    session = _active_hole_detection_session()
+    if session is None:
+        return None
+
+    regions = [
+        region
+        for candidate in _visible_hole_candidates(session)
+        if (region := _hole_candidate_hit_region(candidate)) is not None
+    ]
+    return hit_test_hole_regions(regions, canvas_pos, tolerance_px=5.0)
+
+
 def _redraw_holes_overlay() -> None:
     if not dpg.does_item_exist(IMAGE_TAG):
         return
@@ -1426,10 +1484,11 @@ def _redraw_holes_overlay() -> None:
             elif not _display_layer_enabled(SHOW_REJECTED_HOLES_TAG):
                 continue
 
-            center = _world_to_drawlist(candidate.center_x, candidate.center_y)
-            if center is None:
+            region = _hole_candidate_hit_region(candidate)
+            if region is None:
                 continue
-            radii = _world_radius_to_draw_radii(candidate.radius)
+            center = (region.center_x, region.center_y)
+            radii = (region.radius_x, region.radius_y)
             color, fill = _hole_overlay_colors(candidate.accepted)
             _draw_world_radius_ellipse(
                 center,
@@ -1446,6 +1505,15 @@ def _redraw_holes_overlay() -> None:
                 size=14,
                 parent=HOLES_LAYER_TAG,
             )
+            if state.get("hovered_hole_id") == int(candidate.id):
+                _draw_world_radius_ellipse(
+                    center,
+                    (radii[0] + 4.0, radii[1] + 4.0),
+                    color=(255, 245, 60, 255),
+                    fill=(0, 0, 0, 0),
+                    thickness=4,
+                    parent=HOLES_LAYER_TAG,
+                )
         return
 
     holes = state["holes"]
@@ -1654,60 +1722,142 @@ def _redraw_mixed_contour_overlay() -> None:
                 )
 
 
-def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    _update_pan_from_mouse()
-    _update_mask_brush_from_mouse()
-    _update_brush_cursor_from_mouse()
-    _update_debug_coords()
-
-    coords = _mouse_to_world()
-    if coords is None:
-        dpg.set_value(COORDS_TAG, "World X: - | World Y: -")
-        return
-
-    _pixel_x, _pixel_y, _grid_x, _grid_y, world_x, world_y = coords
-    if update_rectangle_transient(state, (world_x, world_y)):
-        _redraw_polygon_overlay()
-    dpg.set_value(
-        COORDS_TAG,
-        f"World X: {world_x:.6f} | World Y: {world_y:.6f}",
+def _update_hole_hover_from_mouse(*, force: bool = False) -> int | None:
+    candidate_id = None
+    drag_in_progress = any(
+        bool(gesture.get("dragged"))
+        for gesture in state.get("mouse_gestures", {}).values()
     )
+    if not drag_in_progress and not state.get("pick_manual_hole_center"):
+        mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+        candidate_id = _hole_at_screen(mouse_x, mouse_y)
+
+    if not force and state.get("hovered_hole_id") == candidate_id:
+        return candidate_id
+
+    state["hovered_hole_id"] = candidate_id
+    if dpg.does_item_exist(HOLE_HOVER_INFO_TAG):
+        session = _active_hole_detection_session()
+        candidate = None
+        if session is not None and candidate_id is not None:
+            candidate = next(
+                (
+                    item
+                    for item in session.result.candidates
+                    if int(item.id) == int(candidate_id)
+                ),
+                None,
+            )
+        if candidate is None:
+            text = "Hover a hole candidate for details."
+        else:
+            status = "Accepted" if candidate.accepted else "Rejected"
+            text = (
+                f"Hole #{candidate.id} | Diameter: {candidate.diameter:.3f} mm\n"
+                f"Status: {status}"
+            )
+            if candidate.reject_reason:
+                text += f" | Reason: {candidate.reject_reason}"
+        dpg.set_value(HOLE_HOVER_INFO_TAG, text)
+    _redraw_holes_overlay()
+    return candidate_id
 
 
-def _update_mask_brush_from_mouse() -> None:
-    if state["mode"] != "mask_brush":
-        state["last_brush_image"] = None
-        state["last_brush_world"] = None
-        state["active_brush_stroke_id"] = None
+def _gesture_distance_squared(
+    start: tuple[float, float],
+    current: tuple[float, float],
+) -> float:
+    dx = float(current[0]) - float(start[0])
+    dy = float(current[1]) - float(start[1])
+    return dx * dx + dy * dy
+
+
+def _gesture_is_drag(
+    start: tuple[float, float],
+    current: tuple[float, float],
+) -> bool:
+    return _gesture_distance_squared(start, current) > MOUSE_DRAG_THRESHOLD_PX**2
+
+
+def _mouse_down_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    button = str(_user_data or "")
+    if button not in {"left", "right", "middle"}:
         return
-
-    if state["suppress_brush_until_mouse_release"]:
-        if dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
-            return
-        state["suppress_brush_until_mouse_release"] = False
-
-    if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
-        _finish_active_mask_stroke()
-        state["last_brush_image"] = None
-        state["last_brush_world"] = None
-        state["active_brush_stroke_id"] = None
-        return
-
     if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
-        return
-
-    if _warn_preview_grid_params_not_loaded():
         return
 
     mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
     coords = screen_to_world(mouse_x, mouse_y)
-    if coords is None:
+    start_world = None if coords is None else (coords[-2], coords[-1])
+    state.setdefault("mouse_gestures", {})[button] = {
+        "start_screen": (mouse_x, mouse_y),
+        "last_screen": (mouse_x, mouse_y),
+        "start_world": start_world,
+        "dragged": False,
+        "rectangle_drag_started": False,
+        "brush_last_screen": None,
+        "pan_last_screen": (mouse_x, mouse_y),
+    }
+    if button == "left":
+        state["last_brush_image"] = None
+        state["last_brush_world"] = None
+        state["active_brush_stroke_id"] = None
+
+
+def _update_mouse_gestures(current: tuple[float, float]) -> None:
+    for gesture in state.get("mouse_gestures", {}).values():
+        gesture["last_screen"] = current
+        if not gesture["dragged"] and _gesture_is_drag(
+            gesture["start_screen"],
+            current,
+        ):
+            gesture["dragged"] = True
+
+
+def _update_rectangle_drag_from_mouse(
+    current: tuple[float, float],
+) -> None:
+    gesture = state.get("mouse_gestures", {}).get("left")
+    if (
+        state.get("mode") != "rectangle"
+        or gesture is None
+        or not gesture.get("dragged")
+    ):
         return
 
+    world = gesture.get("start_world")
+    if world is None:
+        return
+    if not gesture.get("rectangle_drag_started"):
+        if state.get("roi_first_world") is None:
+            begin_rectangle_draft(state, world)
+        gesture["rectangle_drag_started"] = True
+
+    coords = screen_to_world(*current)
+    if coords is not None and update_rectangle_transient(
+        state,
+        (coords[-2], coords[-1]),
+    ):
+        _redraw_polygon_overlay()
+
+
+def _apply_mask_brush_at_screen(
+    current: tuple[float, float],
+    *,
+    initial_world: tuple[float, float] | None = None,
+) -> bool:
+    if state.get("mode") != "mask_brush":
+        return False
+    if _warn_preview_grid_params_not_loaded():
+        return False
+
+    coords = screen_to_world(*current)
+    if coords is None:
+        return False
     editing = _active_mask_editing_session()
     if editing is None:
         _set_status("Find a preliminary contour before editing its mask.")
-        return
+        return False
 
     image_x, image_y, _grid_x, _grid_y, world_x, world_y = coords
     try:
@@ -1716,20 +1866,19 @@ def _update_mask_brush_from_mouse() -> None:
         )
     except ValueError as exc:
         _set_status(str(exc))
-        return
-    brush_mode = _get_brush_edit_mode()
+        return False
+
     stroke_id = state["active_brush_stroke_id"]
     if stroke_id is None:
         stroke_id = int(state["next_brush_stroke_id"])
         state["active_brush_stroke_id"] = stroke_id
         state["next_brush_stroke_id"] = stroke_id + 1
-
-    start_world = state["last_brush_world"] or (world_x, world_y)
+    start_world = state["last_brush_world"] or initial_world or (world_x, world_y)
     edits = mask_edits_for_world_segment(
         editing.grid,
         start_world,
         (world_x, world_y),
-        mode=brush_mode,
+        mode=_get_brush_edit_mode(),
         brush_diameter_mm=brush_diameter_mm,
         stroke_id=stroke_id,
     )
@@ -1747,6 +1896,49 @@ def _update_mask_brush_from_mouse() -> None:
         _update_contour_info()
         _redraw_preview()
         _set_status("Mask modified. Release the mouse to update contour.")
+    return True
+
+
+def _update_mask_brush_from_mouse() -> None:
+    gesture = state.get("mouse_gestures", {}).get("left")
+    if (
+        state.get("mode") != "mask_brush"
+        or gesture is None
+        or not gesture.get("dragged")
+    ):
+        return
+    current = tuple(gesture["last_screen"])
+    if gesture.get("brush_last_screen") == current:
+        return
+    if _apply_mask_brush_at_screen(
+        current,
+        initial_world=gesture.get("start_world"),
+    ):
+        gesture["brush_last_screen"] = current
+
+
+def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    mouse_pos = tuple(dpg.get_mouse_pos(local=False))
+    _update_mouse_gestures(mouse_pos)
+    _update_pan_from_mouse()
+    _update_rectangle_drag_from_mouse(mouse_pos)
+    _update_mask_brush_from_mouse()
+    _update_brush_cursor_from_mouse()
+    _update_hole_hover_from_mouse()
+    _update_debug_coords()
+
+    coords = _mouse_to_world()
+    if coords is None:
+        dpg.set_value(COORDS_TAG, "World X: - | World Y: -")
+        return
+
+    _pixel_x, _pixel_y, _grid_x, _grid_y, world_x, world_y = coords
+    if update_rectangle_transient(state, (world_x, world_y)):
+        _redraw_polygon_overlay()
+    dpg.set_value(
+        COORDS_TAG,
+        f"World X: {world_x:.6f} | World Y: {world_y:.6f}",
+    )
 
 
 def _finish_active_mask_stroke() -> bool:
@@ -1769,15 +1961,6 @@ def _finish_active_mask_stroke() -> bool:
         if _refresh_contour_from_current_edits():
             _set_status("Mask edit applied; preliminary contour updated.")
     return finished
-
-
-def _mouse_release_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    if state["mode"] != "mask_brush":
-        return
-    _finish_active_mask_stroke()
-    state["active_brush_stroke_id"] = None
-    state["last_brush_image"] = None
-    state["last_brush_world"] = None
 
 
 def _update_mask_edits_count() -> None:
@@ -1812,10 +1995,10 @@ def _update_holes_stats() -> None:
 
 
 def _update_hole_detection_info() -> None:
+    session = _active_hole_detection_session()
     if not dpg.does_item_exist(HOLE_DETECTION_INFO_TAG):
         return
 
-    session = _active_hole_detection_session()
     if session is not None:
         dpg.set_value(
             HOLE_DETECTION_INFO_TAG,
@@ -1997,6 +2180,69 @@ def _refresh_hole_views() -> None:
     _redraw_preview()
 
 
+def _set_manual_hole_status_by_id(hole_id: int, *, accepted: bool) -> bool:
+    session = _active_hole_detection_session()
+    if session is not None:
+        try:
+            changed = apply_manual_hole_status(
+                session,
+                hole_id,
+                accepted=accepted,
+            )
+        except KeyError:
+            _set_status(f"Hole not found: {hole_id}")
+            return False
+
+        action = "accepted" if accepted else "rejected"
+        if changed:
+            _update_hole_detection_info()
+            _redraw_preview()
+            _set_status(f"Hole {hole_id} {action} manually.")
+        else:
+            _set_status(f"Hole {hole_id} is already {action}.")
+        return changed
+
+    hole = next(
+        (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
+        None,
+    )
+    if hole is None:
+        _set_status(f"Hole not found: {hole_id}")
+        return False
+
+    if accepted:
+        target_group_id = str(
+            dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or ""
+        ).strip()
+        if not hole.get("group_id") and target_group_id:
+            group = next(
+                (
+                    item
+                    for item in state["hole_groups"]
+                    if str(item.get("id", "")) == target_group_id
+                ),
+                None,
+            )
+            if group is None:
+                _set_status(f"Hole group not found: {target_group_id}")
+                return False
+            hole["group_id"] = target_group_id
+
+        hole["accepted"] = True
+        hole["enabled"] = True
+        hole["reject_reason"] = ""
+    else:
+        hole["accepted"] = False
+        hole["enabled"] = False
+        if not hole.get("reject_reason"):
+            hole["reject_reason"] = "manual_reject"
+
+    _refresh_hole_views()
+    action = "accepted" if accepted else "rejected"
+    _set_status(f"Hole {hole_id} {action}.")
+    return True
+
+
 def _move_hole_to_group_callback(
     _sender=None,
     _app_data=None,
@@ -2030,31 +2276,10 @@ def _accept_selected_hole_callback(
     _app_data=None,
     _user_data=None,
 ) -> None:
-    hole_id, hole = _get_selected_hole()
-    if hole is None:
-        return
-
-    target_group_id = str(dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or "").strip()
-    if not hole.get("group_id") and target_group_id:
-        group = next(
-            (
-                item
-                for item in state["hole_groups"]
-                if str(item.get("id", "")) == target_group_id
-            ),
-            None,
-        )
-        if group is None:
-            _set_status(f"Hole group not found: {target_group_id}")
-            return
-
-        hole["group_id"] = target_group_id
-
-    hole["accepted"] = True
-    hole["enabled"] = True
-    hole["reject_reason"] = ""
-    _refresh_hole_views()
-    _set_status(f"Hole {hole_id} accepted.")
+    _set_manual_hole_status_by_id(
+        int(dpg.get_value(MOVE_HOLE_ID_TAG)),
+        accepted=True,
+    )
 
 
 def _reject_selected_hole_callback(
@@ -2062,17 +2287,10 @@ def _reject_selected_hole_callback(
     _app_data=None,
     _user_data=None,
 ) -> None:
-    hole_id, hole = _get_selected_hole()
-    if hole is None:
-        return
-
-    hole["accepted"] = False
-    hole["enabled"] = False
-    if not hole.get("reject_reason"):
-        hole["reject_reason"] = "manual_reject"
-
-    _refresh_hole_views()
-    _set_status(f"Hole {hole_id} rejected.")
+    _set_manual_hole_status_by_id(
+        int(dpg.get_value(MOVE_HOLE_ID_TAG)),
+        accepted=False,
+    )
 
 
 def _manual_hole_pick_callback(_sender=None, _app_data=None, _user_data=None) -> None:
@@ -2089,7 +2307,6 @@ def _finish_manual_hole_center_pick(world_x: float, world_y: float) -> None:
     state["pick_manual_hole_center"] = False
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
         dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
-    state["suppress_brush_until_mouse_release"] = True
     dpg.set_value(MANUAL_HOLE_X_TAG, world_x)
     dpg.set_value(MANUAL_HOLE_Y_TAG, world_y)
     _redraw_preview()
@@ -2160,7 +2377,6 @@ def _add_manual_hole_callback(
 
     state["manual_hole_center_world"] = None
     state["pick_manual_hole_center"] = False
-    state["suppress_brush_until_mouse_release"] = False
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
         dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
 
@@ -2711,64 +2927,75 @@ def _update_debug_coords() -> None:
 
 
 def _update_pan_from_mouse() -> None:
-    if not dpg.does_item_exist(IMAGE_TAG):
-        state["last_pan_mouse"] = None
-        return
+    moved = False
+    for button in ("right", "middle"):
+        gesture = state.get("mouse_gestures", {}).get(button)
+        if gesture is None or not gesture.get("dragged"):
+            continue
+        current = tuple(gesture["last_screen"])
+        last = tuple(gesture["pan_last_screen"])
+        dx = current[0] - last[0]
+        dy = current[1] - last[1]
+        if dx == 0 and dy == 0:
+            continue
+        state["pan_x"] = float(state["pan_x"]) + dx
+        state["pan_y"] = float(state["pan_y"]) + dy
+        state["last_pan_mouse"] = current
+        gesture["pan_last_screen"] = current
+        moved = True
+    if moved:
+        _redraw_preview()
 
-    pan_button_down = (
-        dpg.is_mouse_button_down(dpg.mvMouseButton_Middle)
-        or dpg.is_mouse_button_down(dpg.mvMouseButton_Right)
+
+def _finish_rectangle_at_world(world_x: float, world_y: float) -> bool:
+    rectangle_roi = finish_rectangle_draft(state, (world_x, world_y))
+    if rectangle_roi is None:
+        return False
+    assert rectangle_roi is not None
+    min_x, min_y, max_x, max_y = rectangle_roi
+    state["editing_overlay_visible"] = True
+    dpg.set_value(ROI_STATUS_TAG, "ROI rectangle ready.")
+    dpg.set_value(
+        ROI_OUTPUT_TAG,
+        "--roi "
+        f"{_format_cli_float(min_x)} "
+        f"{_format_cli_float(min_y)} "
+        f"{_format_cli_float(max_x)} "
+        f"{_format_cli_float(max_y)}",
     )
-
-    if not pan_button_down:
-        state["last_pan_mouse"] = None
-        return
-
-    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-
-    if state["last_pan_mouse"] is None:
-        if dpg.is_item_hovered(IMAGE_TAG):
-            state["last_pan_mouse"] = (mouse_x, mouse_y)
-        return
-
-    last_x, last_y = state["last_pan_mouse"]
-    dx = mouse_x - last_x
-    dy = mouse_y - last_y
-
-    state["pan_x"] = float(state["pan_x"]) + dx
-    state["pan_y"] = float(state["pan_y"]) + dy
-    state["last_pan_mouse"] = (mouse_x, mouse_y)
     _redraw_preview()
+    return True
 
 
-def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    if state["pick_manual_hole_center"]:
+def _route_short_left_click(current: tuple[float, float]) -> bool:
+    if state.get("pick_manual_hole_center"):
         if _warn_preview_grid_params_not_loaded():
-            return
-
-        coords = _mouse_to_world()
+            return True
+        coords = screen_to_world(*current)
         if coords is None:
             _set_status("Pick hole center: click inside preview image.")
-            return
+        else:
+            _finish_manual_hole_center_pick(coords[-2], coords[-1])
+        return True
 
-        *_unused, world_x, world_y = coords
-        _finish_manual_hole_center_pick(world_x, world_y)
-        return
-
-    if state["mode"] == "mask_brush":
-        _update_mask_brush_from_mouse()
-        return
+    hole_id = _hole_at_screen(*current)
+    if hole_id is not None:
+        state["hovered_hole_id"] = hole_id
+        _set_manual_hole_status_by_id(hole_id, accepted=True)
+        return True
 
     if _warn_preview_grid_params_not_loaded():
-        return
-
-    coords = _mouse_to_world()
+        return False
+    coords = screen_to_world(*current)
     if coords is None:
-        return
+        return False
+    world_x, world_y = coords[-2], coords[-1]
 
-    *_unused, world_x, world_y = coords
-
-    if state["mode"] == "polygon":
+    if state.get("mode") == "mask_brush":
+        _apply_mask_brush_at_screen(current, initial_world=(world_x, world_y))
+        _finish_active_mask_stroke()
+        return True
+    if state.get("mode") == "polygon":
         state["polygon_points"].append((world_x, world_y))
         state["undo_history"].append(
             {
@@ -2786,32 +3013,82 @@ def _mouse_click_callback(_sender=None, _app_data=None, _user_data=None) -> None
         dpg.set_value(POLYGON_OUTPUT_TAG, "")
         _update_polygon_points_text()
         _redraw_preview()
+        return True
+    if state.get("mode") == "rectangle":
+        if state.get("roi_first_world") is None:
+            begin_rectangle_draft(state, (world_x, world_y))
+            dpg.set_value(
+                ROI_STATUS_TAG,
+                f"ROI first corner: x={world_x:.6f}, y={world_y:.6f}",
+            )
+            dpg.set_value(ROI_OUTPUT_TAG, "")
+            _redraw_polygon_overlay()
+            return True
+        return _finish_rectangle_at_world(world_x, world_y)
+    return False
+
+
+def _route_short_right_click(current: tuple[float, float]) -> bool:
+    if state.get("pick_manual_hole_center"):
+        return False
+    hole_id = _hole_at_screen(*current)
+    if hole_id is None:
+        return False
+    state["hovered_hole_id"] = hole_id
+    _set_manual_hole_status_by_id(hole_id, accepted=False)
+    return True
+
+
+def _finish_drag_gesture(
+    button: str,
+    gesture: dict,
+    current: tuple[float, float],
+) -> None:
+    if button in {"right", "middle"}:
+        _update_pan_from_mouse()
+        return
+    if button != "left":
+        return
+    if state.get("mode") == "rectangle":
+        _update_rectangle_drag_from_mouse(current)
+        if gesture.get("rectangle_drag_started"):
+            coords = screen_to_world(*current)
+            if coords is not None:
+                _finish_rectangle_at_world(coords[-2], coords[-1])
+    elif state.get("mode") == "mask_brush":
+        _update_mask_brush_from_mouse()
+        _finish_active_mask_stroke()
+
+
+def _mouse_release_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    button = str(_user_data or "")
+    gesture = state.get("mouse_gestures", {}).get(button)
+    if gesture is None:
         return
 
-    if state["roi_first_world"] is None:
-        begin_rectangle_draft(state, (world_x, world_y))
-        dpg.set_value(
-            ROI_STATUS_TAG,
-            f"ROI first corner: x={world_x:.6f}, y={world_y:.6f}",
-        )
-        dpg.set_value(ROI_OUTPUT_TAG, "")
-        _redraw_polygon_overlay()
-        return
+    current = tuple(dpg.get_mouse_pos(local=False))
+    gesture["last_screen"] = current
+    if not gesture.get("dragged") and _gesture_is_drag(
+        gesture["start_screen"],
+        current,
+    ):
+        gesture["dragged"] = True
 
-    rectangle_roi = finish_rectangle_draft(state, (world_x, world_y))
-    assert rectangle_roi is not None
-    min_x, min_y, max_x, max_y = rectangle_roi
-    state["editing_overlay_visible"] = True
-    dpg.set_value(ROI_STATUS_TAG, "ROI rectangle ready.")
-    dpg.set_value(
-        ROI_OUTPUT_TAG,
-        "--roi "
-        f"{_format_cli_float(min_x)} "
-        f"{_format_cli_float(min_y)} "
-        f"{_format_cli_float(max_x)} "
-        f"{_format_cli_float(max_y)}",
-    )
-    _redraw_preview()
+    if gesture.get("dragged"):
+        _finish_drag_gesture(button, gesture, current)
+    elif button == "left":
+        _route_short_left_click(current)
+    elif button == "right":
+        _route_short_right_click(current)
+
+    state["mouse_gestures"].pop(button, None)
+    if button in {"right", "middle"}:
+        state["last_pan_mouse"] = None
+    if button == "left":
+        state["active_brush_stroke_id"] = None
+        state["last_brush_image"] = None
+        state["last_brush_world"] = None
+    _update_hole_hover_from_mouse(force=True)
 
 
 def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
@@ -3745,7 +4022,6 @@ def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None
     state["visible_hole_group_ids"] = {}
     state["pick_manual_hole_center"] = False
     state["manual_hole_center_world"] = None
-    state["suppress_brush_until_mouse_release"] = False
     if state.get("hole_overlay_source") == "legacy":
         state["hole_overlay_source"] = None
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
@@ -4019,11 +4295,33 @@ def run() -> None:
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
         dpg.add_mouse_click_handler(
             button=dpg.mvMouseButton_Left,
-            callback=_mouse_click_callback,
+            callback=_mouse_down_callback,
+            user_data="left",
+        )
+        dpg.add_mouse_click_handler(
+            button=dpg.mvMouseButton_Right,
+            callback=_mouse_down_callback,
+            user_data="right",
+        )
+        dpg.add_mouse_click_handler(
+            button=dpg.mvMouseButton_Middle,
+            callback=_mouse_down_callback,
+            user_data="middle",
         )
         dpg.add_mouse_release_handler(
             button=dpg.mvMouseButton_Left,
             callback=_mouse_release_callback,
+            user_data="left",
+        )
+        dpg.add_mouse_release_handler(
+            button=dpg.mvMouseButton_Right,
+            callback=_mouse_release_callback,
+            user_data="right",
+        )
+        dpg.add_mouse_release_handler(
+            button=dpg.mvMouseButton_Middle,
+            callback=_mouse_release_callback,
+            user_data="middle",
         )
         dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
         dpg.add_key_press_handler(callback=_key_press_callback)
@@ -4275,6 +4573,11 @@ def run() -> None:
                     callback=_find_holes_callback,
                     width=-1,
                     enabled=False,
+                )
+                dpg.add_text(
+                    "Hover a hole candidate for details.",
+                    tag=HOLE_HOVER_INFO_TAG,
+                    wrap=320,
                 )
                 dpg.pop_container_stack()
 
