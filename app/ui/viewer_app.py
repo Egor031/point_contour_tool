@@ -65,6 +65,7 @@ from app.ui.hole_workflow import (
 TEXTURE_TAG = "preview_texture"
 SELECTION_TEXTURE_TAG = "selection_dim_texture"
 PROCESSING_MASK_TEXTURE_TAG = "processing_mask_texture"
+IMAGE_AREA_TAG = "image_area"
 IMAGE_TAG = "preview_drawlist"
 POLYGON_LAYER_TAG = "polygon_overlay_layer"
 SELECTION_LAYER_TAG = "selection_dim_layer"
@@ -75,6 +76,7 @@ MANUAL_HOLE_CENTER_LAYER_TAG = "manual_hole_center_overlay_layer"
 BRUSH_CURSOR_LAYER_TAG = "brush_cursor_overlay_layer"
 CONTOUR_LAYER_TAG = "contour_overlay_layer"
 MIXED_CONTOUR_LAYER_TAG = "mixed_contour_overlay_layer"
+PREVIEW_MOUSE_HANDLER_TAG = "preview_mouse_handlers"
 SHOW_ROI_OVERLAY_TAG = "show_roi_overlay"
 SHOW_MASK_REMOVE_EDITS_TAG = "show_mask_remove_edits"
 SHOW_MASK_ADD_EDITS_TAG = "show_mask_add_edits"
@@ -181,6 +183,7 @@ state = {
     "pan_x": 0.0,
     "pan_y": 0.0,
     "last_pan_mouse": None,
+    "pan_redraw_pending": False,
     "roi_first_world": None,
     "roi_current_world": None,
     "rectangle_roi": None,
@@ -204,6 +207,7 @@ state = {
     "holes_outdated": False,
     "hole_overlay_source": None,
     "hovered_hole_id": None,
+    "last_event_mouse_position": None,
     "mouse_gestures": {},
     "holes": [],
     "hole_groups": [],
@@ -749,6 +753,45 @@ def _screen_to_canvas(mouse_x: float, mouse_y: float) -> tuple[float, float] | N
     return mouse_x - canvas_left, mouse_y - canvas_top
 
 
+def _screen_position_is_on_preview(position: tuple[float, float]) -> bool:
+    canvas_pos = _screen_to_canvas(*position)
+    if canvas_pos is None:
+        return False
+    canvas_x, canvas_y = canvas_pos
+    return 0.0 <= canvas_x < CANVAS_WIDTH and 0.0 <= canvas_y < CANVAS_HEIGHT
+
+
+def _screen_position_is_in_visible_preview(
+    position: tuple[float, float],
+) -> bool:
+    if not dpg.does_item_exist(IMAGE_AREA_TAG):
+        return False
+
+    item_state = dpg.get_item_state(IMAGE_AREA_TAG)
+    if not isinstance(item_state, dict):
+        return False
+    origin = item_state.get("pos")
+    size = item_state.get("rect_size")
+    if not isinstance(origin, (tuple, list)) or len(origin) < 2:
+        return False
+    if not isinstance(size, (tuple, list)) or len(size) < 2:
+        return False
+
+    try:
+        mouse_x, mouse_y = float(position[0]), float(position[1])
+        left, top = float(origin[0]), float(origin[1])
+        width, height = float(size[0]), float(size[1])
+    except (TypeError, ValueError):
+        return False
+
+    return (
+        width > 0.0
+        and height > 0.0
+        and left <= mouse_x < left + width
+        and top <= mouse_y < top + height
+    )
+
+
 def screen_to_image(mouse_x: float, mouse_y: float) -> tuple[float, float] | None:
     canvas_pos = _screen_to_canvas(mouse_x, mouse_y)
     if canvas_pos is None:
@@ -858,7 +901,7 @@ def _redraw_preview() -> None:
     with dpg.drawlist(
         width=CANVAS_WIDTH,
         height=CANVAS_HEIGHT,
-        parent="image_area",
+        parent=IMAGE_AREA_TAG,
         tag=IMAGE_TAG,
     ):
         scaled_width, scaled_height = _scaled_image_size()
@@ -869,6 +912,9 @@ def _redraw_preview() -> None:
             (pan_x, pan_y),
             (pan_x + scaled_width, pan_y + scaled_height),
         )
+
+    if dpg.does_item_exist(PREVIEW_MOUSE_HANDLER_TAG):
+        dpg.bind_item_handler_registry(IMAGE_TAG, PREVIEW_MOUSE_HANDLER_TAG)
 
     _redraw_selection_overlay()
     _redraw_processing_mask_overlay()
@@ -1447,7 +1493,7 @@ def _hole_candidate_hit_region(candidate) -> HoleHitRegion | None:
 def _hole_at_screen(mouse_x: float, mouse_y: float) -> int | None:
     if state.get("pick_manual_hole_center"):
         return None
-    if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
+    if not _screen_position_is_on_preview((mouse_x, mouse_y)):
         return None
     canvas_pos = _screen_to_canvas(mouse_x, mouse_y)
     if canvas_pos is None:
@@ -1728,7 +1774,12 @@ def _update_hole_hover_from_mouse(*, force: bool = False) -> int | None:
         bool(gesture.get("dragged"))
         for gesture in state.get("mouse_gestures", {}).values()
     )
-    if not drag_in_progress and not state.get("pick_manual_hole_center"):
+    if (
+        not drag_in_progress
+        and not state.get("pick_manual_hole_center")
+        and dpg.does_item_exist(IMAGE_TAG)
+        and dpg.is_item_hovered(IMAGE_TAG)
+    ):
         mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
         candidate_id = _hole_at_screen(mouse_x, mouse_y)
 
@@ -1779,14 +1830,46 @@ def _gesture_is_drag(
     return _gesture_distance_squared(start, current) > MOUSE_DRAG_THRESHOLD_PX**2
 
 
+def _mouse_position_from_move_event(app_data) -> tuple[float, float] | None:
+    if not isinstance(app_data, (tuple, list)) or len(app_data) < 2:
+        return None
+    try:
+        return float(app_data[0]), float(app_data[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_event_mouse_position() -> tuple[float, float] | None:
+    position = state.get("last_event_mouse_position")
+    if not isinstance(position, (tuple, list)) or len(position) < 2:
+        return None
+    return float(position[0]), float(position[1])
+
+
+def _preview_click_matches(button: str, app_data) -> bool:
+    expected_button = {
+        "left": dpg.mvMouseButton_Left,
+        "right": dpg.mvMouseButton_Right,
+        "middle": dpg.mvMouseButton_Middle,
+    }.get(button)
+    if expected_button is None or not isinstance(app_data, (tuple, list)):
+        return False
+    if len(app_data) < 2:
+        return False
+    return app_data[0] == expected_button and app_data[1] == IMAGE_TAG
+
+
 def _mouse_down_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     button = str(_user_data or "")
-    if button not in {"left", "right", "middle"}:
+    if not _preview_click_matches(button, _app_data):
         return
-    if not dpg.does_item_exist(IMAGE_TAG) or not dpg.is_item_hovered(IMAGE_TAG):
+    if not dpg.does_item_exist(IMAGE_TAG):
         return
 
-    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    position = _last_event_mouse_position()
+    if position is None:
+        return
+    mouse_x, mouse_y = position
     coords = screen_to_world(mouse_x, mouse_y)
     start_world = None if coords is None else (coords[-2], coords[-1])
     state.setdefault("mouse_gestures", {})[button] = {
@@ -1918,7 +2001,10 @@ def _update_mask_brush_from_mouse() -> None:
 
 
 def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
-    mouse_pos = tuple(dpg.get_mouse_pos(local=False))
+    mouse_pos = _mouse_position_from_move_event(_app_data)
+    if mouse_pos is None:
+        return
+    state["last_event_mouse_position"] = mouse_pos
     _update_mouse_gestures(mouse_pos)
     _update_pan_from_mouse()
     _update_rectangle_drag_from_mouse(mouse_pos)
@@ -1927,7 +2013,7 @@ def _mouse_move_callback(_sender=None, _app_data=None, _user_data=None) -> None:
     _update_hole_hover_from_mouse()
     _update_debug_coords()
 
-    coords = _mouse_to_world()
+    coords = screen_to_world(*mouse_pos)
     if coords is None:
         dpg.set_value(COORDS_TAG, "World X: - | World Y: -")
         return
@@ -2928,9 +3014,14 @@ def _update_debug_coords() -> None:
 
 def _update_pan_from_mouse() -> None:
     moved = False
-    for button in ("right", "middle"):
+    for button, mouse_button in (
+        ("right", dpg.mvMouseButton_Right),
+        ("middle", dpg.mvMouseButton_Middle),
+    ):
         gesture = state.get("mouse_gestures", {}).get(button)
         if gesture is None or not gesture.get("dragged"):
+            continue
+        if not dpg.is_mouse_button_down(mouse_button):
             continue
         current = tuple(gesture["last_screen"])
         last = tuple(gesture["pan_last_screen"])
@@ -2944,7 +3035,15 @@ def _update_pan_from_mouse() -> None:
         gesture["pan_last_screen"] = current
         moved = True
     if moved:
-        _redraw_preview()
+        state["pan_redraw_pending"] = True
+
+
+def _flush_pending_pan_redraw() -> bool:
+    if not state.get("pan_redraw_pending"):
+        return False
+    state["pan_redraw_pending"] = False
+    _redraw_preview()
+    return True
 
 
 def _finish_rectangle_at_world(world_x: float, world_y: float) -> bool:
@@ -3066,7 +3165,9 @@ def _mouse_release_callback(_sender=None, _app_data=None, _user_data=None) -> No
     if gesture is None:
         return
 
-    current = tuple(dpg.get_mouse_pos(local=False))
+    current = _last_event_mouse_position()
+    if current is None:
+        current = tuple(gesture["last_screen"])
     gesture["last_screen"] = current
     if not gesture.get("dragged") and _gesture_is_drag(
         gesture["start_screen"],
@@ -3092,14 +3193,11 @@ def _mouse_release_callback(_sender=None, _app_data=None, _user_data=None) -> No
 
 
 def _mouse_wheel_callback(_sender=None, app_data=None, _user_data=None) -> None:
-    if not dpg.does_item_exist(IMAGE_TAG):
+    position = _last_event_mouse_position()
+    if position is None or not _screen_position_is_in_visible_preview(position):
         return
 
-    if not dpg.is_item_hovered(IMAGE_TAG):
-        return
-
-    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
-    anchor = _screen_to_canvas(mouse_x, mouse_y)
+    anchor = _screen_to_canvas(*position)
     if anchor is None:
         return
 
@@ -4293,21 +4391,6 @@ def run() -> None:
 
     with dpg.handler_registry():
         dpg.add_mouse_move_handler(callback=_mouse_move_callback)
-        dpg.add_mouse_click_handler(
-            button=dpg.mvMouseButton_Left,
-            callback=_mouse_down_callback,
-            user_data="left",
-        )
-        dpg.add_mouse_click_handler(
-            button=dpg.mvMouseButton_Right,
-            callback=_mouse_down_callback,
-            user_data="right",
-        )
-        dpg.add_mouse_click_handler(
-            button=dpg.mvMouseButton_Middle,
-            callback=_mouse_down_callback,
-            user_data="middle",
-        )
         dpg.add_mouse_release_handler(
             button=dpg.mvMouseButton_Left,
             callback=_mouse_release_callback,
@@ -4325,6 +4408,23 @@ def run() -> None:
         )
         dpg.add_mouse_wheel_handler(callback=_mouse_wheel_callback)
         dpg.add_key_press_handler(callback=_key_press_callback)
+
+    with dpg.item_handler_registry(tag=PREVIEW_MOUSE_HANDLER_TAG):
+        dpg.add_item_clicked_handler(
+            button=dpg.mvMouseButton_Left,
+            callback=_mouse_down_callback,
+            user_data="left",
+        )
+        dpg.add_item_clicked_handler(
+            button=dpg.mvMouseButton_Right,
+            callback=_mouse_down_callback,
+            user_data="right",
+        )
+        dpg.add_item_clicked_handler(
+            button=dpg.mvMouseButton_Middle,
+            callback=_mouse_down_callback,
+            user_data="middle",
+        )
 
     with dpg.item_handler_registry(tag="manual_threshold_commit_handlers"):
         dpg.add_item_deactivated_after_edit_handler(
@@ -4390,7 +4490,7 @@ def run() -> None:
 
         with dpg.group(horizontal=True):
             with dpg.child_window(
-                tag="image_area",
+                tag=IMAGE_AREA_TAG,
                 border=False,
                 horizontal_scrollbar=False,
                 no_scrollbar=True,
@@ -4972,6 +5072,7 @@ def run() -> None:
     dpg.set_primary_window("main_window", True)
     while dpg.is_dearpygui_running():
         _process_density_worker_messages()
+        _flush_pending_pan_redraw()
         dpg.render_dearpygui_frame()
     dpg.destroy_context()
 

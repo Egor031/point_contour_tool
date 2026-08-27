@@ -137,6 +137,27 @@ class TestGuiDensityWorkflow(unittest.TestCase):
                 self.assertFalse(
                     dpg.is_item_shown(viewer_app.DENSITY_SETUP_WINDOW_TAG)
                 )
+                self.assertTrue(
+                    dpg.does_item_exist(viewer_app.PREVIEW_MOUSE_HANDLER_TAG)
+                )
+                preview_mouse_handlers = dpg.get_item_children(
+                    viewer_app.PREVIEW_MOUSE_HANDLER_TAG,
+                    slot=1,
+                )
+                self.assertEqual(len(preview_mouse_handlers), 3)
+                self.assertTrue(
+                    all(
+                        dpg.get_item_type(item) == "mvAppItemType::mvClickedHandler"
+                        for item in preview_mouse_handlers
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        dpg.get_item_type(item)
+                        == "mvAppItemType::mvMouseClickHandler"
+                        for item in dpg.get_all_items()
+                    )
+                )
 
                 item = viewer_app.DENSITY_SOURCE_FILE_TAG
                 ancestors = set()

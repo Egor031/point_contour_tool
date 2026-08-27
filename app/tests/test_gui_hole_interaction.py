@@ -197,8 +197,262 @@ class TestHoleInteractionViewer(unittest.TestCase):
     def tearDown(self):
         viewer_app.state["hovered_hole_id"] = None
         viewer_app.state["mouse_gestures"] = {}
+        viewer_app.state["last_event_mouse_position"] = None
+        viewer_app.state["pan_redraw_pending"] = False
         viewer_app.state["pick_manual_hole_center"] = False
         viewer_app.state["mode"] = "rectangle"
+
+    @staticmethod
+    def _preview_click_data(button: str):
+        button_id = {
+            "left": viewer_app.dpg.mvMouseButton_Left,
+            "right": viewer_app.dpg.mvMouseButton_Right,
+            "middle": viewer_app.dpg.mvMouseButton_Middle,
+        }[button]
+        return button_id, viewer_app.IMAGE_TAG
+
+    def test_sidebar_click_never_starts_preview_gesture_or_rectangle(self):
+        replacement = {
+            "mode": "rectangle",
+            "mouse_gestures": {},
+            "last_event_mouse_position": (20.0, 30.0),
+            "roi_first_world": None,
+            "roi_current_world": None,
+            "rectangle_roi": None,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(viewer_app, "_route_short_left_click") as route,
+        ):
+            for index in range(10):
+                viewer_app._mouse_down_callback(
+                    _app_data=(viewer_app.dpg.mvMouseButton_Left, "show_contour"),
+                    _user_data="left",
+                )
+                viewer_app.state["last_event_mouse_position"] = (
+                    500.0 + index,
+                    400.0 + index,
+                )
+                viewer_app._mouse_release_callback(_user_data="left")
+            self.assertEqual(viewer_app.state["mouse_gestures"], {})
+            self.assertIsNone(viewer_app.state["roi_first_world"])
+            self.assertIsNone(viewer_app.state["roi_current_world"])
+            self.assertIsNone(viewer_app.state["rectangle_roi"])
+        route.assert_not_called()
+
+    def test_sidebar_click_does_not_reach_polygon_brush_or_manual_hole(self):
+        for mode, manual_pick in (
+            ("polygon", False),
+            ("mask_brush", False),
+            ("rectangle", True),
+        ):
+            with self.subTest(mode=mode, manual_pick=manual_pick):
+                replacement = {
+                    "mode": mode,
+                    "mouse_gestures": {},
+                    "last_event_mouse_position": (600.0, 500.0),
+                    "polygon_points": [],
+                    "pick_manual_hole_center": manual_pick,
+                    "manual_hole_center_world": None,
+                }
+                with (
+                    patch.dict(viewer_app.state, replacement, clear=False),
+                    patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+                    patch.object(viewer_app, "_apply_mask_brush_at_screen") as brush,
+                    patch.object(viewer_app, "_finish_active_mask_stroke") as finish_brush,
+                    patch.object(viewer_app, "_finish_manual_hole_center_pick") as pick,
+                ):
+                    viewer_app._mouse_down_callback(
+                        _app_data=(
+                            viewer_app.dpg.mvMouseButton_Left,
+                            "sidebar_control",
+                        ),
+                        _user_data="left",
+                    )
+                    viewer_app._mouse_release_callback(_user_data="left")
+                    self.assertEqual(viewer_app.state["polygon_points"], [])
+                    self.assertIsNone(
+                        viewer_app.state["manual_hole_center_world"]
+                    )
+                brush.assert_not_called()
+                finish_brush.assert_not_called()
+                pick.assert_not_called()
+
+    def test_sidebar_lmb_and_rmb_do_not_change_hole_status(self):
+        replacement = {
+            "mouse_gestures": {},
+            "last_event_mouse_position": (700.0, 600.0),
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(viewer_app, "_hole_at_screen", return_value=2),
+            patch.object(viewer_app, "_set_manual_hole_status_by_id") as status,
+        ):
+            for button, button_id in (
+                ("left", viewer_app.dpg.mvMouseButton_Left),
+                ("right", viewer_app.dpg.mvMouseButton_Right),
+            ):
+                viewer_app._mouse_down_callback(
+                    _app_data=(button_id, "sidebar_control"),
+                    _user_data=button,
+                )
+                viewer_app._mouse_release_callback(_user_data=button)
+
+        status.assert_not_called()
+
+    def test_delayed_preview_click_uses_event_position_not_current_cursor(self):
+        event_position = (120.0, 130.0)
+        current_cursor = (900.0, 800.0)
+        replacement = {
+            "mode": "rectangle",
+            "mouse_gestures": {},
+            "last_event_mouse_position": event_position,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app.dpg,
+                "get_mouse_pos",
+                return_value=current_cursor,
+            ) as get_mouse_pos,
+            patch.object(
+                viewer_app,
+                "screen_to_world",
+                return_value=(0.0, 0.0, 0.0, 0.0, 12.0, 13.0),
+            ),
+            patch.object(viewer_app, "_route_short_left_click") as route,
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+        ):
+            viewer_app._mouse_down_callback(
+                _app_data=self._preview_click_data("left"),
+                _user_data="left",
+            )
+            self.assertEqual(
+                viewer_app.state["mouse_gestures"]["left"]["start_screen"],
+                event_position,
+            )
+            viewer_app._mouse_release_callback(_user_data="left")
+
+        route.assert_called_once_with(event_position)
+        get_mouse_pos.assert_not_called()
+
+    def test_move_app_data_drives_drag_threshold_and_rectangle_position(self):
+        start = (40.0, 50.0)
+        event_move = (40.0 + viewer_app.MOUSE_DRAG_THRESHOLD_PX + 1.0, 50.0)
+        replacement = {
+            "mode": "rectangle",
+            "mouse_gestures": {},
+            "last_event_mouse_position": start,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app,
+                "screen_to_world",
+                return_value=(0.0, 0.0, 0.0, 0.0, 4.0, 5.0),
+            ),
+            patch.object(viewer_app, "_update_pan_from_mouse"),
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse") as rectangle,
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app.dpg, "set_value"),
+        ):
+            viewer_app._mouse_down_callback(
+                _app_data=self._preview_click_data("left"),
+                _user_data="left",
+            )
+            viewer_app._mouse_move_callback(_app_data=event_move)
+            gesture = viewer_app.state["mouse_gestures"]["left"]
+            self.assertEqual(gesture["last_screen"], event_move)
+            self.assertTrue(gesture["dragged"])
+        rectangle.assert_called_once_with(event_move)
+
+    def test_event_time_right_move_pans_and_global_release_works_outside(self):
+        start = (100.0, 100.0)
+        outside = (2505.0, 1705.0)
+        replacement = {
+            "mode": "rectangle",
+            "mouse_gestures": {},
+            "last_event_mouse_position": start,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "last_pan_mouse": None,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app,
+                "screen_to_world",
+                return_value=(0.0, 0.0, 0.0, 0.0, 1.0, 1.0),
+            ),
+            patch.object(
+                viewer_app.dpg,
+                "is_mouse_button_down",
+                side_effect=lambda button: button
+                == viewer_app.dpg.mvMouseButton_Right,
+            ),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app.dpg, "set_value"),
+        ):
+            viewer_app._mouse_down_callback(
+                _app_data=self._preview_click_data("right"),
+                _user_data="right",
+            )
+            viewer_app._mouse_move_callback(_app_data=outside)
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (outside[0] - start[0], outside[1] - start[1]),
+            )
+            viewer_app._mouse_release_callback(_user_data="right")
+            self.assertNotIn("right", viewer_app.state["mouse_gestures"])
+
+    def test_visual_hole_hover_uses_current_cursor_not_queued_move_position(self):
+        event_position = (110.0, 120.0)
+        current_cursor = (510.0, 520.0)
+        replacement = {
+            "mouse_gestures": {},
+            "last_event_mouse_position": None,
+            "pick_manual_hole_center": False,
+            "hovered_hole_id": None,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "get_mouse_pos", return_value=current_cursor),
+            patch.object(
+                viewer_app.dpg,
+                "does_item_exist",
+                side_effect=lambda tag: tag == viewer_app.IMAGE_TAG,
+            ),
+            patch.object(viewer_app.dpg, "is_item_hovered", return_value=True),
+            patch.object(viewer_app, "_hole_at_screen", return_value=2) as hit_test,
+            patch.object(viewer_app, "_redraw_holes_overlay"),
+            patch.object(viewer_app, "_update_pan_from_mouse"),
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app, "screen_to_world", return_value=None),
+            patch.object(viewer_app.dpg, "set_value"),
+        ):
+            viewer_app._mouse_move_callback(_app_data=event_position)
+            self.assertEqual(
+                viewer_app.state["last_event_mouse_position"],
+                event_position,
+            )
+            self.assertEqual(viewer_app.state["hovered_hole_id"], 2)
+        hit_test.assert_called_once_with(*current_cursor)
 
     def _screen_hit(
         self,
@@ -291,7 +545,12 @@ class TestHoleInteractionViewer(unittest.TestCase):
                     patch.object(
                         viewer_app.dpg,
                         "does_item_exist",
-                        return_value=False,
+                        side_effect=lambda tag: tag == viewer_app.IMAGE_TAG,
+                    ),
+                    patch.object(
+                        viewer_app.dpg,
+                        "is_item_hovered",
+                        return_value=True,
                     ),
                     patch.object(viewer_app, "_hole_at_screen", return_value=2),
                     patch.object(viewer_app, "_redraw_holes_overlay") as redraw,
@@ -332,16 +591,14 @@ class TestHoleInteractionViewer(unittest.TestCase):
         finish_roi.assert_not_called()
 
     def test_down_release_router_classifies_short_click_once(self):
-        replacement = {"mouse_gestures": {}, "mode": "rectangle"}
+        replacement = {
+            "mouse_gestures": {},
+            "mode": "rectangle",
+            "last_event_mouse_position": (10.0, 10.0),
+        }
         with (
             patch.dict(viewer_app.state, replacement, clear=False),
             patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
-            patch.object(viewer_app.dpg, "is_item_hovered", return_value=True),
-            patch.object(
-                viewer_app.dpg,
-                "get_mouse_pos",
-                side_effect=((10.0, 10.0), (12.0, 11.0)),
-            ),
             patch.object(
                 viewer_app,
                 "screen_to_world",
@@ -350,8 +607,12 @@ class TestHoleInteractionViewer(unittest.TestCase):
             patch.object(viewer_app, "_route_short_left_click") as route,
             patch.object(viewer_app, "_update_hole_hover_from_mouse"),
         ):
-            viewer_app._mouse_down_callback(_user_data="left")
+            viewer_app._mouse_down_callback(
+                _app_data=(viewer_app.dpg.mvMouseButton_Left, viewer_app.IMAGE_TAG),
+                _user_data="left",
+            )
             self.assertIn("left", viewer_app.state["mouse_gestures"])
+            viewer_app.state["last_event_mouse_position"] = (12.0, 11.0)
             viewer_app._mouse_release_callback(_user_data="left")
             self.assertNotIn("left", viewer_app.state["mouse_gestures"])
         route.assert_called_once_with((12.0, 11.0))
@@ -508,6 +769,7 @@ class TestHoleInteractionViewer(unittest.TestCase):
         }
         with (
             patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "is_mouse_button_down", return_value=True),
             patch.object(viewer_app, "_redraw_preview"),
             patch.object(viewer_app, "_set_manual_hole_status_by_id") as status,
         ):
@@ -515,6 +777,380 @@ class TestHoleInteractionViewer(unittest.TestCase):
             self.assertEqual((viewer_app.state["pan_x"], viewer_app.state["pan_y"]), (27.0, 21.0))
         self.assertTrue(session.result.candidates[0].accepted)
         status.assert_not_called()
+
+    def test_right_pan_moves_coalesce_until_frame_flush(self):
+        gesture = _gesture(
+            "right",
+            start=(0.0, 0.0),
+            current=(0.0, 0.0),
+        )
+        replacement = {
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "pan_redraw_pending": False,
+            "mouse_gestures": {"right": gesture},
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "is_mouse_button_down", return_value=True),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app, "_redraw_preview") as redraw,
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app, "screen_to_world", return_value=None),
+        ):
+            for position in ((10.0, 0.0), (20.0, 0.0), (30.0, 0.0)):
+                viewer_app._mouse_move_callback(_app_data=position)
+
+            self.assertEqual(viewer_app.state["pan_x"], 30.0)
+            self.assertEqual(gesture["pan_last_screen"], (30.0, 0.0))
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            redraw.assert_not_called()
+
+            self.assertTrue(viewer_app._flush_pending_pan_redraw())
+            redraw.assert_called_once()
+            self.assertFalse(viewer_app.state["pan_redraw_pending"])
+            self.assertFalse(viewer_app._flush_pending_pan_redraw())
+            redraw.assert_called_once()
+
+    def test_large_pan_queue_and_direction_change_use_one_redraw(self):
+        gesture = _gesture(
+            "right",
+            start=(0.0, 0.0),
+            current=(0.0, 0.0),
+        )
+        replacement = {
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "pan_redraw_pending": False,
+            "mouse_gestures": {"right": gesture},
+        }
+        move_positions = [
+            (float(x), 0.0) for x in range(10, 501, 10)
+        ] + [
+            (float(x), 0.0) for x in range(490, -1, -10)
+        ]
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "is_mouse_button_down", return_value=True),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app, "_redraw_preview") as redraw,
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app, "screen_to_world", return_value=None),
+        ):
+            for position in move_positions[:50]:
+                viewer_app._mouse_move_callback(_app_data=position)
+            self.assertEqual(viewer_app.state["pan_x"], 500.0)
+
+            for position in move_positions[50:]:
+                viewer_app._mouse_move_callback(_app_data=position)
+            self.assertEqual(viewer_app.state["pan_x"], 0.0)
+            self.assertEqual(gesture["pan_last_screen"], (0.0, 0.0))
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            redraw.assert_not_called()
+
+            viewer_app._flush_pending_pan_redraw()
+            redraw.assert_called_once()
+            self.assertFalse(viewer_app.state["pan_redraw_pending"])
+
+    def test_middle_pan_moves_coalesce_until_frame_flush(self):
+        gesture = _gesture(
+            "middle",
+            start=(5.0, 7.0),
+            current=(5.0, 7.0),
+            dragged=True,
+        )
+        replacement = {
+            "pan_x": 2.0,
+            "pan_y": 3.0,
+            "pan_redraw_pending": False,
+            "mouse_gestures": {"middle": gesture},
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "is_mouse_button_down", return_value=True),
+            patch.object(viewer_app, "_redraw_preview") as redraw,
+        ):
+            for position in ((15.0, 17.0), (25.0, 27.0), (35.0, 37.0)):
+                gesture["last_screen"] = position
+                viewer_app._update_pan_from_mouse()
+
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (32.0, 33.0),
+            )
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            redraw.assert_not_called()
+            viewer_app._flush_pending_pan_redraw()
+            redraw.assert_called_once()
+            self.assertFalse(viewer_app.state["pan_redraw_pending"])
+
+    def test_pan_move_arriving_during_redraw_stays_pending(self):
+        redraw_count = 0
+
+        def redraw_with_concurrent_pan():
+            nonlocal redraw_count
+            redraw_count += 1
+            if redraw_count == 1:
+                viewer_app.state["pan_redraw_pending"] = True
+
+        with (
+            patch.dict(
+                viewer_app.state,
+                {"pan_redraw_pending": True},
+                clear=False,
+            ),
+            patch.object(
+                viewer_app,
+                "_redraw_preview",
+                side_effect=redraw_with_concurrent_pan,
+            ),
+        ):
+            self.assertTrue(viewer_app._flush_pending_pan_redraw())
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            self.assertTrue(viewer_app._flush_pending_pan_redraw())
+            self.assertFalse(viewer_app.state["pan_redraw_pending"])
+
+        self.assertEqual(redraw_count, 2)
+
+    def test_pan_coalescing_keeps_all_brush_move_callbacks(self):
+        positions = ((8.0, 5.0), (11.0, 6.0), (14.0, 8.0))
+        gesture = _gesture(
+            "left",
+            start=(2.0, 2.0),
+            current=(2.0, 2.0),
+        )
+        replacement = {
+            "mode": "mask_brush",
+            "pan_redraw_pending": False,
+            "mouse_gestures": {"left": gesture},
+        }
+        brush_positions = []
+
+        def record_brush_position():
+            brush_positions.append(tuple(gesture["last_screen"]))
+
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(
+                viewer_app,
+                "_update_mask_brush_from_mouse",
+                side_effect=record_brush_position,
+            ),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app, "screen_to_world", return_value=None),
+        ):
+            for position in positions:
+                viewer_app._mouse_move_callback(_app_data=position)
+
+        self.assertEqual(brush_positions, list(positions))
+        self.assertFalse(viewer_app.state["pan_redraw_pending"])
+
+    def test_queued_right_moves_do_not_pan_after_physical_release(self):
+        gesture = _gesture(
+            "right",
+            start=(100.0, 100.0),
+            current=(100.0, 100.0),
+        )
+        replacement = {
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "last_pan_mouse": None,
+            "mouse_gestures": {"right": gesture},
+        }
+        physical_down = True
+
+        def is_mouse_button_down(button):
+            return physical_down and button == viewer_app.dpg.mvMouseButton_Right
+
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(
+                viewer_app.dpg,
+                "is_mouse_button_down",
+                side_effect=is_mouse_button_down,
+            ),
+            patch.object(viewer_app.dpg, "set_value"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_update_rectangle_drag_from_mouse"),
+            patch.object(viewer_app, "_update_mask_brush_from_mouse"),
+            patch.object(viewer_app, "_update_brush_cursor_from_mouse"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+            patch.object(viewer_app, "_update_debug_coords"),
+            patch.object(viewer_app, "screen_to_world", return_value=None),
+        ):
+            viewer_app._mouse_move_callback(_app_data=(112.0, 100.0))
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (12.0, 0.0),
+            )
+
+            physical_down = False
+            for current in ((124.0, 100.0), (136.0, 100.0), (148.0, 100.0)):
+                viewer_app._mouse_move_callback(_app_data=current)
+                self.assertEqual(
+                    (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                    (12.0, 0.0),
+                )
+                self.assertIn("right", viewer_app.state["mouse_gestures"])
+
+            viewer_app._mouse_release_callback(_user_data="right")
+            self.assertNotIn("right", viewer_app.state["mouse_gestures"])
+            viewer_app._mouse_move_callback(_app_data=(170.0, 100.0))
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (12.0, 0.0),
+            )
+
+    def test_queued_middle_moves_do_not_pan_after_physical_release(self):
+        gesture = _gesture(
+            "middle",
+            start=(10.0, 10.0),
+            current=(25.0, 18.0),
+            dragged=True,
+        )
+        replacement = {
+            "pan_x": 2.0,
+            "pan_y": 3.0,
+            "mouse_gestures": {"middle": gesture},
+        }
+        physical_down = True
+
+        def is_mouse_button_down(button):
+            return physical_down and button == viewer_app.dpg.mvMouseButton_Middle
+
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(
+                viewer_app.dpg,
+                "is_mouse_button_down",
+                side_effect=is_mouse_button_down,
+            ),
+            patch.object(viewer_app, "_redraw_preview"),
+        ):
+            viewer_app._update_pan_from_mouse()
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (17.0, 11.0),
+            )
+
+            physical_down = False
+            for current in ((35.0, 24.0), (45.0, 30.0), (55.0, 36.0)):
+                gesture["last_screen"] = current
+                viewer_app._update_pan_from_mouse()
+                self.assertEqual(
+                    (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                    (17.0, 11.0),
+                )
+            self.assertIn("middle", viewer_app.state["mouse_gestures"])
+
+    def test_right_pan_and_release_do_not_depend_on_preview_hover(self):
+        gesture = _gesture(
+            "right",
+            start=(10.0, 10.0),
+            current=(30.0, 20.0),
+            dragged=True,
+        )
+        replacement = {
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "pan_redraw_pending": False,
+            "mouse_gestures": {"right": gesture},
+        }
+        physical_down = True
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(
+                viewer_app.dpg,
+                "is_mouse_button_down",
+                side_effect=lambda button: physical_down
+                and button == viewer_app.dpg.mvMouseButton_Right,
+            ),
+            patch.object(viewer_app.dpg, "get_mouse_pos", return_value=(40.0, 30.0)),
+            patch.object(viewer_app.dpg, "is_item_hovered") as is_hovered,
+            patch.object(viewer_app, "_redraw_preview") as redraw,
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+        ):
+            viewer_app._update_pan_from_mouse()
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (20.0, 10.0),
+            )
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            redraw.assert_not_called()
+
+            physical_down = False
+            gesture["last_screen"] = (40.0, 30.0)
+            viewer_app._update_pan_from_mouse()
+            viewer_app._mouse_release_callback(_user_data="right")
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (20.0, 10.0),
+            )
+            self.assertNotIn("right", viewer_app.state["mouse_gestures"])
+            self.assertTrue(viewer_app.state["pan_redraw_pending"])
+            viewer_app._flush_pending_pan_redraw()
+            redraw.assert_called_once()
+            self.assertFalse(viewer_app.state["pan_redraw_pending"])
+        is_hovered.assert_not_called()
+
+    def test_right_drag_over_accepted_hole_stops_on_physical_release(self):
+        session = _session()
+        gesture = _gesture(
+            "right",
+            start=(10.0, 10.0),
+            current=(30.0, 20.0),
+            dragged=True,
+        )
+        replacement = {
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+            "mouse_gestures": {"right": gesture},
+        }
+        physical_down = True
+
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(
+                viewer_app.dpg,
+                "is_mouse_button_down",
+                side_effect=lambda button: physical_down
+                and button == viewer_app.dpg.mvMouseButton_Right,
+            ),
+            patch.object(viewer_app.dpg, "get_mouse_pos", return_value=(45.0, 30.0)),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_route_short_right_click") as short_click,
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+        ):
+            viewer_app._update_pan_from_mouse()
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (20.0, 10.0),
+            )
+
+            physical_down = False
+            gesture["last_screen"] = (45.0, 30.0)
+            viewer_app._update_pan_from_mouse()
+            viewer_app._mouse_release_callback(_user_data="right")
+            self.assertEqual(
+                (viewer_app.state["pan_x"], viewer_app.state["pan_y"]),
+                (20.0, 10.0),
+            )
+            self.assertNotIn("right", viewer_app.state["mouse_gestures"])
+
+        self.assertTrue(session.result.candidates[0].accepted)
+        short_click.assert_not_called()
 
     def test_drag_release_never_routes_hole_action(self):
         gesture = _gesture(
@@ -538,6 +1174,31 @@ class TestHoleInteractionViewer(unittest.TestCase):
         finish_drag.assert_called_once()
         short_click.assert_not_called()
 
+    def test_short_right_click_on_rejected_hole_does_not_change_status(self):
+        session = _session()
+        gesture = _gesture(
+            "right",
+            start=(10.0, 10.0),
+            current=(12.0, 11.0),
+        )
+        with (
+            patch.dict(
+                viewer_app.state,
+                {"mouse_gestures": {"right": gesture}},
+                clear=False,
+            ),
+            patch.object(viewer_app.dpg, "get_mouse_pos", return_value=(12.0, 11.0)),
+            patch.object(viewer_app, "_hole_at_screen", return_value=2),
+            patch.object(viewer_app, "_active_hole_detection_session", return_value=session),
+            patch.object(viewer_app, "_update_hole_detection_info"),
+            patch.object(viewer_app, "_redraw_preview"),
+            patch.object(viewer_app, "_set_status"),
+            patch.object(viewer_app, "_update_hole_hover_from_mouse"),
+        ):
+            viewer_app._mouse_release_callback(_user_data="right")
+
+        self.assertFalse(session.result.candidates[1].accepted)
+
     def test_wheel_zoom_and_hit_test_still_work(self):
         replacement = {
             "zoom": 1.0,
@@ -545,12 +1206,16 @@ class TestHoleInteractionViewer(unittest.TestCase):
             "pan_y": 0.0,
             "image_width": 100,
             "image_height": 80,
+            "last_event_mouse_position": (50.0, 40.0),
         }
         with (
             patch.dict(viewer_app.state, replacement, clear=False),
             patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
-            patch.object(viewer_app.dpg, "is_item_hovered", return_value=True),
-            patch.object(viewer_app.dpg, "get_mouse_pos", return_value=(50.0, 40.0)),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_state",
+                return_value={"pos": (0.0, 0.0), "rect_size": (400.0, 300.0)},
+            ),
             patch.object(viewer_app.dpg, "get_item_rect_min", return_value=(0.0, 0.0)),
             patch.object(viewer_app.dpg, "set_value"),
             patch.object(viewer_app, "_redraw_preview"),
@@ -567,6 +1232,153 @@ class TestHoleInteractionViewer(unittest.TestCase):
             2,
         )
 
+    def test_visible_preview_wheel_bounds_are_half_open(self):
+        with (
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_state",
+                return_value={
+                    "pos": (100.0, 200.0),
+                    "rect_size": (300.0, 150.0),
+                },
+            ),
+        ):
+            for position in (
+                (100.0, 200.0),
+                (399.999, 349.999),
+                (250.0, 275.0),
+            ):
+                with self.subTest(position=position):
+                    self.assertTrue(
+                        viewer_app._screen_position_is_in_visible_preview(position)
+                    )
+
+            for position in (
+                (99.999, 200.0),
+                (100.0, 199.999),
+                (400.0, 250.0),
+                (250.0, 350.0),
+            ):
+                with self.subTest(position=position):
+                    self.assertFalse(
+                        viewer_app._screen_position_is_in_visible_preview(position)
+                    )
+
+    def test_wheel_over_sidebar_ui_does_not_zoom_hidden_drawlist(self):
+        replacement = {
+            "zoom": 1.0,
+            "last_event_mouse_position": None,
+        }
+        ui_positions = {
+            "sidebar": (450.0, 20.0),
+            "input": (470.0, 55.0),
+            "combo": (470.0, 90.0),
+            "collapsing_header": (470.0, 125.0),
+            "status_log": (470.0, 210.0),
+            "nested_scrollable_child": (470.0, 260.0),
+            "sidebar_scroll_boundary": (470.0, 299.0),
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_state",
+                return_value={"pos": (0.0, 0.0), "rect_size": (400.0, 300.0)},
+            ),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_rect_min",
+                return_value=(0.0, 0.0),
+            ),
+            patch.object(viewer_app, "_set_zoom") as set_zoom,
+        ):
+            for area, position in ui_positions.items():
+                with self.subTest(area=area):
+                    self.assertTrue(
+                        viewer_app._screen_position_is_on_preview(position)
+                    )
+                    viewer_app.state["last_event_mouse_position"] = position
+                    viewer_app._mouse_wheel_callback(app_data=1.0)
+                    viewer_app._mouse_wheel_callback(app_data=-1.0)
+
+        set_zoom.assert_not_called()
+
+    def test_delayed_sidebar_wheel_does_not_use_current_preview_cursor(self):
+        replacement = {
+            "zoom": 1.0,
+            "last_event_mouse_position": (470.0, 120.0),
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_state",
+                return_value={"pos": (0.0, 0.0), "rect_size": (400.0, 300.0)},
+            ),
+            patch.object(
+                viewer_app.dpg,
+                "get_mouse_pos",
+                return_value=(100.0, 100.0),
+            ) as get_mouse_pos,
+            patch.object(viewer_app, "_set_zoom") as set_zoom,
+        ):
+            viewer_app._mouse_wheel_callback(app_data=1.0)
+
+        set_zoom.assert_not_called()
+        get_mouse_pos.assert_not_called()
+
+    def test_delayed_preview_wheel_uses_event_position_and_zoom_direction(self):
+        event_position = (160.0, 140.0)
+        replacement = {
+            "zoom": 2.0,
+            "last_event_mouse_position": event_position,
+        }
+        with (
+            patch.dict(viewer_app.state, replacement, clear=False),
+            patch.object(viewer_app.dpg, "does_item_exist", return_value=True),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_state",
+                return_value={"pos": (10.0, 20.0), "rect_size": (400.0, 300.0)},
+            ),
+            patch.object(
+                viewer_app.dpg,
+                "get_item_rect_min",
+                return_value=(10.0, 20.0),
+            ),
+            patch.object(
+                viewer_app.dpg,
+                "get_mouse_pos",
+                return_value=(700.0, 200.0),
+            ) as get_mouse_pos,
+            patch.object(viewer_app, "_set_zoom") as set_zoom,
+        ):
+            viewer_app._mouse_wheel_callback(app_data=-1.0)
+
+        set_zoom.assert_called_once_with(
+            2.0 / viewer_app.ZOOM_STEP,
+            anchor_canvas_pos=(150.0, 120.0),
+        )
+        get_mouse_pos.assert_not_called()
+
+    def test_wheel_without_event_position_is_noop(self):
+        with (
+            patch.dict(
+                viewer_app.state,
+                {"zoom": 1.0, "last_event_mouse_position": None},
+                clear=False,
+            ),
+            patch.object(viewer_app.dpg, "get_item_state") as get_item_state,
+            patch.object(viewer_app, "_set_zoom") as set_zoom,
+        ):
+            viewer_app._mouse_wheel_callback(app_data=1.0)
+
+        get_item_state.assert_not_called()
+        set_zoom.assert_not_called()
+
     def test_hover_and_short_click_use_same_hit_test(self):
         session = _session()
         with (
@@ -580,7 +1392,12 @@ class TestHoleInteractionViewer(unittest.TestCase):
                 clear=False,
             ),
             patch.object(viewer_app.dpg, "get_mouse_pos", return_value=(10.0, 10.0)),
-            patch.object(viewer_app.dpg, "does_item_exist", return_value=False),
+            patch.object(
+                viewer_app.dpg,
+                "does_item_exist",
+                side_effect=lambda tag: tag == viewer_app.IMAGE_TAG,
+            ),
+            patch.object(viewer_app.dpg, "is_item_hovered", return_value=True),
             patch.object(viewer_app, "_hole_at_screen", return_value=2) as hit_test,
             patch.object(viewer_app, "_active_hole_detection_session", return_value=session),
             patch.object(viewer_app, "_redraw_holes_overlay"),
