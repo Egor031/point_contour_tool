@@ -478,6 +478,20 @@ def _point_distance_to_segment(
     return float(np.linalg.norm(point - closest))
 
 
+def point_is_near_segment(
+    point_xy: object,
+    segment_start: object,
+    segment_end: object,
+    search_width: object,
+) -> bool:
+    """Return whether a world-space point is within a segment search band."""
+    point = _validate_point_xy(point_xy, "point_xy")
+    start = np.asarray(_validate_point_xy(segment_start, "segment_start"))
+    end = np.asarray(_validate_point_xy(segment_end, "segment_end"))
+    width = validate_search_width(search_width)
+    return _point_distance_to_segment(point, start, end) <= width
+
+
 def point_is_near_closed_contour(
     point_xy: object,
     contour_world: np.ndarray,

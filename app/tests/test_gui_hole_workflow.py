@@ -632,6 +632,8 @@ class TestGuiHoleWorkflow(unittest.TestCase):
             ) as find_holes_once,
             patch.object(viewer_app, "_redraw_preview"),
             patch.object(viewer_app, "_update_hole_detection_info"),
+            patch.object(viewer_app, "_update_hole_groups_display"),
+            patch.object(viewer_app, "_update_hole_group_target_combo"),
             patch.object(viewer_app, "_set_status"),
         ):
             viewer_app._find_holes_callback()
@@ -710,6 +712,8 @@ class TestGuiHoleWorkflow(unittest.TestCase):
             ) as find_holes,
             patch.object(viewer_app, "_redraw_preview"),
             patch.object(viewer_app, "_update_hole_detection_info"),
+            patch.object(viewer_app, "_update_hole_groups_display"),
+            patch.object(viewer_app, "_update_hole_group_target_combo"),
             patch.object(viewer_app, "_set_status") as set_status,
         ):
             viewer_app._find_holes_callback()

@@ -196,6 +196,7 @@ def working_area_draft_visibility(
 
 def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
     had_hole_session = target.get("hole_detection_session") is not None
+    review_revision = int(target.get("hole_review_revision", 0))
     target.update(
         {
             "roi_first_world": None,
@@ -226,6 +227,7 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
                 target.get("coarse_mask_revision", 0)
             ) + 1,
             "hole_detection_session": None,
+            "hole_review_revision": review_revision + int(had_hole_session),
             "holes_outdated": bool(
                 had_hole_session or target.get("holes_outdated", False)
             ),
@@ -236,6 +238,11 @@ def clear_working_area_state(target: MutableMapping[str, Any]) -> None:
 
 
 def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
+    had_reviewed_holes = (
+        target.get("hole_detection_session") is not None
+        or bool(target.get("holes"))
+    )
+    review_revision = int(target.get("hole_review_revision", 0))
     target.update(
         {
             "roi_first_world": None,
@@ -261,6 +268,7 @@ def reset_source_dependent_state(target: MutableMapping[str, Any]) -> None:
                 target.get("coarse_mask_revision", 0)
             ) + 1,
             "hole_detection_session": None,
+            "hole_review_revision": review_revision + int(had_reviewed_holes),
             "holes_outdated": False,
             "hole_overlay_source": None,
             "hovered_hole_id": None,

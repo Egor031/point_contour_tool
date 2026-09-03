@@ -11,6 +11,8 @@ import numpy as np
 
 from app.core.coordinate_transform import CoordinateTransform
 from app.core.density_grid import DensityGrid
+from app.core.hole_detector import HoleCandidate
+from app.core.working_boundary_cloud import HoleDecisionSnapshot
 from app.core.working_area import WorkingArea
 from app.services.coarse_processing import DensityProcessingResult
 from app.ui.density_workflow import (
@@ -53,7 +55,9 @@ from app.ui.hole_workflow import (
     HoleHitRegion,
     HoleDetectionParameters,
     HoleDetectionSession,
+    advance_hole_review_revision,
     apply_manual_hole_status,
+    build_reviewed_hole_snapshots,
     find_holes_for_current_mask,
     hit_test_hole_regions,
     hole_detection_session_is_current,
@@ -204,6 +208,7 @@ state = {
     "next_brush_stroke_id": 1,
     "coarse_mask_revision": 0,
     "hole_detection_session": None,
+    "hole_review_revision": 0,
     "holes_outdated": False,
     "hole_overlay_source": None,
     "hovered_hole_id": None,
@@ -1324,6 +1329,14 @@ def _active_hole_detection_session() -> HoleDetectionSession | None:
     return None
 
 
+def current_reviewed_hole_snapshots() -> tuple[HoleDecisionSnapshot, ...]:
+    """Return current semantic holes without exposing GUI storage to callers."""
+    return build_reviewed_hole_snapshots(
+        _active_hole_detection_session(),
+        state["holes"],
+    )
+
+
 def _invalidate_hole_detection(*, mark_outdated: bool = True) -> bool:
     state["hovered_hole_id"] = None
     invalidated = invalidate_hole_detection_state(
@@ -1560,13 +1573,15 @@ def _redraw_holes_overlay() -> None:
                     thickness=4,
                     parent=HOLES_LAYER_TAG,
                 )
-        return
+        if not state["holes"]:
+            return
 
     holes = state["holes"]
     if not holes:
         return
 
-    dpg.add_draw_layer(parent=IMAGE_TAG, tag=HOLES_LAYER_TAG)
+    if not dpg.does_item_exist(HOLES_LAYER_TAG):
+        dpg.add_draw_layer(parent=IMAGE_TAG, tag=HOLES_LAYER_TAG)
 
     max_diameter = float(dpg.get_value(MAX_DISPLAYED_HOLE_DIAMETER_TAG))
     show_oversized = _display_layer_enabled(
@@ -2159,9 +2174,18 @@ def _find_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None:
         return
 
     state["hole_detection_session"] = session
+    state["holes"] = []
+    state["hole_groups"] = session.result.groups
+    state["visible_hole_group_ids"] = {
+        str(group.get("id", "")): bool(group.get("enabled", True))
+        for group in session.result.groups
+    }
     state["holes_outdated"] = False
     state["hole_overlay_source"] = "in_memory"
+    advance_hole_review_revision(state)
     _update_hole_detection_info()
+    _update_hole_groups_display()
+    _update_hole_group_target_combo()
     _redraw_preview()
     _set_status(
         "Hole candidates ready: "
@@ -2215,6 +2239,13 @@ def _update_hole_groups_display() -> None:
 
 def _recount_hole_group_counts() -> None:
     accepted_counts: dict[str, int] = {}
+    session = _active_hole_detection_session()
+    if session is not None:
+        for candidate in session.result.candidates:
+            if candidate.accepted and candidate.group_id is not None:
+                group_id = str(candidate.group_id)
+                accepted_counts[group_id] = accepted_counts.get(group_id, 0) + 1
+
     for hole in state["holes"]:
         if not bool(hole.get("accepted", False)):
             continue
@@ -2245,21 +2276,34 @@ def _update_hole_group_target_combo() -> None:
         dpg.set_value(tag, current_value)
 
 
-def _get_selected_hole() -> tuple[int | None, dict | None]:
+def _get_selected_hole() -> tuple[int | None, HoleCandidate | dict | None]:
     hole_id = int(dpg.get_value(MOVE_HOLE_ID_TAG))
-    hole = next(
-        (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
-        None,
+    matches: list[HoleCandidate | dict] = []
+    session = _active_hole_detection_session()
+    if session is not None:
+        matches.extend(
+            candidate
+            for candidate in session.result.candidates
+            if int(candidate.id) == hole_id
+        )
+    matches.extend(
+        item for item in state["holes"] if int(item.get("id", -1)) == hole_id
     )
-    if hole is None:
+    if not matches:
         _set_status(f"Hole not found: {hole_id}")
         return hole_id, None
+    if len(matches) > 1:
+        _set_status(f"Duplicate hole ID: {hole_id}")
+        return hole_id, None
 
-    return hole_id, hole
+    return hole_id, matches[0]
 
 
 def _refresh_hole_views() -> None:
-    state["hole_overlay_source"] = "legacy"
+    session = _active_hole_detection_session()
+    state["hole_overlay_source"] = (
+        "in_memory" if session is not None and session.result.candidates else "legacy"
+    )
     _recount_hole_group_counts()
     _update_hole_groups_display()
     _update_holes_stats()
@@ -2268,34 +2312,50 @@ def _refresh_hole_views() -> None:
 
 def _set_manual_hole_status_by_id(hole_id: int, *, accepted: bool) -> bool:
     session = _active_hole_detection_session()
+    legacy_hole = next(
+        (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
+        None,
+    )
     if session is not None:
-        try:
+        candidate = next(
+            (
+                item
+                for item in session.result.candidates
+                if int(item.id) == int(hole_id)
+            ),
+            None,
+        )
+        if candidate is not None and legacy_hole is not None:
+            _set_status(f"Duplicate hole ID: {hole_id}")
+            return False
+        if candidate is not None:
             changed = apply_manual_hole_status(
                 session,
                 hole_id,
                 accepted=accepted,
             )
-        except KeyError:
-            _set_status(f"Hole not found: {hole_id}")
-            return False
 
-        action = "accepted" if accepted else "rejected"
-        if changed:
-            _update_hole_detection_info()
-            _redraw_preview()
-            _set_status(f"Hole {hole_id} {action} manually.")
-        else:
-            _set_status(f"Hole {hole_id} is already {action}.")
-        return changed
+            action = "accepted" if accepted else "rejected"
+            if changed:
+                advance_hole_review_revision(state)
+                _update_hole_detection_info()
+                _redraw_preview()
+                _set_status(f"Hole {hole_id} {action} manually.")
+            else:
+                _set_status(f"Hole {hole_id} is already {action}.")
+            return changed
 
-    hole = next(
-        (item for item in state["holes"] if int(item.get("id", -1)) == hole_id),
-        None,
-    )
+    hole = legacy_hole
     if hole is None:
         _set_status(f"Hole not found: {hole_id}")
         return False
 
+    before = (
+        bool(hole.get("accepted", False)),
+        bool(hole.get("enabled", True)),
+        str(hole.get("reject_reason", "")),
+        hole.get("group_id"),
+    )
     if accepted:
         target_group_id = str(
             dpg.get_value(MOVE_HOLE_TARGET_GROUP_TAG) or ""
@@ -2323,6 +2383,18 @@ def _set_manual_hole_status_by_id(hole_id: int, *, accepted: bool) -> bool:
         if not hole.get("reject_reason"):
             hole["reject_reason"] = "manual_reject"
 
+    after = (
+        bool(hole.get("accepted", False)),
+        bool(hole.get("enabled", True)),
+        str(hole.get("reject_reason", "")),
+        hole.get("group_id"),
+    )
+    if after == before:
+        action = "accepted" if accepted else "rejected"
+        _set_status(f"Hole {hole_id} is already {action}.")
+        return False
+
+    advance_hole_review_revision(state)
     _refresh_hole_views()
     action = "accepted" if accepted else "rejected"
     _set_status(f"Hole {hole_id} {action}.")
@@ -2352,7 +2424,18 @@ def _move_hole_to_group_callback(
         _set_status(f"Hole group not found: {target_group_id}")
         return
 
-    hole["group_id"] = target_group_id
+    current_group_id = (
+        hole.group_id if isinstance(hole, HoleCandidate) else hole.get("group_id")
+    )
+    if current_group_id == target_group_id:
+        _set_status(f"Hole {hole_id} is already in group {target_group_id}.")
+        return
+
+    if isinstance(hole, HoleCandidate):
+        hole.group_id = target_group_id
+    else:
+        hole["group_id"] = target_group_id
+    advance_hole_review_revision(state)
     _refresh_hole_views()
     _set_status(f"Hole {hole_id} moved to group {target_group_id}.")
 
@@ -2436,6 +2519,10 @@ def _add_manual_hole_callback(
         group_id = target_group_id
 
     max_id = 0
+    session = _active_hole_detection_session()
+    if session is not None:
+        for candidate in session.result.candidates:
+            max_id = max(max_id, int(candidate.id))
     for hole in state["holes"]:
         try:
             max_id = max(max_id, int(hole.get("id", 0)))
@@ -2457,6 +2544,7 @@ def _add_manual_hole_callback(
             "source": "manual",
         }
     )
+    advance_hole_review_revision(state)
 
     if dpg.does_item_exist(MOVE_HOLE_ID_TAG):
         dpg.set_value(MOVE_HOLE_ID_TAG, new_hole_id)
@@ -4092,6 +4180,7 @@ def _load_holes_json(path: str | Path) -> None:
     state["visible_hole_group_ids"] = {
         str(group["id"]): bool(group.get("enabled", True)) for group in hole_groups
     }
+    advance_hole_review_revision(state)
     _recount_hole_group_counts()
     _update_holes_stats()
     _update_hole_groups_display()
@@ -4115,13 +4204,21 @@ def _open_holes_callback(_sender, app_data) -> None:
 
 
 def _clear_holes_callback(_sender=None, _app_data=None, _user_data=None) -> None:
+    changed = (
+        state.get("hole_detection_session") is not None
+        or bool(state["holes"])
+        or bool(state["hole_groups"])
+    )
     state["holes"] = []
     state["hole_groups"] = []
+    state["hole_detection_session"] = None
+    state["holes_outdated"] = False
     state["visible_hole_group_ids"] = {}
     state["pick_manual_hole_center"] = False
     state["manual_hole_center_world"] = None
-    if state.get("hole_overlay_source") == "legacy":
-        state["hole_overlay_source"] = None
+    state["hole_overlay_source"] = None
+    if changed:
+        advance_hole_review_revision(state)
     if dpg.does_item_exist(MANUAL_HOLE_PICK_TAG):
         dpg.set_value(MANUAL_HOLE_PICK_TAG, False)
     _update_holes_stats()

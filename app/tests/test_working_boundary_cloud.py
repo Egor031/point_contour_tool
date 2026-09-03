@@ -25,6 +25,7 @@ from app.core.working_boundary_cloud import (  # noqa: E402
     hole_search_aabb,
     point_is_near_closed_contour,
     point_is_near_hole_boundary,
+    point_is_near_segment,
     segment_search_aabb,
 )
 
@@ -99,6 +100,14 @@ def _manual_decision(
 
 
 class TestOuterBoundaryReferenceGeometry(unittest.TestCase):
+    def test_single_segment_predicate_matches_closed_contour_geometry(self):
+        self.assertTrue(
+            point_is_near_segment((4.0, 0.5), (0.0, 0.0), (8.0, 0.0), 0.5)
+        )
+        self.assertFalse(
+            point_is_near_segment((4.0, 0.51), (0.0, 0.0), (8.0, 0.0), 0.5)
+        )
+
     def test_point_on_segment_is_inside_search_band(self):
         self.assertTrue(point_is_near_closed_contour((20.0, 20.0), _square(), 0.5))
 

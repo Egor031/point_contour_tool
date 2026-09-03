@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import math
-from collections.abc import MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 
+from app.core.hole_detector import HoleCandidate
+from app.core.working_boundary_cloud import (
+    HoleDecisionSnapshot,
+    HoleDetectorMetrics,
+)
 from app.core.working_area import WorkingArea
 from app.services.coarse_processing import (
     HoleDetectionResult,
@@ -53,6 +58,146 @@ class HoleHitRegion:
     center_y: float
     radius_x: float
     radius_y: float
+
+
+class DuplicateReviewedHoleIdError(ValueError):
+    """Raised when two semantic holes have the same public ID."""
+
+
+class UnsupportedReviewedHoleSourceError(ValueError):
+    """Raised for legacy holes without reliable detector/manual provenance."""
+
+
+def current_hole_review_revision(target: Mapping[str, Any]) -> int:
+    value = target.get("hole_review_revision", 0)
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, int):
+        raise TypeError("hole_review_revision must be an integer")
+    if value < 0:
+        raise ValueError("hole_review_revision must be non-negative")
+    return value
+
+
+def advance_hole_review_revision(target: MutableMapping[str, Any]) -> int:
+    revision = current_hole_review_revision(target) + 1
+    target["hole_review_revision"] = revision
+    return revision
+
+
+def _candidate_metrics(candidate: HoleCandidate) -> HoleDetectorMetrics:
+    return HoleDetectorMetrics(
+        area_cells=candidate.area_cells,
+        area_mm2=candidate.area_mm2,
+        bbox_width_mm=candidate.bbox_width_mm,
+        bbox_height_mm=candidate.bbox_height_mm,
+        aspect_ratio=candidate.aspect_ratio,
+        circularity=candidate.circularity,
+        mean_error_mm=candidate.mean_error_mm,
+        max_error_mm=candidate.max_error_mm,
+        error_ratio=candidate.error_ratio,
+    )
+
+
+def _detector_hole_snapshot(
+    session: HoleDetectionSession,
+    candidate: HoleCandidate,
+) -> HoleDecisionSnapshot:
+    hole_id = int(candidate.id)
+    if hole_id in session.automatic_acceptance:
+        automatic_accepted = bool(session.automatic_acceptance[hole_id])
+    elif hole_id in session.manual_overrides:
+        raise ValueError(
+            f"automatic decision is missing for overridden hole {hole_id}"
+        )
+    else:
+        automatic_accepted = bool(candidate.accepted)
+
+    has_override = hole_id in session.manual_overrides
+    final_accepted = (
+        bool(session.manual_overrides[hole_id])
+        if has_override
+        else automatic_accepted
+    )
+    return HoleDecisionSnapshot(
+        hole_id=hole_id,
+        group_id=(
+            str(candidate.group_id) if candidate.group_id is not None else None
+        ),
+        origin="detector",
+        automatic_accepted=automatic_accepted,
+        final_accepted=final_accepted,
+        decision_source="user" if has_override else "automatic",
+        automatic_reject_reason=candidate.reject_reason or None,
+        preliminary_center_x=candidate.center_x,
+        preliminary_center_y=candidate.center_y,
+        preliminary_radius=candidate.radius,
+        detector_metrics=_candidate_metrics(candidate),
+    )
+
+
+def _manual_hole_snapshot(hole: Mapping[str, Any]) -> HoleDecisionSnapshot:
+    source = str(hole.get("source", "legacy"))
+    if source != "manual":
+        raise UnsupportedReviewedHoleSourceError(
+            "loaded legacy holes have no reliable detector/manual provenance "
+            "or source-session binding"
+        )
+    required_fields = ("id", "accepted", "center_x", "center_y", "radius")
+    missing = [name for name in required_fields if name not in hole]
+    if missing:
+        raise ValueError(f"manual hole is missing field: {missing[0]}")
+    group_id = hole.get("group_id")
+    return HoleDecisionSnapshot(
+        hole_id=hole["id"],
+        group_id=str(group_id) if group_id is not None else None,
+        origin="manual",
+        automatic_accepted=None,
+        final_accepted=hole["accepted"],
+        decision_source="user",
+        automatic_reject_reason=None,
+        preliminary_center_x=hole["center_x"],
+        preliminary_center_y=hole["center_y"],
+        preliminary_radius=hole["radius"],
+        detector_metrics=None,
+    )
+
+
+def build_reviewed_hole_snapshots(
+    session: HoleDetectionSession | None,
+    manual_holes: Iterable[Mapping[str, Any]] = (),
+) -> tuple[HoleDecisionSnapshot, ...]:
+    """Normalize the current live review state into immutable semantic holes."""
+    snapshots: list[HoleDecisionSnapshot] = []
+    seen_ids: set[int] = set()
+
+    def append_unique(snapshot: HoleDecisionSnapshot) -> None:
+        if snapshot.hole_id in seen_ids:
+            raise DuplicateReviewedHoleIdError(
+                f"duplicate reviewed hole ID: {snapshot.hole_id}"
+            )
+        seen_ids.add(snapshot.hole_id)
+        snapshots.append(snapshot)
+
+    if session is not None:
+        if not isinstance(session, HoleDetectionSession):
+            raise TypeError("session must be HoleDetectionSession or None")
+        for candidate in session.result.candidates:
+            append_unique(_detector_hole_snapshot(session, candidate))
+
+    for hole in manual_holes:
+        if not isinstance(hole, Mapping):
+            raise TypeError("manual_holes must contain mappings")
+        append_unique(_manual_hole_snapshot(hole))
+
+    return tuple(snapshots)
+
+
+def accepted_hole_snapshots(
+    snapshots: Iterable[HoleDecisionSnapshot],
+) -> tuple[HoleDecisionSnapshot, ...]:
+    result = tuple(snapshots)
+    if not all(isinstance(snapshot, HoleDecisionSnapshot) for snapshot in result):
+        raise TypeError("snapshots must contain only HoleDecisionSnapshot objects")
+    return tuple(snapshot for snapshot in result if snapshot.final_accepted)
 
 
 def hit_test_hole_regions(
@@ -279,4 +424,6 @@ def invalidate_hole_detection_state(
         mark_outdated
         and (had_session or target.get("holes_outdated", False))
     )
+    if had_session:
+        advance_hole_review_revision(target)
     return had_session
